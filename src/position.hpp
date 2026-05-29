@@ -2,6 +2,7 @@
 #include <cstdint>
 #include <string>
 #include <cassert>
+#include <vector>
 #include "types.hpp"
 #include "bitboard.hpp"
 
@@ -56,6 +57,11 @@ public:
     uint64_t key()             const { return key_; }
     uint64_t compute_key()     const;
 
+    // Draw detection
+    bool is_repetition()        const;
+    bool insufficient_material() const;
+    bool is_draw()               const { return is_repetition() || halfmove_ >= 100 || insufficient_material(); }
+
     // Make / unmake
     void do_move(Move m, StateInfo& st);
     void undo_move(Move m);
@@ -78,6 +84,8 @@ private:
 
     StateInfo  root_;          // root state (previous == nullptr)
     StateInfo* st_ = &root_;   // current state node
+
+    std::vector<uint64_t> hist_; // Zobrist key history for repetition detection
 };
 
 } // namespace king

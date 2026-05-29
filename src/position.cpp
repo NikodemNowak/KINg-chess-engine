@@ -129,9 +129,13 @@ void Position::do_move(Move m, StateInfo& st) {
     stm_  = them;
     key_ ^= zobrist::side;
     if (us == BLACK) fullmove_++;
+
+    // 12. Record key in history for repetition detection.
+    hist_.push_back(key_);
 }
 
 void Position::undo_move(Move m) {
+    hist_.pop_back();
     StateInfo* st = st_;
 
     // 1. Flip side back: 'us' is the side that made the move being undone.
@@ -255,6 +259,10 @@ void Position::set_fen(const std::string& fen) {
 
     // 6. Fullmove number
     ss >> fullmove_;
+
+    // 7. Seed key history for repetition detection
+    hist_.clear();
+    hist_.push_back(key_);
 }
 
 // ── FEN emission ──────────────────────────────────────────────────────────────
@@ -350,6 +358,22 @@ bool Position::in_check(Color c) const {
     Bitboard k = pieces(c, KING);
     if (!k) return false;                 // defensive: no king -> avoid OOB on lsb(0)=64
     return (attackers_to(lsb(k), occupied()) & by_color_[Color(!c)]) != 0;
+}
+
+// ── Draw detection ────────────────────────────────────────────────────────────
+
+bool Position::is_repetition() const {
+    int n     = (int)hist_.size();
+    int limit = std::min(halfmove_, n - 1);
+    // Positions with the same side to move are 2 plies apart; current is hist_[n-1].
+    for (int i = n - 3; i >= n - 1 - limit; i -= 2)
+        if (hist_[i] == key_) return true;
+    return false;
+}
+
+bool Position::insufficient_material() const {
+    if (pieces(PAWN) | pieces(ROOK) | pieces(QUEEN)) return false;
+    return popcount(pieces(KNIGHT) | pieces(BISHOP)) <= 1;
 }
 
 } // namespace king
