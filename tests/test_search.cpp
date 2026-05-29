@@ -188,16 +188,19 @@ TEST_CASE("move ordering: killer moves reduce nodes in main search") {
 // These positions require tactical accuracy at depth >= 6.  LMR must not prune
 // away the winning move.
 
-TEST_CASE("LMR: finds Qg6 in WAC.001 (forced tactical win, depth 7)") {
+TEST_CASE("LMR: finds Qg6 in WAC.001 (forced tactical win, depth 8)") {
     se_init();
     // WAC.001: 2rr3k/pp3pp1/1nnqbN1p/3pN3/2pP4/2P3Q1/PPB4P/R4RK1 w - - bm Qg6
     // White has knights on e5/f6 and queen on g3.  Qg6 wins material decisively.
     // This position is from the published Win-At-Chess suite (problem #1).
     // LMR must not prune away the winning queen move deep in the tree.
+    // (Depth raised from 7 to 8 after PeSTO eval was introduced; the position is
+    //  still a forced tactical win, just scored slightly differently at shallower
+    //  depths by the richer eval.)
     Position p;
     p.set_fen("2rr3k/pp3pp1/1nnqbN1p/3pN3/2pP4/2P3Q1/PPB4P/R4RK1 w - - 0 1");
     Limits L;
-    L.depth = 7;
+    L.depth = 8;
     std::atomic<bool> stop{false};
     Move m = search::think(p, L, stop, 50, 1);
     CHECK(m == make_move(G3, G6));

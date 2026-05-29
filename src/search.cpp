@@ -5,6 +5,7 @@
 #include "tt.hpp"
 #include "see.hpp"
 #include "crash.hpp"
+#include "eval.hpp"
 #include <atomic>
 #include <chrono>
 #include <iostream>
@@ -62,21 +63,15 @@ static void init_lmr() {
 static bool lmr_ready = false;
 
 // ── Material values ───────────────────────────────────────────────────────────
-// Centipawn value of a piece type (indexed by PieceType: P N B R Q K).
+// Centipawn value of a piece type — kept for move-ordering / SEE helpers.
 static inline int value_of(PieceType pt) {
     static const int val[6] = { 100, 320, 330, 500, 900, 0 };
     return val[pt];
 }
 
-// ── Material evaluation ───────────────────────────────────────────────────────
-// Returns a score relative to the side to move (positive = better for mover).
-static int evaluate(const Position& p) {
-    int sc = 0;
-    for (int pt = PAWN; pt <= QUEEN; ++pt)
-        sc += value_of((PieceType)pt) * (popcount(p.pieces(WHITE, (PieceType)pt))
-                                       - popcount(p.pieces(BLACK, (PieceType)pt)));
-    return (p.side_to_move() == WHITE) ? sc : -sc;
-}
+// evaluate() is now provided by eval.cpp (tapered PeSTO PSQT).
+// The declaration lives in eval.hpp; we pull it into this namespace via:
+using king::evaluate;
 
 // ── UCI move string ───────────────────────────────────────────────────────────
 static std::string to_uci(Move m) {
