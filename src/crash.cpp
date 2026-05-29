@@ -15,7 +15,7 @@ static void on_fatal(int /*sig*/) {
         std::fputs(g_line, stdout);
         std::fflush(stdout);
     }
-    std::_Exit(0);
+    std::_Exit(1);
 }
 
 void arm_fallback(const char* uci_move) {

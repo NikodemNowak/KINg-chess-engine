@@ -36,3 +36,11 @@ TEST_CASE("has_legal_moves / mate / stalemate") {
   CHECK(has_legal_moves(st) == false);
   CHECK(st.in_check(BLACK) == false);
 }
+
+TEST_CASE("no crash on kingless / hostile positions") {
+  mg_init();
+  Position e; e.set_fen("8/8/8/8/8/8/8/8 w - - 0 1");        // empty board, no kings
+  MoveList m1; generate_legal(e, m1);  CHECK(m1.size == 0);  // and NO crash/OOB
+  Position q; q.set_fen("8/8/8/3q4/8/8/8/8 w - - 0 1");      // lone black queen, white to move, no kings
+  MoveList m2; generate_legal(q, m2);  CHECK(m2.size == 0);
+}

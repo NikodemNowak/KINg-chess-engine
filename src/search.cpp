@@ -6,6 +6,8 @@
 #include <atomic>
 #include <chrono>
 #include <iostream>
+#include <ostream>
+#include <mutex>
 #include <algorithm>
 
 namespace king {
@@ -105,7 +107,8 @@ struct Searcher {
 
 // ── think ─────────────────────────────────────────────────────────────────────
 Move think(Position& pos, const Limits& L, std::atomic<bool>& stop,
-           int overhead, int /*threads*/) {
+           int overhead, int /*threads*/,
+           std::ostream& out, std::mutex* out_mtx) {
     TimeManager tm;
     tm.init(L, pos.side_to_move(), overhead);
 
@@ -149,11 +152,13 @@ Move think(Position& pos, const Limits& L, std::atomic<bool>& stop,
         auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                       std::chrono::steady_clock::now() - s.start)
                       .count();
-        std::cout << "info depth " << depth
-                  << " score cp " << bestScore
-                  << " nodes " << s.nodes
-                  << " time " << ms
-                  << " pv " << to_uci(best) << "\n";
+        if (out_mtx) out_mtx->lock();
+        out << "info depth " << depth
+            << " score cp " << bestScore
+            << " nodes " << s.nodes
+            << " time " << ms
+            << " pv " << to_uci(best) << std::endl;
+        if (out_mtx) out_mtx->unlock();
 
         if (ms >= tm.soft_ms) break; // don't start an iteration we likely can't finish
     }

@@ -13,6 +13,7 @@
 #include <string>
 #include <thread>
 #include <atomic>
+#include <mutex>
 #include <vector>
 #include <deque>
 #include <algorithm>
@@ -66,6 +67,7 @@ static int find_tok(const std::vector<std::string>& toks, const std::string& s, 
 struct EngineState {
     Position pos;
     std::deque<StateInfo> history;
+    std::mutex out_mtx;
 
     EngineState() {
         pos.set_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
@@ -128,6 +130,7 @@ void run(std::istream& in, std::ostream& out) {
 
             // ── uci ──────────────────────────────────────────────────────────
             if (cmd == "uci") {
+                std::lock_guard<std::mutex> lk(es.out_mtx);
                 out << "id name KINg\n";
                 out << "id author KINg Team\n";
                 out << "option name Hash type spin default 64 min 1 max 1024\n";
@@ -140,6 +143,7 @@ void run(std::istream& in, std::ostream& out) {
 
             // ── isready ──────────────────────────────────────────────────────
             else if (cmd == "isready") {
+                std::lock_guard<std::mutex> lk(es.out_mtx);
                 out << "readyok\n";
                 out.flush();
             }
@@ -183,6 +187,8 @@ void run(std::istream& in, std::ostream& out) {
 
             // ── position ─────────────────────────────────────────────────────
             else if (cmd == "position") {
+                stop_and_join();
+                stop = false;
                 if ((int)toks.size() < 2) continue;
 
                 int moves_kw = -1;
@@ -255,9 +261,11 @@ void run(std::istream& in, std::ostream& out) {
                 // Worker operates on es.pos by reference. The main loop only
                 // touches pos via position/ucinewgame commands, which require
                 // stop_and_join() first, so there is no concurrent access.
+                // All output (info lines and bestmove) is serialized via out_mtx.
                 worker = std::thread([&es, &stop, &out, lim, ovh, thrs]() {
-                    Move m = search::think(es.pos, lim, stop, ovh, thrs);
+                    Move m = search::think(es.pos, lim, stop, ovh, thrs, out, &es.out_mtx);
                     std::string bm = (m != 0) ? to_uci(m) : "0000";
+                    std::lock_guard<std::mutex> lk(es.out_mtx);
                     out << "bestmove " << bm << "\n";
                     out.flush();
                 });

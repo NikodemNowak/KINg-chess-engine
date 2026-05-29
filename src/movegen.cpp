@@ -105,44 +105,46 @@ void generate_pseudo(const Position& pos, MoveList& list) {
     }
 
     // ── King ────────────────────────────────────────────────────────────────
-    Square   ksq     = pos.king_sq(us);
-    Bitboard ktargets = king_attacks[ksq] & ~ownPieces;
-    while (ktargets) list.add(make_move(ksq, pop_lsb(ktargets)));
+    Square ksq = pos.king_sq(us);
+    if (ksq != NO_SQ) {
+        Bitboard ktargets = king_attacks[ksq] & ~ownPieces;
+        while (ktargets) list.add(make_move(ksq, pop_lsb(ktargets)));
 
-    // ── Castling (fully legality-checked) ────────────────────────────────────
-    const uint8_t cr = pos.castling_rights();
-    if (us == WHITE) {
-        // O-O: F1,G1 empty; E1,F1,G1 not attacked by BLACK.
-        if ((cr & WHITE_OO)
-            && (empty & square_bb(F1)) && (empty & square_bb(G1))
-            && !attacked(pos, E1, BLACK, occ)
-            && !attacked(pos, F1, BLACK, occ)
-            && !attacked(pos, G1, BLACK, occ))
-            list.add(make_move(E1, G1, CASTLING));
+        // ── Castling (fully legality-checked) ────────────────────────────────
+        const uint8_t cr = pos.castling_rights();
+        if (us == WHITE) {
+            // O-O: F1,G1 empty; E1,F1,G1 not attacked by BLACK.
+            if ((cr & WHITE_OO)
+                && (empty & square_bb(F1)) && (empty & square_bb(G1))
+                && !attacked(pos, E1, BLACK, occ)
+                && !attacked(pos, F1, BLACK, occ)
+                && !attacked(pos, G1, BLACK, occ))
+                list.add(make_move(E1, G1, CASTLING));
 
-        // O-O-O: B1,C1,D1 empty; E1,D1,C1 not attacked by BLACK.
-        if ((cr & WHITE_OOO)
-            && (empty & square_bb(B1)) && (empty & square_bb(C1)) && (empty & square_bb(D1))
-            && !attacked(pos, E1, BLACK, occ)
-            && !attacked(pos, D1, BLACK, occ)
-            && !attacked(pos, C1, BLACK, occ))
-            list.add(make_move(E1, C1, CASTLING));
-    } else {
-        // O-O: F8,G8 empty; E8,F8,G8 not attacked by WHITE.
-        if ((cr & BLACK_OO)
-            && (empty & square_bb(F8)) && (empty & square_bb(G8))
-            && !attacked(pos, E8, WHITE, occ)
-            && !attacked(pos, F8, WHITE, occ)
-            && !attacked(pos, G8, WHITE, occ))
-            list.add(make_move(E8, G8, CASTLING));
+            // O-O-O: B1,C1,D1 empty; E1,D1,C1 not attacked by BLACK.
+            if ((cr & WHITE_OOO)
+                && (empty & square_bb(B1)) && (empty & square_bb(C1)) && (empty & square_bb(D1))
+                && !attacked(pos, E1, BLACK, occ)
+                && !attacked(pos, D1, BLACK, occ)
+                && !attacked(pos, C1, BLACK, occ))
+                list.add(make_move(E1, C1, CASTLING));
+        } else {
+            // O-O: F8,G8 empty; E8,F8,G8 not attacked by WHITE.
+            if ((cr & BLACK_OO)
+                && (empty & square_bb(F8)) && (empty & square_bb(G8))
+                && !attacked(pos, E8, WHITE, occ)
+                && !attacked(pos, F8, WHITE, occ)
+                && !attacked(pos, G8, WHITE, occ))
+                list.add(make_move(E8, G8, CASTLING));
 
-        // O-O-O: B8,C8,D8 empty; E8,D8,C8 not attacked by WHITE.
-        if ((cr & BLACK_OOO)
-            && (empty & square_bb(B8)) && (empty & square_bb(C8)) && (empty & square_bb(D8))
-            && !attacked(pos, E8, WHITE, occ)
-            && !attacked(pos, D8, WHITE, occ)
-            && !attacked(pos, C8, WHITE, occ))
-            list.add(make_move(E8, C8, CASTLING));
+            // O-O-O: B8,C8,D8 empty; E8,D8,C8 not attacked by WHITE.
+            if ((cr & BLACK_OOO)
+                && (empty & square_bb(B8)) && (empty & square_bb(C8)) && (empty & square_bb(D8))
+                && !attacked(pos, E8, WHITE, occ)
+                && !attacked(pos, D8, WHITE, occ)
+                && !attacked(pos, C8, WHITE, occ))
+                list.add(make_move(E8, C8, CASTLING));
+        }
     }
 }
 
