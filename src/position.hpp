@@ -47,9 +47,11 @@ public:
     bool     in_check(Color c) const;
 
     // State
-    Color    side_to_move() const { return stm_; }
-    uint64_t key()          const { return key_; }
-    uint64_t compute_key()  const;
+    Color    side_to_move()    const { return stm_; }
+    uint8_t  castling_rights() const { return castling_; }
+    Square   ep_square()       const { return ep_; }
+    uint64_t key()             const { return key_; }
+    uint64_t compute_key()     const;
 
     // Make / unmake
     void do_move(Move m, StateInfo& st);
