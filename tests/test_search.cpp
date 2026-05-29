@@ -188,6 +188,36 @@ TEST_CASE("move ordering: killer moves reduce nodes in main search") {
 // These positions require tactical accuracy at depth >= 6.  LMR must not prune
 // away the winning move.
 
+// ── Lazy SMP stress test ───────────────────────────────────────────────────
+// Runs the multi-threaded search (Threads=4) on several positions, many times,
+// at a short movetime. Asserts every search returns a LEGAL move and the engine
+// never crashes / hangs. This is the primary correctness guard for Lazy SMP:
+// a data race in the shared TT or per-thread state tends to surface as an
+// illegal move, a hang, or a crash under repeated concurrent runs.
+TEST_CASE("SMP: 4-thread search always returns a legal move (stress)") {
+    se_init();
+    const char* fens[] = {
+        // startpos
+        "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+        // kiwipete (rich, many captures/castles/checks)
+        "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+        // a sharp tactical position (WAC.001)
+        "2rr3k/pp3pp1/1nnqbN1p/3pN3/2pP4/2P3Q1/PPB4P/R4RK1 w - - 0 1",
+    };
+    const int kIters = 12; // 3 positions * 12 = 36 concurrent searches
+    for (int it = 0; it < kIters; ++it) {
+        for (const char* fen : fens) {
+            Position p;
+            p.set_fen(fen);
+            Limits L;
+            L.movetime = 60; // short, so the whole loop stays fast
+            std::atomic<bool> stop{false};
+            Move m = search::think(p, L, stop, 20, /*threads=*/4);
+            CHECK(legal_move(p, m)); // must always be legal — never garbage/illegal
+        }
+    }
+}
+
 TEST_CASE("LMR: finds Qg6 in WAC.001 (forced tactical win, depth 8)") {
     se_init();
     // WAC.001: 2rr3k/pp3pp1/1nnqbN1p/3pN3/2pP4/2P3Q1/PPB4P/R4RK1 w - - bm Qg6

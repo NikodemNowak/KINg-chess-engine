@@ -62,6 +62,14 @@ public:
     bool insufficient_material() const;
     bool is_draw()               const { return is_repetition() || halfmove_ >= 100 || insufficient_material(); }
 
+    // Controlled deep clone (the generic copy ctor is deleted because st_/root_
+    // are self-referential). Copies all board/scalar state and the repetition
+    // history, then re-roots the StateInfo chain: the clone's root_ becomes a
+    // fresh root (previous == nullptr) and st_ points at it. The clone can then
+    // do/undo moves completely independently of the source — used by Lazy SMP to
+    // give each search thread its own Position with the game history intact.
+    void copy_from(const Position& o);
+
     // Make / unmake
     void do_move(Move m, StateInfo& st);
     void undo_move(Move m);

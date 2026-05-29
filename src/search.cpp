@@ -11,6 +11,8 @@
 #include <iostream>
 #include <ostream>
 #include <mutex>
+#include <thread>
+#include <vector>
 #include <algorithm>
 #include <cstring>
 #include <utility>
@@ -508,56 +510,43 @@ struct Searcher {
     }
 };
 
-// ── think ─────────────────────────────────────────────────────────────────────
-Move think(Position& pos, const Limits& L, std::atomic<bool>& stop,
-           int overhead, int /*threads*/,
-           std::ostream& out, std::mutex* out_mtx) {
-    TimeManager tm;
-    tm.init(L, pos.side_to_move(), overhead);
-
-    // One-time LMR table initialisation (fast: just 64*64 = 4096 entries).
-    if (!lmr_ready) { init_lmr(); lmr_ready = true; }
-
-    // Ensure the TT is sized before the first search (covers direct callers
-    // that never went through the UCI `Hash` option). Default 64 MB.
-    if (tt.size() == 0) tt.resize(64);
-    tt.new_search();
-
+// ── Per-thread search worker ────────────────────────────────────────────────
+// Runs the full iterative-deepening / aspiration / root-PVS search on ONE
+// thread, using the thread's OWN Searcher `s` (nodes/killers/history) and its
+// OWN Position clone `pos`. The transposition table (`tt`) and the abort flag
+// (`s.stop`) are SHARED across threads — that sharing is the entire point of
+// Lazy SMP: helpers deepen the shared TT so the main thread searches better.
+//
+// Only the MAIN thread (isMain) drives time management (breaks on soft-time and
+// then raises the shared stop flag) and emits `info` lines / arms the crash
+// fallback. Helpers stay silent and simply loop until the shared stop flag (or
+// the hard time limit, polled in times_up()) tells them to quit.
+//
+// The thread's best move + score + reached depth are written to `outBest`,
+// `outScore`, `outDepth`.
+static void smp_worker(Searcher& s, Position& pos, const TimeManager& tm,
+                       int maxDepth, bool isMain,
+                       Move startBest, std::atomic<bool>& stop,
+                       std::ostream& out, std::mutex* out_mtx,
+                       Move& outBest, int& outScore, int& outDepth) {
     MoveList root;
     generate_legal(pos, root);
-    if (root.size == 0) return 0; // no legal move (mate/stalemate); UCI layer handles
+    if (root.size == 0) { outBest = 0; outScore = 0; outDepth = 0; return; }
 
-    Move best = root.moves[0]; // safety default: always a legal move
-    crash::arm_fallback(to_uci(best).c_str());
+    Move best      = (startBest != 0) ? startBest : root.moves[0];
+    int  bestScore = 0;
+    int  bestDepth = 0;
+    int  prevScore = 0;
 
-    Searcher s;
-    s.stop     = &stop;
-    s.hard_ms  = tm.hard_ms;
-    s.start    = std::chrono::steady_clock::now();
-    s.nodes    = 1;  // start at 1 so the first stop/time check fires at nodes=2048
-    s.aborted  = false;
-
-    // Initialize move-ordering tables before the iterative deepening loop.
-    // These persist across depths within one think() call so killers and
-    // history learned at shallow depths inform deeper searches.
-    std::memset(s.killers, 0, sizeof(s.killers));
-    std::memset(s.history, 0, sizeof(s.history));
-
-    int maxDepth = (L.depth > 0) ? std::min(L.depth, MAX_PLY) : MAX_PLY;
-
-    int prevScore = 0; // tracks score from the last completed depth for aspiration
-
-    // ── root_search lambda ────────────────────────────────────────────────────
-    // Performs PVS over the root legal moves within [alpha, beta].
-    // Updates iterBest/iterScore. Returns the best score found.
-    // On abort, iterBest/iterScore reflect partial results from this depth.
-    // NOTE: this lambda captures root, s, pos by reference so it can mutate them.
     Move iterBest  = best;
     int  iterScore = 0;
 
+    // ── root_search ─────────────────────────────────────────────────────────
+    // PVS over the root legal moves within [alpha, beta]; updates iterBest /
+    // iterScore. On abort, iterBest/iterScore hold partial results from the
+    // moves searched so far this depth.
     auto root_search = [&](int depth, int alpha, int beta) -> int {
-        // Re-order: put iterBest (best from previous aspiration attempt or
-        // previous depth) first so the PVS first-move gets the best candidate.
+        // Put iterBest first so the PVS first-move is the best candidate.
         for (int i = 0; i < root.size; ++i) {
             if (root.moves[i] == iterBest) {
                 if (i != 0) std::swap(root.moves[0], root.moves[i]);
@@ -565,8 +554,8 @@ Move think(Position& pos, const Limits& L, std::atomic<bool>& stop,
             }
         }
 
-        int  bestScore = -INF;
-        Move localBest = iterBest; // keep previous best as fallback
+        int  rootBest  = -INF;
+        Move localBest = iterBest;
         bool firstMove = true;
 
         for (int i = 0; i < root.size; ++i) {
@@ -586,23 +575,19 @@ Move think(Position& pos, const Limits& L, std::atomic<bool>& stop,
             if (s.aborted) break;
             firstMove = false;
 
-            if (score > bestScore) {
-                bestScore = score;
+            if (score > rootBest) {
+                rootBest  = score;
                 localBest = root.moves[i];
             }
             if (score > alpha) alpha = score;
-            // No beta cutoff at root: we always want to find the best move.
-            // (Early break would miss a better move that beats the window.)
+            // No beta cutoff at root: always look for the best move.
         }
 
-        // Only update iterBest/iterScore if we got a useful result (not aborted
-        // with no moves tried at all). If aborted after the first move we still
-        // have a valid localBest from that move.
-        if (bestScore > -INF) {
+        if (rootBest > -INF) {
             iterBest  = localBest;
-            iterScore = bestScore;
+            iterScore = rootBest;
         }
-        return bestScore;
+        return rootBest;
     };
 
     for (int depth = 1; depth <= maxDepth; ++depth) {
@@ -617,8 +602,6 @@ Move think(Position& pos, const Limits& L, std::atomic<bool>& stop,
         }
 
         int scoreThisDepth = 0;
-        // Reset iterBest to best (last completed depth's best) at the start of
-        // each new depth so root_search has a good first-move candidate.
         iterBest  = best;
         iterScore = 0;
 
@@ -628,50 +611,150 @@ Move think(Position& pos, const Limits& L, std::atomic<bool>& stop,
             if (s.aborted) break;
 
             if (scoreThisDepth <= alpha) {
-                // Fail low: widen downward.
                 beta  = (alpha + beta) / 2;
                 alpha = std::max(-INF, scoreThisDepth - delta);
                 delta += delta / 2;
             } else if (scoreThisDepth >= beta) {
-                // Fail high: widen upward.
                 beta = std::min(INF, scoreThisDepth + delta);
                 delta += delta / 2;
             } else {
-                // In window: accept the result.
-                break;
+                break; // in window: accept
             }
 
-            // Safety valve: bail to full window to prevent loops on weird positions.
-            if (delta > 2000) {
-                alpha = -INF;
-                beta  =  INF;
-            }
+            if (delta > 2000) { alpha = -INF; beta = INF; }
         }
 
         if (s.aborted) break;
 
-        // Commit the completed depth's result.
+        // Commit the completed depth.
         prevScore = scoreThisDepth;
         best      = iterBest;
+        bestScore = scoreThisDepth;
+        bestDepth = depth;
 
         // Store the completed root result (EXACT — full window, full search).
+        // Shared TT: lockless XOR scheme makes concurrent stores safe.
         tt.store(pos.key(), best, toTT(scoreThisDepth, 0), 0, (uint8_t)depth, BOUND_EXACT);
-        crash::arm_fallback(to_uci(best).c_str());
 
-        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                      std::chrono::steady_clock::now() - s.start)
-                      .count();
-        if (out_mtx) out_mtx->lock();
-        out << "info depth " << depth
-            << " score cp " << scoreThisDepth
-            << " nodes " << s.nodes
-            << " time " << ms
-            << " pv " << to_uci(best) << std::endl;
-        if (out_mtx) out_mtx->unlock();
+        if (isMain) {
+            crash::arm_fallback(to_uci(best).c_str());
 
-        if (ms >= tm.soft_ms) break; // don't start an iteration we likely can't finish
+            auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                          std::chrono::steady_clock::now() - s.start)
+                          .count();
+            if (out_mtx) out_mtx->lock();
+            out << "info depth " << depth
+                << " score cp " << scoreThisDepth
+                << " nodes " << s.nodes
+                << " time " << ms
+                << " pv " << to_uci(best) << std::endl;
+            if (out_mtx) out_mtx->unlock();
+
+            // Soft-time management is the MAIN thread's job only. When the main
+            // thread decides to stop starting new iterations, it raises the
+            // shared stop flag so every helper aborts its current search too.
+            if (ms >= tm.soft_ms) { stop.store(true); break; }
+        } else {
+            // Helpers ignore soft time; they keep deepening (filling the TT)
+            // until the shared stop flag / hard limit aborts them.
+            if (stop.load()) break;
+        }
     }
 
+    // Make sure helpers also unblock the main thread's join promptly if THIS
+    // thread is the one that hit max depth or ran out of legal work.
+    if (isMain) stop.store(true);
+
+    outBest  = best;
+    outScore = bestScore;
+    outDepth = bestDepth;
+}
+
+// ── think ─────────────────────────────────────────────────────────────────────
+// Lazy SMP entry point. Spawns `threads` workers (clamped to [1,256]). Each
+// worker owns a private Searcher + a private Position clone (copy_from) and runs
+// the iterative-deepening search above, all sharing the global TT and the `stop`
+// flag. Thread 0 (run inline on the calling thread) drives time management,
+// prints info/bestmove, and reports the result. Helpers are silent and are
+// ALWAYS joined before returning (every exit path) so there is never a dangling
+// thread and never a data race on per-thread state.
+//
+// GUARANTEE: returns exactly one legal Move (or 0 only when there is no legal
+// move at all), never crashes, and always joins all helper threads.
+Move think(Position& pos, const Limits& L, std::atomic<bool>& stop,
+           int overhead, int threads,
+           std::ostream& out, std::mutex* out_mtx) {
+    TimeManager tm;
+    tm.init(L, pos.side_to_move(), overhead);
+
+    // One-time LMR table initialisation (fast: just 64*64 = 4096 entries).
+    if (!lmr_ready) { init_lmr(); lmr_ready = true; }
+
+    // Ensure the TT is sized before the first search (covers direct callers
+    // that never went through the UCI `Hash` option). Default 64 MB.
+    if (tt.size() == 0) tt.resize(64);
+    tt.new_search();
+
+    // No legal move → mate/stalemate; the UCI layer handles emitting bestmove.
+    MoveList root0;
+    generate_legal(pos, root0);
+    if (root0.size == 0) return 0;
+
+    Move startBest = root0.moves[0];        // safety default: always legal
+    crash::arm_fallback(to_uci(startBest).c_str());
+
+    const int nThreads = std::max(1, std::min(256, threads));
+    const int maxDepth = (L.depth > 0) ? std::min(L.depth, MAX_PLY) : MAX_PLY;
+    const auto startTime = std::chrono::steady_clock::now();
+
+    // ── Allocate per-thread state ───────────────────────────────────────────
+    // Each helper gets its OWN Searcher (nodes/killers/history) and its OWN
+    // Position clone. Thread 0 uses index 0. Position clones must outlive the
+    // worker threads, hence the vectors live here on the stack of think().
+    std::vector<Searcher> searchers(nThreads);
+    std::vector<Position> positions(nThreads);
+    std::vector<Move>     bestMoves(nThreads, startBest);
+    std::vector<int>      bestScores(nThreads, 0);
+    std::vector<int>      bestDepths(nThreads, 0);
+
+    for (int t = 0; t < nThreads; ++t) {
+        Searcher& s = searchers[t];
+        s.stop    = &stop;
+        s.hard_ms = tm.hard_ms;
+        s.start   = startTime;
+        s.nodes   = 1; // first stop/time check fires at nodes=2048
+        s.aborted = false;
+        std::memset(s.killers, 0, sizeof(s.killers));
+        std::memset(s.history, 0, sizeof(s.history));
+        positions[t].copy_from(pos); // private clone with full repetition history
+    }
+
+    // ── Spawn helpers (threads 1..N-1) ──────────────────────────────────────
+    std::vector<std::thread> helpers;
+    helpers.reserve(nThreads > 0 ? nThreads - 1 : 0);
+    for (int t = 1; t < nThreads; ++t) {
+        helpers.emplace_back([&, t]() {
+            smp_worker(searchers[t], positions[t], tm, maxDepth,
+                       /*isMain=*/false, startBest, stop,
+                       out, out_mtx, bestMoves[t], bestScores[t], bestDepths[t]);
+        });
+    }
+
+    // ── Run the main thread (index 0) inline ────────────────────────────────
+    smp_worker(searchers[0], positions[0], tm, maxDepth,
+               /*isMain=*/true, startBest, stop,
+               out, out_mtx, bestMoves[0], bestScores[0], bestDepths[0]);
+
+    // ── Join ALL helpers (every exit path) ──────────────────────────────────
+    // The main worker raised `stop` on exit, so helpers see it and finish.
+    for (auto& h : helpers)
+        if (h.joinable()) h.join();
+
+    // ── Report thread 0's result ────────────────────────────────────────────
+    // Simple, correct Lazy SMP: the main thread reports. Its best move comes
+    // from its own deepest completed iteration; helpers only enriched the TT.
+    Move best = bestMoves[0];
+    if (best == 0) best = startBest; // ultra-defensive: never return null here
     return best;
 }
 

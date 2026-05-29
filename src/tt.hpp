@@ -1,6 +1,7 @@
 #pragma once
 #include <cstdint>
 #include <cstddef>
+#include <atomic>
 #include <vector>
 #include "types.hpp"
 
@@ -12,11 +13,19 @@ namespace king {
 //   BOUND_UPPER  — score is an upper bound (fail-low, score <= alpha)
 enum Bound : uint8_t { BOUND_NONE = 0, BOUND_UPPER = 1, BOUND_LOWER = 2, BOUND_EXACT = 3 };
 
-// A single transposition-table slot. Kept small (16 bytes) so many fit per
-// cache line. `score`/`eval` are mate-adjusted by the search (by ply) at the
+// A single transposition-table slot as seen by callers (probe output / store
+// input). `score`/`eval` are mate-adjusted by the search (by ply) at the
 // store/probe boundary — the TT itself stores them verbatim.
+//
+// Internally the table does NOT store this struct directly. Each physical slot
+// is a pair of std::atomic<uint64_t> words (see TTSlot below): one "data" word
+// packing {move, score, eval, depth, genBound}, and one "key" word holding
+// (zobristKey XOR data). This is the lockless XOR scheme (Hyatt): a torn,
+// half-updated slot fails the recomputed-key check on probe and is treated as a
+// miss, so concurrent probe/store can never return a corrupt entry and no locks
+// are needed in the hot path.
 struct TTEntry {
-    uint16_t key16;    // upper 16 bits of the zobrist key (cheap collision check)
+    uint16_t key16;    // upper 16 bits of the zobrist key (collision-check, informational)
     Move     move;     // best / refutation move (used for move ordering)
     int16_t  score;    // search score (mate scores are ply-adjusted by search)
     int16_t  eval;     // static eval (optional; 0 if unused)
@@ -38,8 +47,9 @@ public:
     void new_search();
 
     // Probe the slot for `key`. Returns true and fills `tte` iff the slot holds
-    // an entry whose key16 matches (collision-checked). On a miss `tte` is left
-    // with whatever was in the slot (caller should ignore it on false).
+    // an entry whose recomputed key matches the full 64-bit `key` (lockless XOR
+    // check, which also rejects torn entries). On a miss `tte` is left
+    // untouched-meaningful (caller must ignore it on false).
     bool probe(uint64_t key, TTEntry& tte) const;
 
     // Store/refresh the entry for `key`. Replacement policy: write if the slot
@@ -58,12 +68,25 @@ public:
     size_t size() const { return table_.size(); }
 
 private:
-    std::vector<TTEntry> table_;
+    // One physical slot: two relaxed-atomic words implementing the XOR scheme.
+    //   data = packed {move:16, score:16, eval:16, depth:8, genBound:8}
+    //   key  = zobristKey XOR data
+    // Reading key^data must reproduce the original zobristKey for the slot to be
+    // considered a valid (non-torn) match. Relaxed atomics keep the accesses
+    // data-race-free under the C++ memory model (so ThreadSanitizer is clean)
+    // while imposing no ordering cost; correctness of the *value* relies only on
+    // the XOR self-consistency check, not on inter-thread ordering.
+    struct TTSlot {
+        std::atomic<uint64_t> key{0};
+        std::atomic<uint64_t> data{0};
+    };
+
+    std::vector<TTSlot> table_;
     size_t  mask_       = 0; // (number of entries - 1); index = key & mask_
     uint8_t generation_ = 0;
 };
 
-// Global single instance. Single-threaded for now; SMP-safety is a later task.
+// Global single instance. Lockless / thread-safe (XOR scheme) for Lazy SMP.
 extern TT tt;
 
 } // namespace king

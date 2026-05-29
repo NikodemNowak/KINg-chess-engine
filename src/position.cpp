@@ -57,6 +57,41 @@ void Position::move_piece(Square from, Square to) {
     put_piece(p, to);
 }
 
+// ── Controlled deep clone ─────────────────────────────────────────────────────
+
+void Position::copy_from(const Position& o) {
+    // 1. Copy all board bitboards and the mailbox.
+    for (int i = 0; i < 6; ++i) by_type_[i] = o.by_type_[i];
+    by_color_[0] = o.by_color_[0];
+    by_color_[1] = o.by_color_[1];
+    for (int i = 0; i < 64; ++i) board_[i] = o.board_[i];
+
+    // 2. Copy scalar state.
+    stm_      = o.stm_;
+    castling_ = o.castling_;
+    ep_       = o.ep_;
+    halfmove_ = o.halfmove_;
+    fullmove_ = o.fullmove_;
+    key_      = o.key_;
+
+    // 3. Copy the repetition history verbatim (so the clone detects draws by
+    //    repetition exactly like the source).
+    hist_ = o.hist_;
+
+    // 4. Re-root the StateInfo chain. The clone owns a FRESH root with
+    //    previous == nullptr, and st_ points at it. Search on the clone only
+    //    ever undoes moves it itself made, so it never walks past this root;
+    //    we still snapshot the current scalars into root_ for consistency.
+    root_.previous      = nullptr;
+    root_.captured      = NO_PIECE;
+    root_.prev_ep       = o.ep_;
+    root_.prev_castling = o.castling_;
+    root_.prev_halfmove = o.halfmove_;
+    root_.prev_fullmove = o.fullmove_;
+    root_.prev_key      = o.key_;
+    st_ = &root_;
+}
+
 // ── Make / unmake ─────────────────────────────────────────────────────────────
 
 void Position::do_move(Move m, StateInfo& st) {

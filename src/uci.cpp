@@ -113,7 +113,11 @@ void run(std::istream& in, std::ostream& out) {
     std::thread worker;
 
     int hashMB       = 64;
-    int threads      = 1;
+    // Default Threads = all hardware cores (clamped to [1,256]) so the
+    // competition harness auto-uses every core even if it never sets the option.
+    // hardware_concurrency() can return 0 if it can't detect — fall back to 1.
+    unsigned hc = std::thread::hardware_concurrency();
+    int threads      = std::max(1, std::min(256, hc == 0 ? 1 : (int)hc));
     int moveOverhead = 200;
 
     auto join_worker = [&]() {
@@ -139,7 +143,8 @@ void run(std::istream& in, std::ostream& out) {
                 out << "id name KINg\n";
                 out << "id author KINg Team\n";
                 out << "option name Hash type spin default 64 min 1 max 1024\n";
-                out << "option name Threads type spin default 1 min 1 max 256\n";
+                out << "option name Threads type spin default " << threads
+                    << " min 1 max 256\n";
                 out << "option name Move Overhead type spin default 200 min 0 max 5000\n";
                 out << "option name Ponder type check default false\n";
                 out << "uciok\n";

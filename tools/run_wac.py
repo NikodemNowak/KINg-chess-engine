@@ -45,6 +45,12 @@ def run_wac(engine_path: str, movetime_ms: int, epd_path: str) -> None:
 
     engine = chess.engine.SimpleEngine.popen_uci(engine_path)
     engine_name = engine.id.get("name", os.path.basename(engine_path))
+    # Force single-thread so WAC scores stay deterministic and comparable to
+    # prior single-thread numbers (the engine now defaults Threads to all cores).
+    try:
+        engine.configure({"Threads": 1})
+    except Exception:
+        pass
     limit = chess.engine.Limit(time=movetime_ms / 1000.0)
 
     with open(epd_path, "r", encoding="utf-8") as f:
