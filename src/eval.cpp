@@ -1,53 +1,40 @@
-// Tapered piece-square-table (PeSTO) evaluation.
+// Tapered piece-square-table (PeSTO) evaluation + handcrafted structural terms.
 //
-// Source: PeSTO's Evaluation Function by Ronald Friederich, published on the
-//   Chess Programming Wiki:
+// PeSTO Source: Ronald Friederich, Chess Programming Wiki:
 //   https://www.chessprogramming.org/PeSTO%27s_Evaluation_Function
 //
-// Orientation note: The Wiki tables are printed rank-8-first (a8=row0, a1=row7).
-// Our engine uses a1=0, h8=63 (rank-major, rank 1 first — see types.hpp).
-// All tables below have been flipped vertically so that index 0 = a1, index 63 = h8.
-//
-// For Black pieces we mirror vertically: sq ^ 56 (swaps rank 1 ↔ rank 8, etc.),
-// which converts the square to the equivalent White-perspective index.
+// Orientation: a1=0, h8=63 (rank-major, rank 1 first — see types.hpp).
+// Black pieces are mirrored vertically: sq ^ 56.
 // The taper weight is a game-phase counter (24 = full midgame, 0 = full endgame).
+//
+// Structural terms (all color-symmetric, added to the same mg/eg accumulators):
+//   bishop_pair, rook_open_file, rook_semiopen_file,
+//   pawn_isolated, pawn_doubled, passed_pawn, mobility, king_safety.
 
 #include "eval.hpp"
 #include "bitboard.hpp"
+#include "attacks.hpp"
 
 namespace king {
 
 // ── Piece values (midgame / endgame) ─────────────────────────────────────────
-// P, N, B, R, Q, K
 static constexpr int MG_VALUE[6] = {  82, 337, 365, 477, 1025,    0 };
 static constexpr int EG_VALUE[6] = {  94, 281, 297, 512,  936,    0 };
 
 // ── Phase increment per piece type ───────────────────────────────────────────
-// P=0, N=1, B=1, R=2, Q=4, K=0  (total for both sides at start = 24)
 static constexpr int PHASE_INC[6] = { 0, 1, 1, 2, 4, 0 };
 
 // ── PSQT tables ──────────────────────────────────────────────────────────────
 // All from White's POV. Index 0 = a1 (rank 1), index 63 = h8 (rank 8).
-// Row 0 below = rank 1 (a1..h1), row 7 = rank 8 (a8..h8).
-// (The original PeSTO Wiki tables start at rank 8; they are reversed here.)
 
-// Pawn — rank 1 and rank 8 are always 0 (impossible positions for a pawn)
 static constexpr int MG_PSQT_PAWN[64] = {
-     // rank 1 (a1..h1)
       0,   0,   0,   0,   0,   0,   0,   0,
-     // rank 2
     -35,  -1, -20, -23, -15,  24,  38, -22,
-     // rank 3
     -26,  -4,  -4, -10,   3,   3,  33, -12,
-     // rank 4
     -27,  -2,  -5,  12,  17,   6,  10, -25,
-     // rank 5
     -14,  13,   6,  21,  23,  12,  17, -23,
-     // rank 6
      -6,   7,  26,  31,  65,  56,  25, -20,
-     // rank 7
      98, 134,  61,  95,  68, 126,  34, -11,
-     // rank 8
       0,   0,   0,   0,   0,   0,   0,   0,
 };
 static constexpr int EG_PSQT_PAWN[64] = {
@@ -61,7 +48,6 @@ static constexpr int EG_PSQT_PAWN[64] = {
       0,   0,   0,   0,   0,   0,   0,   0,
 };
 
-// Knight
 static constexpr int MG_PSQT_KNIGHT[64] = {
     -105, -21, -58, -33, -17, -28, -19,  -23,
      -29, -53, -12,  -3,  -1,  18, -14,  -19,
@@ -83,7 +69,6 @@ static constexpr int EG_PSQT_KNIGHT[64] = {
     -58, -38, -13, -28, -31, -27, -63, -99,
 };
 
-// Bishop
 static constexpr int MG_PSQT_BISHOP[64] = {
     -33,  -3, -14, -21, -13, -12, -39, -21,
       4,  15,  16,   0,   7,  21,  33,   1,
@@ -105,7 +90,6 @@ static constexpr int EG_PSQT_BISHOP[64] = {
     -14, -21, -11,  -8, -7,  -9, -17, -24,
 };
 
-// Rook
 static constexpr int MG_PSQT_ROOK[64] = {
     -19, -13,   1,  17, 16,  7, -37, -26,
     -44, -16, -20,  -9, -1, 11,  -6, -71,
@@ -127,7 +111,6 @@ static constexpr int EG_PSQT_ROOK[64] = {
     13, 10, 18, 15, 12,  12,   8,   5,
 };
 
-// Queen
 static constexpr int MG_PSQT_QUEEN[64] = {
      -1, -18,  -9,  10, -15, -25, -31, -50,
     -35,  -8,  11,   2,   8,  15,  -3,   1,
@@ -149,7 +132,6 @@ static constexpr int EG_PSQT_QUEEN[64] = {
      -9,  22,  22,  27,  27,  19,  10,  20,
 };
 
-// King
 static constexpr int MG_PSQT_KING[64] = {
     -15,  36,  12, -54,   8, -28,  24,  14,
       1,   7,  -8, -64, -43, -16,   9,   8,
@@ -171,7 +153,6 @@ static constexpr int EG_PSQT_KING[64] = {
     -74, -35, -18, -18, -11,  15,   4, -17,
 };
 
-// Aggregate per piece type (indexed by PieceType enum: P=0..K=5)
 static const int* MG_PSQT[6] = {
     MG_PSQT_PAWN, MG_PSQT_KNIGHT, MG_PSQT_BISHOP,
     MG_PSQT_ROOK, MG_PSQT_QUEEN,  MG_PSQT_KING
@@ -181,23 +162,289 @@ static const int* EG_PSQT[6] = {
     EG_PSQT_ROOK, EG_PSQT_QUEEN,  EG_PSQT_KING
 };
 
+// ── Structural term weights ───────────────────────────────────────────────────
+// Format: {mg, eg}  (Texel-tunable — keep as named constants)
+
+// Bishop pair
+static constexpr int BISHOP_PAIR_MG = 30;
+static constexpr int BISHOP_PAIR_EG = 50;
+
+// Rook file bonuses
+static constexpr int ROOK_OPEN_MG     = 25;
+static constexpr int ROOK_OPEN_EG     = 10;
+static constexpr int ROOK_SEMIOPEN_MG = 12;
+static constexpr int ROOK_SEMIOPEN_EG =  5;
+
+// Pawn structure penalties (positive values = penalty, subtracted below)
+static constexpr int PAWN_ISOLATED_MG = 15;
+static constexpr int PAWN_ISOLATED_EG = 18;
+static constexpr int PAWN_DOUBLED_MG  = 10;
+static constexpr int PAWN_DOUBLED_EG  = 25;
+
+// Passed pawn bonus by relative rank (0-indexed, rank 0 = own back rank, never occupied by pawn)
+static constexpr int PASSED_MG[8] = { 0,  2,  6, 12, 22, 40,  65, 0 };
+static constexpr int PASSED_EG[8] = { 0,  5, 15, 30, 55, 85, 130, 0 };
+
+// Mobility: (count - pivot) * weight  per piece type  (N, B, R, Q)
+// Conservative weights — Texel tuning will refine these
+static constexpr int MOB_PIVOT[4]  = { 4, 6,  7, 14 };  // indexed 0=N,1=B,2=R,3=Q
+static constexpr int MOB_MG[4]     = { 3, 2,  1,  1 };
+static constexpr int MOB_EG[4]     = { 3, 2,  2,  1 };
+
+// King safety — conservative weights to avoid over-penalizing normal piece activity
+// Attack units: per piece type that has ≥1 square in king zone (not per square)
+static constexpr int KING_ATTACK_UNITS[6]  = { 0, 1, 1, 2, 3, 0 };  // per attacking piece
+static constexpr int PAWN_SHIELD_MG = 5;    // per shielding pawn, mg only
+static constexpr int KING_SAFETY_MAX = 100; // cap penalty magnitude (conservative for untuned)
+// Coefficient for quadratic penalty: units*units / KING_SAFETY_DIVISOR
+static constexpr int KING_SAFETY_DIVISOR = 8;
+
+// ── Helper: adjacent-file mask ────────────────────────────────────────────────
+// Returns a mask of the files adjacent to the file of square s.
+static inline Bitboard adjacent_files(File f) {
+    Bitboard m = 0;
+    if (f > FILE_A) m |= file_bb(File(f - 1));
+    if (f < FILE_H) m |= file_bb(File(f + 1));
+    return m;
+}
+
+// Forward span: all squares strictly ahead of sq for color c (same file).
+// For WHITE: squares above sq on same file; for BLACK: squares below sq on same file.
+static inline Bitboard forward_file_span(Color c, Square sq) {
+    // file mask minus the square itself and behind
+    Bitboard f = file_bb(file_of(sq));
+    if (c == WHITE) {
+        // ranks above sq
+        Bitboard above = ~((Bitboard(1) << (sq + 1)) - 1); // all bits >= sq+1... not quite
+        // simpler: shift the square bit north repeatedly — just use rank mask arithmetic
+        // squares on same file with rank > rank_of(sq)
+        Rank r = rank_of(sq);
+        Bitboard ahead = 0;
+        for (int rr = r + 1; rr <= RANK_8; ++rr)
+            ahead |= (RANK_1_BB << (rr * 8));
+        return f & ahead;
+    } else {
+        Rank r = rank_of(sq);
+        Bitboard ahead = 0;
+        for (int rr = 0; rr < r; ++rr)
+            ahead |= (RANK_1_BB << (rr * 8));
+        return f & ahead;
+    }
+}
+
+// Forward span on file AND adjacent files ahead of sq for color c.
+// Used for passed pawn detection: no enemy pawn on file or adjacent files ahead.
+static inline Bitboard passed_pawn_mask(Color c, Square sq) {
+    File f = file_of(sq);
+    Bitboard files = file_bb(f) | adjacent_files(f);
+    Rank r = rank_of(sq);
+    Bitboard ahead = 0;
+    if (c == WHITE) {
+        for (int rr = r + 1; rr <= RANK_8; ++rr)
+            ahead |= (RANK_1_BB << (rr * 8));
+    } else {
+        for (int rr = 0; rr < r; ++rr)
+            ahead |= (RANK_1_BB << (rr * 8));
+    }
+    return files & ahead;
+}
+
+// Relative rank: rank from the perspective of color c (0 = own back rank, 7 = promotion rank)
+static inline int relative_rank(Color c, Square sq) {
+    int r = rank_of(sq);
+    return (c == WHITE) ? r : (7 - r);
+}
+
+// ── Per-side structural score ─────────────────────────────────────────────────
+// Returns {mg_score, eg_score} for one side.
+static void eval_side(const Position& pos, Color c, int& mg, int& eg) {
+
+    const Color them = Color(c ^ 1);
+    const Bitboard occ        = pos.occupied();
+    const Bitboard own_pawns  = pos.pieces(c,    PAWN);
+    const Bitboard their_pawns = pos.pieces(them, PAWN);
+
+    // ── Bishop pair ──────────────────────────────────────────────────────────
+    if (popcount(pos.pieces(c, BISHOP)) >= 2) {
+        mg += BISHOP_PAIR_MG;
+        eg += BISHOP_PAIR_EG;
+    }
+
+    // ── Pawn structure ───────────────────────────────────────────────────────
+    {
+        Bitboard pawns = own_pawns;
+        while (pawns) {
+            Square sq = pop_lsb(pawns);
+            File f = file_of(sq);
+
+            // Isolated: no own pawns on adjacent files
+            if (!(own_pawns & adjacent_files(f))) {
+                mg -= PAWN_ISOLATED_MG;
+                eg -= PAWN_ISOLATED_EG;
+            }
+
+            // Doubled: count own pawns on same file; penalise extras only
+            // (we'll count total pawns on file, subtract 1 for base, penalise rest)
+            // We do this once per file to avoid double-counting; track via file set.
+        }
+
+        // Doubled pawn penalty — per-file, once
+        for (int fi = FILE_A; fi <= FILE_H; ++fi) {
+            Bitboard on_file = own_pawns & file_bb(File(fi));
+            int cnt = popcount(on_file);
+            if (cnt >= 2) {
+                // penalise the extras (cnt-1 extra pawns)
+                mg -= (cnt - 1) * PAWN_DOUBLED_MG;
+                eg -= (cnt - 1) * PAWN_DOUBLED_EG;
+            }
+        }
+
+        // Passed pawn bonus
+        Bitboard pp = own_pawns;
+        while (pp) {
+            Square sq = pop_lsb(pp);
+            // A pawn is passed if there are no enemy pawns in its forward span
+            // (same file + adjacent files, all ranks ahead)
+            if (!(their_pawns & passed_pawn_mask(c, sq))) {
+                int relrank = relative_rank(c, sq);
+                mg += PASSED_MG[relrank];
+                eg += PASSED_EG[relrank];
+            }
+        }
+    }
+
+    // ── Rook file bonuses ────────────────────────────────────────────────────
+    {
+        Bitboard rooks = pos.pieces(c, ROOK);
+        while (rooks) {
+            Square sq = pop_lsb(rooks);
+            Bitboard fbb = file_bb(file_of(sq));
+            bool no_own   = !(own_pawns   & fbb);
+            bool no_their = !(their_pawns & fbb);
+            if (no_own && no_their) {
+                mg += ROOK_OPEN_MG;
+                eg += ROOK_OPEN_EG;
+            } else if (no_own) {
+                mg += ROOK_SEMIOPEN_MG;
+                eg += ROOK_SEMIOPEN_EG;
+            }
+        }
+    }
+
+    // ── Mobility ─────────────────────────────────────────────────────────────
+    // mobilityArea = squares NOT attacked by enemy pawns, excluding own pieces
+    {
+        // Build enemy pawn attack mask
+        Bitboard ep_attacks = 0;
+        Bitboard their_pw = their_pawns;
+        while (their_pw) {
+            Square s = pop_lsb(their_pw);
+            ep_attacks |= pawn_attacks[them][s];
+        }
+        Bitboard own_pieces  = pos.pieces(c);
+        Bitboard mob_area    = ~(ep_attacks | own_pieces);
+
+        // Knights (mob index 0)
+        {
+            Bitboard nb = pos.pieces(c, KNIGHT);
+            while (nb) {
+                Square s = pop_lsb(nb);
+                int cnt = popcount(knight_attacks[s] & mob_area);
+                mg += (cnt - MOB_PIVOT[0]) * MOB_MG[0];
+                eg += (cnt - MOB_PIVOT[0]) * MOB_EG[0];
+            }
+        }
+        // Bishops (mob index 1)
+        {
+            Bitboard bb2 = pos.pieces(c, BISHOP);
+            while (bb2) {
+                Square s = pop_lsb(bb2);
+                int cnt = popcount(bishop_attacks(s, occ) & mob_area);
+                mg += (cnt - MOB_PIVOT[1]) * MOB_MG[1];
+                eg += (cnt - MOB_PIVOT[1]) * MOB_EG[1];
+            }
+        }
+        // Rooks (mob index 2)
+        {
+            Bitboard rb = pos.pieces(c, ROOK);
+            while (rb) {
+                Square s = pop_lsb(rb);
+                int cnt = popcount(rook_attacks(s, occ) & mob_area);
+                mg += (cnt - MOB_PIVOT[2]) * MOB_MG[2];
+                eg += (cnt - MOB_PIVOT[2]) * MOB_EG[2];
+            }
+        }
+        // Queens (mob index 3)
+        {
+            Bitboard qb = pos.pieces(c, QUEEN);
+            while (qb) {
+                Square s = pop_lsb(qb);
+                int cnt = popcount(queen_attacks(s, occ) & mob_area);
+                mg += (cnt - MOB_PIVOT[3]) * MOB_MG[3];
+                eg += (cnt - MOB_PIVOT[3]) * MOB_EG[3];
+            }
+        }
+    }
+
+    // ── King safety ──────────────────────────────────────────────────────────
+    {
+        Square ksq  = pos.king_sq(c);
+        Bitboard zone = king_attacks[ksq] | square_bb(ksq);
+
+        // Sum up attack units from enemy pieces attacking the king zone
+        int units = 0;
+        for (int pt = KNIGHT; pt <= QUEEN; ++pt) {
+            Bitboard att = pos.pieces(them, (PieceType)pt);
+            while (att) {
+                Square s = pop_lsb(att);
+                Bitboard piece_att;
+                switch (pt) {
+                    case KNIGHT: piece_att = knight_attacks[s]; break;
+                    case BISHOP: piece_att = bishop_attacks(s, occ); break;
+                    case ROOK:   piece_att = rook_attacks(s, occ); break;
+                    default:     piece_att = queen_attacks(s, occ); break;
+                }
+                int overlap = popcount(piece_att & zone);
+                if (overlap > 0)
+                    units += KING_ATTACK_UNITS[pt];
+            }
+        }
+        // Quadratic penalty, mg-heavy, conservative divisor
+        int penalty = (units * units) / KING_SAFETY_DIVISOR;
+        if (penalty > KING_SAFETY_MAX) penalty = KING_SAFETY_MAX;
+        mg -= penalty;
+        // eg penalty is 0 (king safety is primarily a midgame concern)
+
+        // Pawn shield: own pawns on the 3 files around king, on the 2 ranks in front
+        File kf = file_of(ksq);
+        Rank kr = rank_of(ksq);
+        Bitboard shield_files = file_bb(kf) | adjacent_files(kf);
+        // The 2 ranks directly in front
+        Bitboard shield_ranks = 0;
+        if (c == WHITE) {
+            if (kr + 1 <= RANK_8) shield_ranks |= rank_bb(Rank(kr + 1));
+            if (kr + 2 <= RANK_8) shield_ranks |= rank_bb(Rank(kr + 2));
+        } else {
+            if (kr - 1 >= RANK_1) shield_ranks |= rank_bb(Rank(kr - 1));
+            if (kr - 2 >= RANK_1) shield_ranks |= rank_bb(Rank(kr - 2));
+        }
+        int shield = popcount(own_pawns & shield_files & shield_ranks);
+        mg += shield * PAWN_SHIELD_MG;
+    }
+}
+
 // ── evaluate ─────────────────────────────────────────────────────────────────
 // Returns score in centipawns relative to the side to move.
-// Algorithm:
-//   1. Accumulate mg/eg scores and phase counter over all pieces.
-//   2. Taper: score = (mg * phase + eg * (24 - phase)) / 24.
-//   3. Flip sign for Black to move.
 int evaluate(const Position& pos) {
     int mg = 0, eg = 0, phase = 0;
 
+    // PSQT + material (unchanged from PeSTO base)
     for (int c = WHITE; c <= BLACK; ++c) {
         const int sign = (c == WHITE) ? +1 : -1;
         for (int pt = PAWN; pt <= KING; ++pt) {
             Bitboard bb = pos.pieces((Color)c, (PieceType)pt);
             while (bb) {
                 Square s = pop_lsb(bb);
-                // Mirror rank for Black: rank 1 ↔ rank 8, so Black a8 (idx 56)
-                // maps to idx 0 (White a1 view), Black a1 (idx 0) maps to idx 56.
                 int idx = (c == WHITE) ? s : (s ^ 56);
                 mg += sign * (MG_VALUE[pt] + MG_PSQT[pt][idx]);
                 eg += sign * (EG_VALUE[pt] + EG_PSQT[pt][idx]);
@@ -206,7 +453,17 @@ int evaluate(const Position& pos) {
         }
     }
 
-    if (phase > 24) phase = 24; // clamp (early promotions)
+    // Structural terms: compute for white, subtract for black (perfectly symmetric)
+    {
+        int w_mg = 0, w_eg = 0;
+        int b_mg = 0, b_eg = 0;
+        eval_side(pos, WHITE, w_mg, w_eg);
+        eval_side(pos, BLACK, b_mg, b_eg);
+        mg += (w_mg - b_mg);
+        eg += (w_eg - b_eg);
+    }
+
+    if (phase > 24) phase = 24;
     int score = (mg * phase + eg * (24 - phase)) / 24;
     return (pos.side_to_move() == WHITE) ? score : -score;
 }

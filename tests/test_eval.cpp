@@ -48,3 +48,40 @@ TEST_CASE("knight prefers center over corner") {
     d.set_fen("4k3/8/8/4N3/8/8/8/4K3 w - - 0 1"); // Ne5 (center)
     CHECK(evaluate(d) > evaluate(c));
 }
+
+// ── New structural term tests ─────────────────────────────────────────────────
+
+TEST_CASE("passed pawn scores higher than blocked pawn") {
+    ev_init();
+    // White pawn on e5 with no enemy pawns on d,e,f files ahead — passed
+    Position pass;
+    pass.set_fen("4k3/8/8/4P3/8/8/8/4K3 w - - 0 1");
+    // White pawn on e5 with enemy pawn on e6 blocking it — not passed
+    Position block;
+    block.set_fen("4k3/8/4p3/4P3/8/8/8/4K3 w - - 0 1");
+    CHECK(evaluate(pass) > evaluate(block));
+}
+
+TEST_CASE("bishop pair scores higher than single bishop") {
+    ev_init();
+    // White has two bishops, Black has one
+    Position two_bish;
+    two_bish.set_fen("4k3/8/8/8/8/8/8/2BBK3 w - - 0 1");
+    Position one_bish;
+    one_bish.set_fen("4k3/8/8/8/8/8/8/3BK3 w - - 0 1");
+    CHECK(evaluate(two_bish) > evaluate(one_bish));
+}
+
+TEST_CASE("rook on open file scores higher than closed file") {
+    ev_init();
+    // Same material: both sides have rook + king + one pawn each on d-file.
+    // White rook on e1: e-file has no pawns at all — open file bonus.
+    Position open_f;
+    open_f.set_fen("4k3/3p4/8/8/8/8/3P4/4RK2 w - - 0 1");
+    // White rook on e1: e-file has own pawn — blocked, no bonus.
+    // Identical material: white d2-pawn moved to e2; black d7-pawn stays.
+    Position closed_f;
+    closed_f.set_fen("4k3/3p4/8/8/8/8/4P3/4RK2 w - - 0 1");
+    // open file should score better (same material, rook has open-file bonus in open_f)
+    CHECK(evaluate(open_f) > evaluate(closed_f));
+}
