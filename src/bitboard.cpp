@@ -86,8 +86,10 @@ void init() {
                 if (delta != 8 && delta != -8) {
                     int cur_file = cur & 7;
                     int expected_file_diff = (delta > 0) ? 1 : -1;
-                    if (delta == 9 || delta == 7)   expected_file_diff =  1;
-                    if (delta == -9 || delta == -7)  expected_file_diff = -1;
+                    if (delta == 9)   expected_file_diff =  1;
+                    if (delta == 7)   expected_file_diff = -1;
+                    if (delta == -9)  expected_file_diff = -1;
+                    if (delta == -7)  expected_file_diff =  1;
                     if (delta == 1)                  expected_file_diff =  1;
                     if (delta == -1)                 expected_file_diff = -1;
                     if (cur_file - prev_file != expected_file_diff) {
@@ -117,8 +119,10 @@ void init() {
                     if (delta != 8 && delta != -8) {
                         int cf = c & 7;
                         int efd = (delta > 0) ? -1 : 1;
-                        if (delta == 9 || delta == 7)   efd = -1;
-                        if (delta == -9 || delta == -7)  efd =  1;
+                        if (delta == 9)   efd = -1;
+                        if (delta == 7)   efd =  1;
+                        if (delta == -9)  efd =  1;
+                        if (delta == -7)  efd = -1;
                         if (delta == 1)                  efd = -1;
                         if (delta == -1)                 efd =  1;
                         if (cf - pf != efd) break;
@@ -137,8 +141,10 @@ void init() {
                     if (delta != 8 && delta != -8) {
                         int cf = c & 7;
                         int efd = (delta > 0) ? 1 : -1;
-                        if (delta == 9 || delta == 7)   efd =  1;
-                        if (delta == -9 || delta == -7)  efd = -1;
+                        if (delta == 9)   efd =  1;
+                        if (delta == 7)   efd = -1;
+                        if (delta == -9)  efd = -1;
+                        if (delta == -7)  efd =  1;
                         if (delta == 1)                  efd =  1;
                         if (delta == -1)                 efd = -1;
                         if (cf - pf != efd) break;

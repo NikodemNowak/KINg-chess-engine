@@ -27,4 +27,12 @@ TEST_CASE("between and line") {
   CHECK(line_bb(A1, A5) == FILE_A_BB);        // whole a-file
   CHECK((line_bb(A1, H1) & RANK_1_BB) == RANK_1_BB);
   CHECK(line_bb(A1, B3) == 0ULL);             // not aligned
+
+  // Anti-diagonal regression (H1–A8 direction, delta == 7 / -7)
+  CHECK(between_bb(H1, A8) == (square_bb(G2)|square_bb(F3)|square_bb(E4)|square_bb(D5)|square_bb(C6)|square_bb(B7)));
+  CHECK(between_bb(H8, A1) == (square_bb(G7)|square_bb(F6)|square_bb(E5)|square_bb(D4)|square_bb(C3)|square_bb(B2)));
+  CHECK(line_bb(H1, A8) == line_bb(B7, G2));            // same anti-diagonal, full span
+  CHECK((line_bb(H1, A8) & square_bb(H1)) != 0ULL);
+  CHECK((line_bb(H1, A8) & square_bb(A8)) != 0ULL);
+  CHECK(between_bb(H1, A8) != 0ULL);
 }
