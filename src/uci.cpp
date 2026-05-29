@@ -8,6 +8,7 @@
 #include "zobrist.hpp"
 #include "tt.hpp"
 #include "types.hpp"
+#include "syzygy.hpp"
 
 #include <iostream>
 #include <sstream>
@@ -215,6 +216,8 @@ void run(std::istream& in, std::ostream& out) {
                     << " min 1 max 256\n";
                 out << "option name Move Overhead type spin default 200 min 0 max 5000\n";
                 out << "option name Ponder type check default false\n";
+                out << "option name SyzygyPath type string default <empty>\n";
+                out << "option name SyzygyProbeDepth type spin default 1 min 0 max 100\n";
                 out << "uciok\n";
                 out.flush();
             }
@@ -263,6 +266,16 @@ void run(std::istream& in, std::ostream& out) {
                     try { threads = std::max(1, std::min(256, std::stoi(val_str))); } catch (...) {}
                 } else if (opt_lower == "move overhead") {
                     try { moveOverhead = std::max(0, std::min(5000, std::stoi(val_str))); } catch (...) {}
+                } else if (opt_lower == "syzygypath") {
+                    // val_str may be "<empty>" (the GUI default) or a real path.
+                    // If the user sends the literal "<empty>" or an empty string,
+                    // call init("") which disables TBs.
+                    std::string tb_path = val_str;
+                    if (tb_path == "<empty>") tb_path = "";
+                    syzygy::init(tb_path);
+                } else if (opt_lower == "syzygyrobedepth") {
+                    // Accepted and silently ignored for now
+                    // (probe depth threshold could be added here later)
                 }
                 // Unknown options silently ignored
             }

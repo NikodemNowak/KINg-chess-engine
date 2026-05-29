@@ -6,6 +6,7 @@
 #include "see.hpp"
 #include "crash.hpp"
 #include "eval.hpp"
+#include "syzygy.hpp"
 #include <atomic>
 #include <chrono>
 #include <iostream>
@@ -17,6 +18,22 @@
 #include <cstring>
 #include <utility>
 #include <cmath>
+
+// Fathom WDL constants (from tbprobe.h, mirrored here for clarity)
+#ifndef TB_LOSS
+#define TB_LOSS         0
+#define TB_BLESSED_LOSS 1
+#define TB_DRAW         2
+#define TB_CURSED_WIN   3
+#define TB_WIN          4
+#define TB_RESULT_FAILED 0xFFFFFFFFu
+#endif
+#ifndef TB_GET_WDL
+#define TB_GET_WDL(_res)  ((_res) & 0x0Fu)
+#define TB_GET_FROM(_res) (((_res) >> 10) & 0x3Fu)
+#define TB_GET_TO(_res)   (((_res) >>  4) & 0x3Fu)
+#define TB_GET_PROMOTES(_res) (((_res) >> 16) & 0x7u)
+#endif
 
 namespace king {
 namespace search {
@@ -263,6 +280,49 @@ struct Searcher {
 
         const bool inCheck = pos.in_check(pos.side_to_move());
         const Color stm    = pos.side_to_move();
+
+        // ── Syzygy WDL probe (non-root, in-search) ───────────────────────────
+        // Conditions: TBs enabled, no castling rights, piece count ≤ TB_LARGEST,
+        // depth >= 1 (already guaranteed by the depth<=0 guard above), ply > 0
+        // so we are NOT at the root (root probing is done separately in think).
+        // tb_probe_wdl already handles rule50 internally (returns FAILED if != 0
+        // when castling==0; we still pass it and it's a correctness filter).
+        if (ply > 0 && syzygy::enabled()
+                && pos.castling_rights() == 0
+                && static_cast<unsigned>(popcount(pos.occupied())) <= syzygy::largest()) {
+            unsigned wdl = syzygy::probe_wdl(pos);
+            if (wdl != TB_RESULT_FAILED) {
+                // Convert WDL to a search score.
+                // TB_WIN / TB_CURSED_WIN → winning score just below true mate
+                // TB_LOSS / TB_BLESSED_LOSS → losing score just above true mate-loss
+                // TB_DRAW → 0
+                // We use MATE - MAX_PLY - 1 so TB scores are clearly below/above
+                // normal mate scores while still counting as "forced" results.
+                const int tb_base = MATE - MAX_PLY - 1;
+                int score;
+                if      (wdl == TB_WIN)          score =  tb_base - ply;
+                else if (wdl == TB_CURSED_WIN)   score =  1;   // cursed: draws with perfect play
+                else if (wdl == TB_BLESSED_LOSS) score = -1;   // blessed: loss, but 50-move draw
+                else if (wdl == TB_LOSS)         score = -(tb_base - ply);
+                else                             score =  0;   // TB_DRAW
+
+                // Update TT with the TB result so siblings can use it.
+                Bound tb_bound = (score >= beta) ? BOUND_LOWER
+                               : (score <= alpha) ? BOUND_UPPER
+                               : BOUND_EXACT;
+                tt.store(pos.key(), 0, toTT(score, ply), 0, (uint8_t)depth, tb_bound);
+
+                // Cutoff (or return exact) based on window.
+                if (tb_bound == BOUND_EXACT
+                    || (tb_bound == BOUND_LOWER && score >= beta)
+                    || (tb_bound == BOUND_UPPER && score <= alpha))
+                    return score;
+
+                // Soft bound: adjust alpha/beta for more accurate search.
+                if (score > alpha) alpha = score;
+                if (score < beta)  beta  = score;   // keep beta if we have an upper bound
+            }
+        }
 
         // ── Static evaluation (cached for pruning) ────────────────────────────
         // Not meaningful while in check (king is in danger, eval is unstable).
@@ -703,6 +763,63 @@ Move think(Position& pos, const Limits& L, std::atomic<bool>& stop,
 
     Move startBest = root0.moves[0];        // safety default: always legal
     crash::arm_fallback(to_uci(startBest).c_str());
+
+    // ── Root Syzygy probe ────────────────────────────────────────────────────
+    // If TBs are enabled and the root position is probe-eligible, try to find
+    // a TB-optimal move. We use the DTZ probe (probe_root) which accounts for
+    // the 50-move rule. If it succeeds and gives us a clear move, we use it as
+    // startBest (the PVS root search will also see it first, and in many cases
+    // we can short-circuit entirely for a clear win/loss).
+    if (syzygy::enabled()
+            && pos.castling_rights() == 0
+            && static_cast<unsigned>(popcount(pos.occupied())) <= syzygy::largest()) {
+        unsigned res = syzygy::probe_root(pos);
+        if (res != TB_RESULT_FAILED) {
+            unsigned wdl  = TB_GET_WDL(res);
+            unsigned from = TB_GET_FROM(res);
+            unsigned to   = TB_GET_TO(res);
+            unsigned promo = TB_GET_PROMOTES(res);
+
+            // Build the king Move from TB result.
+            // TB_PROMOTES: 0=none,1=queen,2=rook,3=bishop,4=knight
+            // Our PROMO flag uses KNIGHT..QUEEN offset from KNIGHT.
+            Move tbMove = 0;
+            if (from < 64 && to < 64) {
+                if (promo == 0) {
+                    tbMove = make_move(Square(from), Square(to));
+                } else {
+                    // Map Fathom promo to our PieceType
+                    PieceType pt = QUEEN;
+                    if      (promo == 2) pt = ROOK;
+                    else if (promo == 3) pt = BISHOP;
+                    else if (promo == 4) pt = KNIGHT;
+                    tbMove = make_move(Square(from), Square(to), PROMO, pt);
+                }
+                // Verify tbMove is legal (safety check)
+                bool legal = false;
+                for (int i = 0; i < root0.size; ++i) {
+                    if (root0.moves[i] == tbMove) { legal = true; break; }
+                }
+                if (legal) {
+                    startBest = tbMove;
+                    crash::arm_fallback(to_uci(startBest).c_str());
+                    // For a decisive TB result (WIN or LOSS), emit an info line
+                    // so the GUI knows we're using TBs. For cursed wins / blessed
+                    // losses / draws we still search (the 50-move counter matters).
+                    if (wdl == TB_WIN || wdl == TB_LOSS) {
+                        const int tb_score = (wdl == TB_WIN)
+                            ? (MATE - MAX_PLY - 1)
+                            : -(MATE - MAX_PLY - 1);
+                        if (out_mtx) out_mtx->lock();
+                        out << "info depth 0 score cp " << tb_score
+                            << " tb 1 pv " << to_uci(startBest) << "\n";
+                        out.flush();
+                        if (out_mtx) out_mtx->unlock();
+                    }
+                }
+            }
+        }
+    }
 
     const int nThreads = std::max(1, std::min(256, threads));
     const int maxDepth = (L.depth > 0) ? std::min(L.depth, MAX_PLY) : MAX_PLY;

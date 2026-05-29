@@ -63,6 +63,7 @@ public:
     Color    side_to_move()    const { return stm_; }
     uint8_t  castling_rights() const { return castling_; }
     Square   ep_square()       const { return ep_; }
+    int      halfmove_clock()  const { return halfmove_; }
     uint64_t key()             const { return key_; }
     uint64_t compute_key()     const;
 

@@ -1,12 +1,15 @@
 cmake_minimum_required(VERSION 3.20)
-project(KINg CXX)
+project(KINg CXX C)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_C_STANDARD 11)
+set(CMAKE_C_STANDARD_REQUIRED ON)
 if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif()
 set(CMAKE_CXX_FLAGS_RELEASE "-O3 -mavx2 -mpopcnt -DNDEBUG")
+set(CMAKE_C_FLAGS_RELEASE   "-O3 -mavx2 -mpopcnt -DNDEBUG")
 
 # ── Evaluation selector ───────────────────────────────────────────────────────
 # -DEVAL=HCE (default): handcrafted PeSTO/structural eval ("No Deep Learning").
@@ -22,7 +25,14 @@ set(EVAL "HCE" CACHE STRING "Evaluation: HCE (default) or NNUE")
 set_property(CACHE EVAL PROPERTY STRINGS NNUE HCE)
 message(STATUS "KINg eval = ${EVAL}")
 
-include_directories(${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/third_party)
+include_directories(${CMAKE_SOURCE_DIR}/src
+                    ${CMAKE_SOURCE_DIR}/third_party
+                    ${CMAKE_SOURCE_DIR}/third_party/fathom)
+
+# ── Fathom (Syzygy tablebase probing, self-contained C library) ───────────────
+set(FATHOM_SRC ${CMAKE_SOURCE_DIR}/third_party/fathom/tbprobe.c)
+# Compile as C (not C++) — tbprobe.c uses C11 atomics when compiled as C.
+set_source_files_properties(${FATHOM_SRC} PROPERTIES LANGUAGE C)
 
 file(GLOB_RECURSE ENGINE_SRC CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/src/*.cpp)
 file(GLOB_RECURSE TEST_SRC   CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/tests/*.cpp)
@@ -50,11 +60,11 @@ else()
   list(FILTER ENGINE_SRC EXCLUDE REGEX "nnue\\.cpp$")
 endif()
 
-add_executable(engine ${ENGINE_SRC} ${EXTRA_SRC})
+add_executable(engine ${ENGINE_SRC} ${EXTRA_SRC} ${FATHOM_SRC})
 
 set(ENGINE_SRC_NO_MAIN ${ENGINE_SRC})
 list(FILTER ENGINE_SRC_NO_MAIN EXCLUDE REGEX "main\\.cpp$")
-add_executable(unit_tests ${TEST_SRC} ${ENGINE_SRC_NO_MAIN} ${EXTRA_SRC})
+add_executable(unit_tests ${TEST_SRC} ${ENGINE_SRC_NO_MAIN} ${EXTRA_SRC} ${FATHOM_SRC})
 
 if(EVAL STREQUAL "NNUE")
   # Absolute path to the sample file so the bit-exact gate test finds it

@@ -5,6 +5,7 @@ build/
 *.pgn
 *.log
 syzygy/
+syzygy_test/
 nets/*.bin
 *.pdf
 # Explicit: always commit harness files used for local Task-16 testing
