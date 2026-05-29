@@ -60,6 +60,14 @@ extern EvalParams g_eval;
 // Reset g_eval to the built-in (committed) defaults. Used by the tuner before a run.
 void eval_set_defaults();
 
+// Handcrafted (PeSTO + structural) evaluation. Always available — it is the
+// "No Deep Learning" build and the NNUE-less fallback. Score in centipawns
+// relative to the side to move.
+int evaluate_hce(const Position& pos);
+
+// The single evaluation symbol the search calls. Dispatches at compile time:
+//   -DEVAL=NNUE  -> nnue::evaluate (incremental accumulator)
+//   -DEVAL=HCE   -> evaluate_hce
 int evaluate(const Position& pos);
 
 } // namespace king

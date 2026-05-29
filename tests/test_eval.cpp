@@ -8,6 +8,13 @@
 
 using namespace king;
 
+// These assertions check properties of the handcrafted evaluation (near-zero
+// symmetric startpos, exact color symmetry, structural-term magnitudes). The
+// NNUE eval is not perfectly symmetric (the startpos sample is +36) and has no
+// such structural guarantees, so this whole suite is HCE-only. The NNUE eval is
+// gated instead by the bit-exact sample test in test_nnue.cpp.
+#ifndef EVAL_NNUE
+
 static void ev_init() {
     bitboard::init();
     attacks::init_leapers();
@@ -85,3 +92,5 @@ TEST_CASE("rook on open file scores higher than closed file") {
     // open file should score better (same material, rook has open-file bonus in open_f)
     CHECK(evaluate(open_f) > evaluate(closed_f));
 }
+
+#endif // !EVAL_NNUE

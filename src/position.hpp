@@ -5,6 +5,9 @@
 #include <vector>
 #include "types.hpp"
 #include "bitboard.hpp"
+#ifdef EVAL_NNUE
+#include "nnue.hpp"
+#endif
 
 namespace king {
 
@@ -26,6 +29,9 @@ struct StateInfo {
     int        prev_fullmove;
     uint64_t   prev_key;
     StateInfo* previous;
+#ifdef EVAL_NNUE
+    nnue::Accumulator prev_acc; // accumulator snapshot before the move (for undo)
+#endif
 };
 
 class Position {
@@ -83,6 +89,14 @@ public:
     void remove_piece(Square s);
     void move_piece(Square from, Square to);
 
+#ifdef EVAL_NNUE
+    // Live NNUE accumulator (both perspectives), kept in sync by put/remove_piece
+    // and snapshot/restored across do_move/undo_move. Refreshed in set_fen and
+    // copy_from. Read by nnue::evaluate via evaluate_acc(acc, stm).
+    const nnue::Accumulator& accumulator() const { return acc_; }
+    void refresh_accumulator() { nnue::refresh(acc_, *this); }
+#endif
+
 private:
     Bitboard by_type_[6]{};
     Bitboard by_color_[2]{};
@@ -98,6 +112,10 @@ private:
     StateInfo* st_ = &root_;   // current state node
 
     std::vector<uint64_t> hist_; // Zobrist key history for repetition detection
+
+#ifdef EVAL_NNUE
+    nnue::Accumulator acc_{}; // live accumulator (see accumulator())
+#endif
 };
 
 } // namespace king

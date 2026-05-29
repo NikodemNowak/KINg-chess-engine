@@ -40,6 +40,9 @@ void Position::put_piece(Piece p, Square s) {
     by_type_[piece_type(p)] |= square_bb(s);
     by_color_[color_of(p)]  |= square_bb(s);
     key_ ^= zobrist::psq[p][s];
+#ifdef EVAL_NNUE
+    nnue::add_feature(acc_, color_of(p), piece_type(p), s);
+#endif
 }
 
 void Position::remove_piece(Square s) {
@@ -49,6 +52,9 @@ void Position::remove_piece(Square s) {
     by_color_[color_of(p)]  &= ~square_bb(s);
     board_[s] = NO_PIECE;
     key_ ^= zobrist::psq[p][s];
+#ifdef EVAL_NNUE
+    nnue::sub_feature(acc_, color_of(p), piece_type(p), s);
+#endif
 }
 
 void Position::move_piece(Square from, Square to) {
@@ -90,6 +96,11 @@ void Position::copy_from(const Position& o) {
     root_.prev_fullmove = o.fullmove_;
     root_.prev_key      = o.key_;
     st_ = &root_;
+
+#ifdef EVAL_NNUE
+    // Rebuild the clone's accumulator from its (now-copied) board.
+    nnue::refresh(acc_, *this);
+#endif
 }
 
 // ── Make / unmake ─────────────────────────────────────────────────────────────
@@ -103,6 +114,11 @@ void Position::do_move(Move m, StateInfo& st) {
     st.prev_fullmove = fullmove_;
     st.prev_key      = key_;
     st_              = &st;
+#ifdef EVAL_NNUE
+    // Snapshot the accumulator so undo_move can restore it; the put/remove_piece
+    // calls below update acc_ incrementally for both perspectives.
+    st.prev_acc = acc_;
+#endif
 
     // 2. Remove the old en-passant file from the key (if any).
     if (ep_ != NO_SQ) key_ ^= zobrist::enpassant[file_of(ep_)];
@@ -213,6 +229,10 @@ void Position::undo_move(Move m) {
     halfmove_ = st->prev_halfmove;
     fullmove_ = st->prev_fullmove;
     key_      = st->prev_key;
+#ifdef EVAL_NNUE
+    // The board mutations above also touched acc_; just restore the snapshot.
+    acc_ = st->prev_acc;
+#endif
     st_       = st->previous;
 }
 
@@ -340,6 +360,13 @@ void Position::set_fen(const std::string& fen) {
     // 7. Seed key history for repetition detection
     hist_.clear();
     hist_.push_back(key_);
+
+#ifdef EVAL_NNUE
+    // Rebuild the accumulator from scratch for the final board (the per-piece
+    // updates done by put_piece during parsing started from uninitialised state
+    // and are discarded here).
+    nnue::refresh(acc_, *this);
+#endif
 }
 
 // ── FEN emission ──────────────────────────────────────────────────────────────

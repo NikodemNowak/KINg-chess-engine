@@ -18,6 +18,9 @@
 #include "eval.hpp"
 #include "bitboard.hpp"
 #include "attacks.hpp"
+#ifdef EVAL_NNUE
+#include "nnue.hpp"
+#endif
 
 namespace king {
 
@@ -406,9 +409,9 @@ static void eval_side(const Position& pos, Color c, int& mg, int& eg) {
     }
 }
 
-// ── evaluate ─────────────────────────────────────────────────────────────────
+// ── evaluate (HCE) ───────────────────────────────────────────────────────────
 // Returns score in centipawns relative to the side to move.
-int evaluate(const Position& pos) {
+int evaluate_hce(const Position& pos) {
     int mg = 0, eg = 0, phase = 0;
 
     // PSQT + material
@@ -439,6 +442,19 @@ int evaluate(const Position& pos) {
     if (phase > 24) phase = 24;
     int score = (mg * phase + eg * (24 - phase)) / 24;
     return (pos.side_to_move() == WHITE) ? score : -score;
+}
+
+// ── evaluate (dispatcher) ────────────────────────────────────────────────────
+// Single symbol the search calls; selected at compile time by the EVAL CMake
+// option (-DEVAL=NNUE default, or -DEVAL=HCE).
+int evaluate(const Position& pos) {
+#ifdef EVAL_NNUE
+    // Read the position's incremental accumulator (kept in sync by do/undo_move
+    // and refreshed in set_fen/copy_from). stm perspective first.
+    return nnue::evaluate_acc(pos.accumulator(), pos.side_to_move());
+#else
+    return evaluate_hce(pos);
+#endif
 }
 
 } // namespace king

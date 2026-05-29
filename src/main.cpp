@@ -7,6 +7,9 @@
 #include "crash.hpp"
 #include "tune.hpp"
 #include "datagen.hpp"
+#ifdef EVAL_NNUE
+#include "nnue.hpp"
+#endif
 #include <iostream>
 #include <string>
 
@@ -18,6 +21,9 @@ int main(int argc, char** argv) {
     attacks::init_leapers();
     attacks::init_magics();
     zobrist::init();
+#ifdef EVAL_NNUE
+    nnue::init(); // parse the embedded net before any set_fen() builds an accumulator
+#endif
 
     try {
         if (argc >= 2 && std::string(argv[1]) == "tune") {
