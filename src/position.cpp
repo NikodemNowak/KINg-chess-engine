@@ -4,8 +4,26 @@
 #include <sstream>
 #include <cassert>
 #include <cctype>
+#include <cstdlib>
 
 namespace king {
+
+// ── Castling-rights update masks ──────────────────────────────────────────────
+// AND-mask applied (per from/to square) to castling_ on every move. Default is
+// ANY_CASTLING (15): no change. Squares that involve a king/rook strip the
+// corresponding rights when touched (moved from, or captured on).
+static uint8_t CASTLE_MASK[64];
+
+static const bool castle_mask_inited = [] {
+    for (int s = 0; s < 64; ++s) CASTLE_MASK[s] = ANY_CASTLING;
+    CASTLE_MASK[E1] = uint8_t(~(WHITE_OO | WHITE_OOO) & ANY_CASTLING); // 12
+    CASTLE_MASK[H1] = uint8_t(~WHITE_OO  & ANY_CASTLING);              // 14
+    CASTLE_MASK[A1] = uint8_t(~WHITE_OOO & ANY_CASTLING);              // 13
+    CASTLE_MASK[E8] = uint8_t(~(BLACK_OO | BLACK_OOO) & ANY_CASTLING); //  3
+    CASTLE_MASK[H8] = uint8_t(~BLACK_OO  & ANY_CASTLING);              // 11
+    CASTLE_MASK[A8] = uint8_t(~BLACK_OOO & ANY_CASTLING);              //  7
+    return true;
+}();
 
 // ── Constructor ───────────────────────────────────────────────────────────────
 
@@ -38,6 +56,126 @@ void Position::move_piece(Square from, Square to) {
     put_piece(p, to);
 }
 
+// ── Make / unmake ─────────────────────────────────────────────────────────────
+
+void Position::do_move(Move m, StateInfo& st) {
+    // 1. Snapshot current state into the new node and link it.
+    st.previous      = st_;
+    st.prev_ep       = ep_;
+    st.prev_castling = castling_;
+    st.prev_halfmove = halfmove_;
+    st.prev_fullmove = fullmove_;
+    st.prev_key      = key_;
+    st_              = &st;
+
+    // 2. Remove the old en-passant file from the key (if any).
+    if (ep_ != NO_SQ) key_ ^= zobrist::enpassant[file_of(ep_)];
+
+    // 3. Decode the move.
+    Square   from = from_sq(m);
+    Square   to   = to_sq(m);
+    MoveFlag fl   = type_of(m);
+    Piece    pc   = piece_on(from);
+    Color    us   = stm_;
+    Color    them = Color(!us);
+
+    // 4. Determine captured piece.
+    st.captured = (fl == EN_PASSANT) ? make_piece(them, PAWN) : piece_on(to);
+
+    // 5. Halfmove clock: reset on pawn move or capture, else increment.
+    if (piece_type(pc) == PAWN || st.captured != NO_PIECE) halfmove_ = 0;
+    else                                                   halfmove_++;
+
+    // 6. Remove captured piece.
+    if (fl == EN_PASSANT)
+        remove_piece(Square(us == WHITE ? to - 8 : to + 8));
+    else if (st.captured != NO_PIECE)
+        remove_piece(to);
+
+    // 7. Move (or promote) the moving piece.
+    if (fl == PROMO) {
+        remove_piece(from);
+        put_piece(make_piece(us, promo_pt(m)), to);
+    } else {
+        move_piece(from, to);
+    }
+
+    // 8. Castling: relocate the rook.
+    if (fl == CASTLING) {
+        Square rfrom, rto;
+        switch (to) {
+            case G1: rfrom = H1; rto = F1; break;
+            case C1: rfrom = A1; rto = D1; break;
+            case G8: rfrom = H8; rto = F8; break;
+            case C8: rfrom = A8; rto = D8; break;
+            default: rfrom = to; rto = to; break; // unreachable
+        }
+        move_piece(rfrom, rto);
+    }
+
+    // 9. New en-passant square (only on a double pawn push).
+    ep_ = NO_SQ;
+    if (piece_type(pc) == PAWN && std::abs(int(to) - int(from)) == 16)
+        ep_ = Square((from + to) / 2);
+    if (ep_ != NO_SQ) key_ ^= zobrist::enpassant[file_of(ep_)];
+
+    // 10. Update castling rights (and key).
+    key_ ^= zobrist::castling[castling_];
+    castling_ &= CASTLE_MASK[from] & CASTLE_MASK[to];
+    key_ ^= zobrist::castling[castling_];
+
+    // 11. Flip side to move; bump fullmove after Black moves.
+    stm_  = them;
+    key_ ^= zobrist::side;
+    if (us == BLACK) fullmove_++;
+}
+
+void Position::undo_move(Move m) {
+    StateInfo* st = st_;
+
+    // 1. Flip side back: 'us' is the side that made the move being undone.
+    stm_          = Color(!stm_);
+    Color    us   = stm_;
+    Color    them = Color(!us);
+    Square   from = from_sq(m);
+    Square   to   = to_sq(m);
+    MoveFlag fl   = type_of(m);
+
+    // 2. Undo the piece movement.
+    if (fl == CASTLING) {
+        move_piece(to, from);
+        Square rfrom, rto;
+        switch (to) {
+            case G1: rfrom = H1; rto = F1; break;
+            case C1: rfrom = A1; rto = D1; break;
+            case G8: rfrom = H8; rto = F8; break;
+            case C8: rfrom = A8; rto = D8; break;
+            default: rfrom = to; rto = to; break; // unreachable
+        }
+        move_piece(rto, rfrom);
+    } else if (fl == PROMO) {
+        remove_piece(to);
+        put_piece(make_piece(us, PAWN), from);
+    } else {
+        move_piece(to, from);
+    }
+
+    // 3. Restore the captured piece.
+    if (fl == EN_PASSANT)
+        put_piece(make_piece(them, PAWN), Square(us == WHITE ? to - 8 : to + 8));
+    else if (st->captured != NO_PIECE)
+        put_piece(st->captured, to);
+
+    // 4. Restore scalar state. The key is restored from the snapshot; the board
+    //    is already physically correct via put/remove/move above.
+    ep_       = st->prev_ep;
+    castling_ = st->prev_castling;
+    halfmove_ = st->prev_halfmove;
+    fullmove_ = st->prev_fullmove;
+    key_      = st->prev_key;
+    st_       = st->previous;
+}
+
 // ── FEN parsing ───────────────────────────────────────────────────────────────
 
 void Position::set_fen(const std::string& fen) {
@@ -51,6 +189,8 @@ void Position::set_fen(const std::string& fen) {
     halfmove_  = 0;
     fullmove_  = 1;
     key_       = 0;
+    st_        = &root_;
+    root_.previous = nullptr;
 
     std::istringstream ss(fen);
     std::string token;

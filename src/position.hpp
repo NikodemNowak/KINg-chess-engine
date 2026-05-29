@@ -15,6 +15,17 @@ enum CastlingRight {
     ANY_CASTLING = 15
 };
 
+// State saved before a move so it can be undone (and for incremental key/ep/etc).
+struct StateInfo {
+    Piece      captured;       // piece removed by the move (NO_PIECE if none); for EN_PASSANT = enemy pawn
+    Square     prev_ep;
+    uint8_t    prev_castling;
+    int        prev_halfmove;
+    int        prev_fullmove;
+    uint64_t   prev_key;
+    StateInfo* previous;
+};
+
 class Position {
 public:
     Position();
@@ -40,6 +51,10 @@ public:
     uint64_t key()          const { return key_; }
     uint64_t compute_key()  const;
 
+    // Make / unmake
+    void do_move(Move m, StateInfo& st);
+    void undo_move(Move m);
+
     // Incremental helpers — also used by T7 make/unmake
     void put_piece(Piece p, Square s);
     void remove_piece(Square s);
@@ -55,6 +70,9 @@ private:
     int      halfmove_;
     int      fullmove_;
     uint64_t key_;
+
+    StateInfo  root_;          // root state (previous == nullptr)
+    StateInfo* st_ = &root_;   // current state node
 };
 
 } // namespace king
