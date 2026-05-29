@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <cstring>
 #include <utility>
+#include <cmath>
 
 namespace king {
 namespace search {
@@ -39,6 +40,25 @@ static inline int fromTT(int score, int ply) {
     else if (score <= -(MATE - MAX_PLY)) score += ply;
     return score;
 }
+
+// ── Late Move Reduction table ─────────────────────────────────────────────────
+// LMR[depth][moveCount] gives the reduction in plies for a late quiet move.
+// Formula: max(0, floor(0.75 + ln(depth) * ln(moveCount) / 2.25))
+// Precomputed once; LMR[0][*] = LMR[*][0] = 0 (boundary guard).
+static int LMR[64][64];
+
+static void init_lmr() {
+    for (int d = 0; d < 64; ++d)
+        for (int m = 0; m < 64; ++m) {
+            if (d == 0 || m == 0)
+                LMR[d][m] = 0;
+            else
+                LMR[d][m] = (int)(0.75 + std::log((double)d) * std::log((double)m) / 2.25);
+        }
+}
+
+// One-time init guard (init_lmr() is called from think() before the first search).
+static bool lmr_ready = false;
 
 // ── Material values ───────────────────────────────────────────────────────────
 // Centipawn value of a piece type (indexed by PieceType: P N B R Q K).
@@ -304,9 +324,10 @@ struct Searcher {
             }
         }
 
-        int  best     = -INF;
-        Move bestMove = 0;
-        int  legal    = 0;
+        int  best      = -INF;
+        Move bestMove  = 0;
+        int  legal     = 0;
+        int  moveCount = 0;  // post-legality counter (for LMR/LMP thresholds)
         bool firstMove = true;
 
         for (int i = 0; i < ml.size; ++i) {
@@ -320,6 +341,26 @@ struct Searcher {
             }
 
             Move m = ml.moves[i];
+
+            // ── Classify move BEFORE do_move (board is still unmoved) ─────
+            // isQuiet: not a capture, not en passant, not a promotion.
+            const bool isEpPre      = (type_of(m) == EN_PASSANT);
+            const Piece capPiecePre = pos.piece_on(to_sq(m));
+            const bool isQuiet      = !(isEpPre || (capPiecePre != NO_PIECE)
+                                                 || (type_of(m) == PROMO));
+
+            // ── Late Move Pruning (LMP) ───────────────────────────────────
+            // Skip very late quiet moves at low depth when not in check and
+            // we already have a non-losing best score.  (moveCount is the
+            // post-legality count so early moves always pass the threshold.)
+            // Only prune at depth >= 3 to avoid hiding tactics at shallow nodes.
+            if (!isPV && !inCheck && isQuiet
+                    && depth >= 3 && depth <= 6
+                    && moveCount >= 4 + depth * depth
+                    && best > -(MATE - MAX_PLY)) {
+                continue;
+            }
+
             StateInfo st;
             pos.do_move(m, st);
             // Skip illegal pseudo-moves: after do_move the mover is now the
@@ -329,19 +370,39 @@ struct Searcher {
                 continue;
             }
             ++legal;
+            ++moveCount;
 
+            // ── Does this move give check? (opponent now to move) ─────────
+            const bool givesCheck = pos.in_check(pos.side_to_move());
+
+            const int newDepth = depth - 1;
             int score;
+
             if (firstMove) {
-                // First (best) move: search with full window.
-                score = -negamax(pos, depth - 1, -beta, -alpha, ply + 1);
+                // First (best) move: full-window search, no reduction.
+                score = -negamax(pos, newDepth, -beta, -alpha, ply + 1);
             } else {
-                // Subsequent moves: zero-window scout first.
-                score = -negamax(pos, depth - 1, -alpha - 1, -alpha, ply + 1);
-                // If the scout beats alpha and is not a beta cutoff, re-search
-                // with the full window to get the exact score.
-                if (!aborted && score > alpha && score < beta) {
-                    score = -negamax(pos, depth - 1, -beta, -alpha, ply + 1);
+                // ── Late Move Reduction (LMR) ─────────────────────────────
+                int r = 0;
+                if (depth >= 4 && moveCount >= 6 && isQuiet
+                        && !inCheck && !givesCheck) {
+                    r = LMR[std::min(depth, 63)][std::min(moveCount, 63)];
+                    if (isPV && r > 0) r -= 1;          // reduce less on PV
+                    if (r < 0) r = 0;
+                    if (r > newDepth - 1) r = newDepth - 1; // never below 1 ply
+                    if (r < 0) r = 0;
                 }
+
+                // Reduced zero-window scout.
+                score = -negamax(pos, newDepth - r, -alpha - 1, -alpha, ply + 1);
+
+                // Failed high while reduced → re-search at full depth (zero window).
+                if (!aborted && score > alpha && r > 0)
+                    score = -negamax(pos, newDepth, -alpha - 1, -alpha, ply + 1);
+
+                // Still beating alpha but below beta → full-window re-search.
+                if (!aborted && score > alpha && score < beta)
+                    score = -negamax(pos, newDepth, -beta, -alpha, ply + 1);
             }
 
             pos.undo_move(m);
@@ -355,11 +416,11 @@ struct Searcher {
             if (score > alpha) alpha = score;
             if (alpha >= beta) {
                 // ── Beta cutoff: update killers and history for quiet moves ──
-                const bool isEp      = (type_of(m) == EN_PASSANT);
-                const Piece capPiece = pos.piece_on(to_sq(m)); // piece already restored
-                const bool isCapture = isEp || (capPiece != NO_PIECE);
-                const bool isPromo   = (type_of(m) == PROMO);
-                if (!isCapture && !isPromo) {
+                const bool isEpPost      = (type_of(m) == EN_PASSANT);
+                const Piece capPiecePost = pos.piece_on(to_sq(m)); // piece already restored
+                const bool isCapturePost = isEpPost || (capPiecePost != NO_PIECE);
+                const bool isPromoPost   = (type_of(m) == PROMO);
+                if (!isCapturePost && !isPromoPost) {
                     // Update killers (keep 2 distinct killers per ply)
                     if (ply < MAX_PLY && m != killers[ply][0]) {
                         killers[ply][1] = killers[ply][0];
@@ -393,6 +454,9 @@ Move think(Position& pos, const Limits& L, std::atomic<bool>& stop,
            std::ostream& out, std::mutex* out_mtx) {
     TimeManager tm;
     tm.init(L, pos.side_to_move(), overhead);
+
+    // One-time LMR table initialisation (fast: just 64*64 = 4096 entries).
+    if (!lmr_ready) { init_lmr(); lmr_ready = true; }
 
     // Ensure the TT is sized before the first search (covers direct callers
     // that never went through the UCI `Hash` option). Default 64 MB.
