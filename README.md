@@ -45,4 +45,15 @@ make test-game   # two-game self-play via engine-adapter.sh
 
 ## Provenance
 
-TODO: list techniques and sources (alpha-beta, MCTS, NNUE references), training data (if any), third-party libraries, AI-conversation links — to be completed before submission per competition regulations.
+Evaluation weights (material values, piece-square tables, and the handcrafted
+structural-term weights) are Texel-tuned with the in-engine coordinate-descent
+tuner (`engine tune <epd>`, see `src/tune.cpp`). Training data is the public
+Zurichess **quiet-labeled.epd** dataset (~725k FEN + game-result positions,
+Alexandru Moșoi et al.), mirrored at
+<https://github.com/KierenP/ChessTrainingSets>. The base piece-square tables are
+PeSTO by Ronald Friederich (Chess Programming Wiki). The dataset file itself is
+not committed (gitignored); fetch it before re-running the tuner.
+
+TODO: list remaining techniques and sources (alpha-beta, MCTS, NNUE references),
+third-party libraries, AI-conversation links — to be completed before submission
+per competition regulations.

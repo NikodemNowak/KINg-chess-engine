@@ -14,3 +14,7 @@ nets/*.bin
 # Baseline binaries -- rebuild from the tagged commit, don't commit binaries
 tools/baseline/king_v1
 tools/baseline/king_v*
+
+# Texel tuning dataset (public Zurichess quiet-labeled.epd, ~41MB) -- large, fetch separately
+tools/quiet-labeled.epd
+tools/*.epd.gz

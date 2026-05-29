@@ -10,6 +10,10 @@
 // Structural terms (all color-symmetric, added to the same mg/eg accumulators):
 //   bishop_pair, rook_open_file, rook_semiopen_file,
 //   pawn_isolated, pawn_doubled, passed_pawn, mobility, king_safety.
+//
+// All tunable weights (material, structural-term weights, and the PSQT) live in
+// the mutable global `g_eval`. The committed defaults below are the Texel-tuned
+// values; eval_set_defaults() also reinstates them (used by the tuner).
 
 #include "eval.hpp"
 #include "bitboard.hpp"
@@ -17,187 +21,182 @@
 
 namespace king {
 
-// ── Piece values (midgame / endgame) ─────────────────────────────────────────
-static constexpr int MG_VALUE[6] = {  82, 337, 365, 477, 1025,    0 };
-static constexpr int EG_VALUE[6] = {  94, 281, 297, 512,  936,    0 };
-
-// ── Phase increment per piece type ───────────────────────────────────────────
+// ── Phase increment per piece type (not tuned) ────────────────────────────────
 static constexpr int PHASE_INC[6] = { 0, 1, 1, 2, 4, 0 };
 
-// ── PSQT tables ──────────────────────────────────────────────────────────────
-// All from White's POV. Index 0 = a1 (rank 1), index 63 = h8 (rank 8).
-
-static constexpr int MG_PSQT_PAWN[64] = {
-      0,   0,   0,   0,   0,   0,   0,   0,
-    -35,  -1, -20, -23, -15,  24,  38, -22,
-    -26,  -4,  -4, -10,   3,   3,  33, -12,
-    -27,  -2,  -5,  12,  17,   6,  10, -25,
-    -14,  13,   6,  21,  23,  12,  17, -23,
-     -6,   7,  26,  31,  65,  56,  25, -20,
-     98, 134,  61,  95,  68, 126,  34, -11,
-      0,   0,   0,   0,   0,   0,   0,   0,
+// ── Default (committed) evaluation parameters ─────────────────────────────────
+// These are the values evaluate() uses out of the box. The PSQT blocks are the
+// PeSTO tables (White POV, a1=0 .. h8=63); the scalar/array weights are the
+// handcrafted-term weights (Texel-tuned).
+static const EvalParams DEFAULT_EVAL = {
+    // mg_value[6]
+    { 98, 381, 399, 495, 1169, 0 },
+    // eg_value[6]
+    { 86, 304, 313, 540, 935, 0 },
+    26, 54, // bishop_pair mg,eg
+    47, -3, // rook_open mg,eg
+    13, 13, // rook_semiopen mg,eg
+    9, 8, // pawn_isolated mg,eg
+    8, 21, // pawn_doubled mg,eg
+    // passed_mg[8]
+    { 0, -1, -7, -13, 12, 5, 12, 0 },
+    // passed_eg[8]
+    { 0, 1, 11, 36, 51, 66, 46, 0 },
+    // mob_pivot[4]
+    { 4, 6, -1, 5 },
+    // mob_mg[4]
+    { 4, 4, 3, 0 },
+    // mob_eg[4]
+    { -1, 2, 2, 8 },
+    // king_attack_units[6]
+    { 0, 7, 9, 13, 14, 0 },
+    10, // pawn_shield_mg
+    157, // king_safety_max
+    17, // king_safety_divisor
+    // mg_psqt[6][64]
+    {
+        // PAWN
+        {
+               0,    0,    0,    0,    0,    0,    0,    0,
+             -35,   -1,  -20,  -23,  -15,   24,   38,  -22,
+             -26,   -4,   -4,  -10,    3,    3,   33,  -12,
+             -27,   -2,   -5,   12,   17,    6,   10,  -25,
+             -14,   13,    6,   21,   23,   12,   17,  -23,
+              -6,    7,   26,   31,   65,   56,   25,  -20,
+              98,  134,   61,   95,   68,  126,   34,  -11,
+               0,    0,    0,    0,    0,    0,    0,    0,
+        },
+        // KNIGHT
+        {
+            -105,  -21,  -58,  -33,  -17,  -28,  -19,  -23,
+             -29,  -53,  -12,   -3,   -1,   18,  -14,  -19,
+             -23,   -9,   12,   10,   19,   17,   25,  -16,
+             -13,    4,   16,   13,   28,   19,   21,   -8,
+              -9,   17,   19,   53,   37,   69,   18,   22,
+             -47,   60,   37,   65,   84,  129,   73,   44,
+             -73,  -41,   72,   36,   23,   62,    7,  -17,
+            -167,  -89,  -34,  -49,   61,  -97,  -15, -107,
+        },
+        // BISHOP
+        {
+             -33,   -3,  -14,  -21,  -13,  -12,  -39,  -21,
+               4,   15,   16,    0,    7,   21,   33,    1,
+               0,   15,   15,   15,   14,   27,   18,   10,
+              -6,   13,   13,   26,   34,   12,   10,    4,
+              -4,    5,   19,   50,   37,   37,    7,   -2,
+             -16,   37,   43,   40,   35,   50,   37,   -2,
+             -26,   16,  -18,  -13,   30,   59,   18,  -47,
+             -29,    4,  -82,  -37,  -25,  -42,    7,   -8,
+        },
+        // ROOK
+        {
+             -19,  -13,    1,   17,   16,    7,  -37,  -26,
+             -44,  -16,  -20,   -9,   -1,   11,   -6,  -71,
+             -45,  -25,  -16,  -17,    3,    0,   -5,  -33,
+             -36,  -26,  -12,   -1,    9,   -7,    6,  -23,
+             -24,  -11,    7,   26,   24,   35,   -8,  -20,
+              -5,   19,   26,   36,   17,   45,   61,   16,
+              27,   32,   58,   62,   80,   67,   26,   44,
+              32,   42,   32,   51,   63,    9,   31,   43,
+        },
+        // QUEEN
+        {
+              -1,  -18,   -9,   10,  -15,  -25,  -31,  -50,
+             -35,   -8,   11,    2,    8,   15,   -3,    1,
+             -14,    2,  -11,   -2,   -5,    2,   14,    5,
+              -9,  -26,   -9,  -10,   -2,   -4,    3,   -3,
+             -27,  -27,  -16,  -16,   -1,   17,   -2,    1,
+             -13,  -17,    7,    8,   29,   56,   47,   57,
+             -24,  -39,   -5,    1,  -16,   57,   28,   54,
+             -28,    0,   29,   12,   59,   44,   43,   45,
+        },
+        // KING
+        {
+             -15,   36,   12,  -54,    8,  -28,   24,   14,
+               1,    7,   -8,  -64,  -43,  -16,    9,    8,
+             -14,  -14,  -22,  -46,  -44,  -30,  -15,  -27,
+             -49,   -1,  -27,  -39,  -46,  -44,  -33,  -51,
+             -17,  -20,  -12,  -27,  -30,  -25,  -14,  -36,
+              -9,   24,    2,  -16,  -20,    6,   22,  -22,
+              29,   -1,  -20,   -7,   -8,   -4,  -38,  -29,
+             -65,   23,   16,  -15,  -56,  -34,    2,   13,
+        },
+    },
+    // eg_psqt[6][64]
+    {
+        // PAWN
+        {
+               0,    0,    0,    0,    0,    0,    0,    0,
+              13,    8,    8,   10,   13,    0,    2,   -7,
+               4,    7,   -6,    1,    0,   -5,   -1,   -8,
+              13,    9,   -3,   -7,   -7,   -8,    3,   -1,
+              32,   24,   13,    5,   -2,    4,   17,   17,
+              94,  100,   85,   67,   56,   53,   82,   84,
+             178,  173,  158,  134,  147,  132,  165,  187,
+               0,    0,    0,    0,    0,    0,    0,    0,
+        },
+        // KNIGHT
+        {
+             -29,  -51,  -23,  -15,  -22,  -18,  -50,  -64,
+             -42,  -20,  -10,   -5,   -2,  -20,  -23,  -44,
+             -23,   -3,   -1,   15,   10,   -3,  -20,  -22,
+             -18,   -6,   16,   25,   16,   17,    4,  -18,
+             -17,    3,   22,   22,   22,   11,    8,  -18,
+             -24,  -20,   10,    9,   -1,   -9,  -19,  -41,
+             -25,   -8,  -25,   -2,   -9,  -25,  -24,  -52,
+             -58,  -38,  -13,  -28,  -31,  -27,  -63,  -99,
+        },
+        // BISHOP
+        {
+             -23,   -9,  -23,   -5,   -9,  -16,   -5,  -17,
+             -14,  -18,   -7,   -1,    4,   -9,  -15,  -27,
+             -12,   -3,    8,   10,   13,    3,   -7,  -15,
+              -6,    3,   13,   19,    7,   10,   -3,   -9,
+              -3,    9,   12,    9,   14,   10,    3,    2,
+               2,   -8,    0,   -1,   -2,    6,    0,    4,
+              -8,   -4,    7,  -12,   -3,  -13,   -4,  -14,
+             -14,  -21,  -11,   -8,   -7,   -9,  -17,  -24,
+        },
+        // ROOK
+        {
+              -9,    2,    3,   -1,   -5,  -13,    4,  -20,
+              -6,   -6,    0,    2,   -9,   -9,  -11,   -3,
+              -4,    0,   -5,   -1,   -7,  -12,   -8,  -16,
+               3,    5,    8,    4,   -5,   -6,   -8,  -11,
+               4,    3,   13,    1,    2,    1,   -1,    2,
+               7,    7,    7,    5,    4,   -3,   -5,   -3,
+              11,   13,   13,   11,   -3,    3,    8,    3,
+              13,   10,   18,   15,   12,   12,    8,    5,
+        },
+        // QUEEN
+        {
+             -33,  -28,  -22,  -43,   -5,  -32,  -20,  -41,
+             -22,  -23,  -30,  -16,  -16,  -23,  -36,  -32,
+             -16,  -27,   15,    6,    9,   17,   10,    5,
+             -18,   28,   19,   47,   31,   34,   39,   23,
+               3,   22,   24,   45,   57,   40,   57,   36,
+             -20,    6,    9,   49,   47,   35,   19,    9,
+             -17,   20,   32,   41,   58,   25,   30,    0,
+              -9,   22,   22,   27,   27,   19,   10,   20,
+        },
+        // KING
+        {
+             -53,  -34,  -21,  -11,  -28,  -14,  -24,  -43,
+             -27,  -11,    4,   13,   14,    4,   -5,  -17,
+             -19,   -3,   11,   21,   23,   16,    7,   -9,
+             -18,   -4,   21,   24,   27,   23,    9,  -11,
+              -8,   22,   24,   27,   26,   33,   26,    3,
+              10,   17,   23,   15,   20,   45,   44,   13,
+             -12,   17,   14,   17,   17,   38,   23,   11,
+             -74,  -35,  -18,  -18,  -11,   15,    4,  -17,
+        },
+    },
 };
-static constexpr int EG_PSQT_PAWN[64] = {
-      0,   0,   0,   0,   0,   0,   0,   0,
-     13,   8,   8,  10,  13,   0,   2,  -7,
-      4,   7,  -6,   1,   0,  -5,  -1,  -8,
-     13,   9,  -3,  -7,  -7,  -8,   3,  -1,
-     32,  24,  13,   5,  -2,   4,  17,  17,
-     94, 100,  85,  67,  56,  53,  82,  84,
-    178, 173, 158, 134, 147, 132, 165, 187,
-      0,   0,   0,   0,   0,   0,   0,   0,
-};
 
-static constexpr int MG_PSQT_KNIGHT[64] = {
-    -105, -21, -58, -33, -17, -28, -19,  -23,
-     -29, -53, -12,  -3,  -1,  18, -14,  -19,
-     -23,  -9,  12,  10,  19,  17,  25,  -16,
-     -13,   4,  16,  13,  28,  19,  21,   -8,
-      -9,  17,  19,  53,  37,  69,  18,   22,
-     -47,  60,  37,  65,  84, 129,  73,   44,
-     -73, -41,  72,  36,  23,  62,   7,  -17,
-    -167, -89, -34, -49,  61, -97, -15, -107,
-};
-static constexpr int EG_PSQT_KNIGHT[64] = {
-    -29, -51, -23, -15, -22, -18, -50, -64,
-    -42, -20, -10,  -5,  -2, -20, -23, -44,
-    -23,  -3,  -1,  15,  10,  -3, -20, -22,
-    -18,  -6,  16,  25,  16,  17,   4, -18,
-    -17,   3,  22,  22,  22,  11,   8, -18,
-    -24, -20,  10,   9,  -1,  -9, -19, -41,
-    -25,  -8, -25,  -2,  -9, -25, -24, -52,
-    -58, -38, -13, -28, -31, -27, -63, -99,
-};
+// The single mutable instance read by evaluate().
+EvalParams g_eval = DEFAULT_EVAL;
 
-static constexpr int MG_PSQT_BISHOP[64] = {
-    -33,  -3, -14, -21, -13, -12, -39, -21,
-      4,  15,  16,   0,   7,  21,  33,   1,
-      0,  15,  15,  15,  14,  27,  18,  10,
-     -6,  13,  13,  26,  34,  12,  10,   4,
-     -4,   5,  19,  50,  37,  37,   7,  -2,
-    -16,  37,  43,  40,  35,  50,  37,  -2,
-    -26,  16, -18, -13,  30,  59,  18, -47,
-    -29,   4, -82, -37, -25, -42,   7,  -8,
-};
-static constexpr int EG_PSQT_BISHOP[64] = {
-    -23,  -9, -23,  -5, -9, -16,  -5, -17,
-    -14, -18,  -7,  -1,  4,  -9, -15, -27,
-    -12,  -3,   8,  10, 13,   3,  -7, -15,
-     -6,   3,  13,  19,  7,  10,  -3,  -9,
-     -3,   9,  12,   9, 14,  10,   3,   2,
-      2,  -8,   0,  -1, -2,   6,   0,   4,
-     -8,  -4,   7, -12, -3, -13,  -4, -14,
-    -14, -21, -11,  -8, -7,  -9, -17, -24,
-};
-
-static constexpr int MG_PSQT_ROOK[64] = {
-    -19, -13,   1,  17, 16,  7, -37, -26,
-    -44, -16, -20,  -9, -1, 11,  -6, -71,
-    -45, -25, -16, -17,  3,  0,  -5, -33,
-    -36, -26, -12,  -1,  9, -7,   6, -23,
-    -24, -11,   7,  26, 24, 35,  -8, -20,
-     -5,  19,  26,  36, 17, 45,  61,  16,
-     27,  32,  58,  62, 80, 67,  26,  44,
-     32,  42,  32,  51, 63,  9,  31,  43,
-};
-static constexpr int EG_PSQT_ROOK[64] = {
-    -9,  2,  3, -1, -5, -13,   4, -20,
-    -6, -6,  0,  2, -9,  -9, -11,  -3,
-    -4,  0, -5, -1, -7, -12,  -8, -16,
-     3,  5,  8,  4, -5,  -6,  -8, -11,
-     4,  3, 13,  1,  2,   1,  -1,   2,
-     7,  7,  7,  5,  4,  -3,  -5,  -3,
-    11, 13, 13, 11, -3,   3,   8,   3,
-    13, 10, 18, 15, 12,  12,   8,   5,
-};
-
-static constexpr int MG_PSQT_QUEEN[64] = {
-     -1, -18,  -9,  10, -15, -25, -31, -50,
-    -35,  -8,  11,   2,   8,  15,  -3,   1,
-    -14,   2, -11,  -2,  -5,   2,  14,   5,
-     -9, -26,  -9, -10,  -2,  -4,   3,  -3,
-    -27, -27, -16, -16,  -1,  17,  -2,   1,
-    -13, -17,   7,   8,  29,  56,  47,  57,
-    -24, -39,  -5,   1, -16,  57,  28,  54,
-    -28,   0,  29,  12,  59,  44,  43,  45,
-};
-static constexpr int EG_PSQT_QUEEN[64] = {
-    -33, -28, -22, -43,  -5, -32, -20, -41,
-    -22, -23, -30, -16, -16, -23, -36, -32,
-    -16, -27,  15,   6,   9,  17,  10,   5,
-    -18,  28,  19,  47,  31,  34,  39,  23,
-      3,  22,  24,  45,  57,  40,  57,  36,
-    -20,   6,   9,  49,  47,  35,  19,   9,
-    -17,  20,  32,  41,  58,  25,  30,   0,
-     -9,  22,  22,  27,  27,  19,  10,  20,
-};
-
-static constexpr int MG_PSQT_KING[64] = {
-    -15,  36,  12, -54,   8, -28,  24,  14,
-      1,   7,  -8, -64, -43, -16,   9,   8,
-    -14, -14, -22, -46, -44, -30, -15, -27,
-    -49,  -1, -27, -39, -46, -44, -33, -51,
-    -17, -20, -12, -27, -30, -25, -14, -36,
-     -9,  24,   2, -16, -20,   6,  22, -22,
-     29,  -1, -20,  -7,  -8,  -4, -38, -29,
-    -65,  23,  16, -15, -56, -34,   2,  13,
-};
-static constexpr int EG_PSQT_KING[64] = {
-    -53, -34, -21, -11, -28, -14, -24, -43,
-    -27, -11,   4,  13,  14,   4,  -5, -17,
-    -19,  -3,  11,  21,  23,  16,   7,  -9,
-    -18,  -4,  21,  24,  27,  23,   9, -11,
-     -8,  22,  24,  27,  26,  33,  26,   3,
-     10,  17,  23,  15,  20,  45,  44,  13,
-    -12,  17,  14,  17,  17,  38,  23,  11,
-    -74, -35, -18, -18, -11,  15,   4, -17,
-};
-
-static const int* MG_PSQT[6] = {
-    MG_PSQT_PAWN, MG_PSQT_KNIGHT, MG_PSQT_BISHOP,
-    MG_PSQT_ROOK, MG_PSQT_QUEEN,  MG_PSQT_KING
-};
-static const int* EG_PSQT[6] = {
-    EG_PSQT_PAWN, EG_PSQT_KNIGHT, EG_PSQT_BISHOP,
-    EG_PSQT_ROOK, EG_PSQT_QUEEN,  EG_PSQT_KING
-};
-
-// ── Structural term weights ───────────────────────────────────────────────────
-// Format: {mg, eg}  (Texel-tunable — keep as named constants)
-
-// Bishop pair
-static constexpr int BISHOP_PAIR_MG = 30;
-static constexpr int BISHOP_PAIR_EG = 50;
-
-// Rook file bonuses
-static constexpr int ROOK_OPEN_MG     = 25;
-static constexpr int ROOK_OPEN_EG     = 10;
-static constexpr int ROOK_SEMIOPEN_MG = 12;
-static constexpr int ROOK_SEMIOPEN_EG =  5;
-
-// Pawn structure penalties (positive values = penalty, subtracted below)
-static constexpr int PAWN_ISOLATED_MG = 15;
-static constexpr int PAWN_ISOLATED_EG = 18;
-static constexpr int PAWN_DOUBLED_MG  = 10;
-static constexpr int PAWN_DOUBLED_EG  = 25;
-
-// Passed pawn bonus by relative rank (0-indexed, rank 0 = own back rank, never occupied by pawn)
-static constexpr int PASSED_MG[8] = { 0,  2,  6, 12, 22, 40,  65, 0 };
-static constexpr int PASSED_EG[8] = { 0,  5, 15, 30, 55, 85, 130, 0 };
-
-// Mobility: (count - pivot) * weight  per piece type  (N, B, R, Q)
-// Conservative weights — Texel tuning will refine these
-static constexpr int MOB_PIVOT[4]  = { 4, 6,  7, 14 };  // indexed 0=N,1=B,2=R,3=Q
-static constexpr int MOB_MG[4]     = { 3, 2,  1,  1 };
-static constexpr int MOB_EG[4]     = { 3, 2,  2,  1 };
-
-// King safety — conservative weights to avoid over-penalizing normal piece activity
-// Attack units: per piece type that has ≥1 square in king zone (not per square)
-static constexpr int KING_ATTACK_UNITS[6]  = { 0, 1, 1, 2, 3, 0 };  // per attacking piece
-static constexpr int PAWN_SHIELD_MG = 5;    // per shielding pawn, mg only
-static constexpr int KING_SAFETY_MAX = 100; // cap penalty magnitude (conservative for untuned)
-// Coefficient for quadratic penalty: units*units / KING_SAFETY_DIVISOR
-static constexpr int KING_SAFETY_DIVISOR = 8;
+void eval_set_defaults() { g_eval = DEFAULT_EVAL; }
 
 // ── Helper: adjacent-file mask ────────────────────────────────────────────────
 // Returns a mask of the files adjacent to the file of square s.
@@ -206,30 +205,6 @@ static inline Bitboard adjacent_files(File f) {
     if (f > FILE_A) m |= file_bb(File(f - 1));
     if (f < FILE_H) m |= file_bb(File(f + 1));
     return m;
-}
-
-// Forward span: all squares strictly ahead of sq for color c (same file).
-// For WHITE: squares above sq on same file; for BLACK: squares below sq on same file.
-static inline Bitboard forward_file_span(Color c, Square sq) {
-    // file mask minus the square itself and behind
-    Bitboard f = file_bb(file_of(sq));
-    if (c == WHITE) {
-        // ranks above sq
-        Bitboard above = ~((Bitboard(1) << (sq + 1)) - 1); // all bits >= sq+1... not quite
-        // simpler: shift the square bit north repeatedly — just use rank mask arithmetic
-        // squares on same file with rank > rank_of(sq)
-        Rank r = rank_of(sq);
-        Bitboard ahead = 0;
-        for (int rr = r + 1; rr <= RANK_8; ++rr)
-            ahead |= (RANK_1_BB << (rr * 8));
-        return f & ahead;
-    } else {
-        Rank r = rank_of(sq);
-        Bitboard ahead = 0;
-        for (int rr = 0; rr < r; ++rr)
-            ahead |= (RANK_1_BB << (rr * 8));
-        return f & ahead;
-    }
 }
 
 // Forward span on file AND adjacent files ahead of sq for color c.
@@ -266,8 +241,8 @@ static void eval_side(const Position& pos, Color c, int& mg, int& eg) {
 
     // ── Bishop pair ──────────────────────────────────────────────────────────
     if (popcount(pos.pieces(c, BISHOP)) >= 2) {
-        mg += BISHOP_PAIR_MG;
-        eg += BISHOP_PAIR_EG;
+        mg += g_eval.bishop_pair_mg;
+        eg += g_eval.bishop_pair_eg;
     }
 
     // ── Pawn structure ───────────────────────────────────────────────────────
@@ -279,13 +254,9 @@ static void eval_side(const Position& pos, Color c, int& mg, int& eg) {
 
             // Isolated: no own pawns on adjacent files
             if (!(own_pawns & adjacent_files(f))) {
-                mg -= PAWN_ISOLATED_MG;
-                eg -= PAWN_ISOLATED_EG;
+                mg -= g_eval.pawn_isolated_mg;
+                eg -= g_eval.pawn_isolated_eg;
             }
-
-            // Doubled: count own pawns on same file; penalise extras only
-            // (we'll count total pawns on file, subtract 1 for base, penalise rest)
-            // We do this once per file to avoid double-counting; track via file set.
         }
 
         // Doubled pawn penalty — per-file, once
@@ -294,8 +265,8 @@ static void eval_side(const Position& pos, Color c, int& mg, int& eg) {
             int cnt = popcount(on_file);
             if (cnt >= 2) {
                 // penalise the extras (cnt-1 extra pawns)
-                mg -= (cnt - 1) * PAWN_DOUBLED_MG;
-                eg -= (cnt - 1) * PAWN_DOUBLED_EG;
+                mg -= (cnt - 1) * g_eval.pawn_doubled_mg;
+                eg -= (cnt - 1) * g_eval.pawn_doubled_eg;
             }
         }
 
@@ -307,8 +278,8 @@ static void eval_side(const Position& pos, Color c, int& mg, int& eg) {
             // (same file + adjacent files, all ranks ahead)
             if (!(their_pawns & passed_pawn_mask(c, sq))) {
                 int relrank = relative_rank(c, sq);
-                mg += PASSED_MG[relrank];
-                eg += PASSED_EG[relrank];
+                mg += g_eval.passed_mg[relrank];
+                eg += g_eval.passed_eg[relrank];
             }
         }
     }
@@ -322,11 +293,11 @@ static void eval_side(const Position& pos, Color c, int& mg, int& eg) {
             bool no_own   = !(own_pawns   & fbb);
             bool no_their = !(their_pawns & fbb);
             if (no_own && no_their) {
-                mg += ROOK_OPEN_MG;
-                eg += ROOK_OPEN_EG;
+                mg += g_eval.rook_open_mg;
+                eg += g_eval.rook_open_eg;
             } else if (no_own) {
-                mg += ROOK_SEMIOPEN_MG;
-                eg += ROOK_SEMIOPEN_EG;
+                mg += g_eval.rook_semiopen_mg;
+                eg += g_eval.rook_semiopen_eg;
             }
         }
     }
@@ -350,8 +321,8 @@ static void eval_side(const Position& pos, Color c, int& mg, int& eg) {
             while (nb) {
                 Square s = pop_lsb(nb);
                 int cnt = popcount(knight_attacks[s] & mob_area);
-                mg += (cnt - MOB_PIVOT[0]) * MOB_MG[0];
-                eg += (cnt - MOB_PIVOT[0]) * MOB_EG[0];
+                mg += (cnt - g_eval.mob_pivot[0]) * g_eval.mob_mg[0];
+                eg += (cnt - g_eval.mob_pivot[0]) * g_eval.mob_eg[0];
             }
         }
         // Bishops (mob index 1)
@@ -360,8 +331,8 @@ static void eval_side(const Position& pos, Color c, int& mg, int& eg) {
             while (bb2) {
                 Square s = pop_lsb(bb2);
                 int cnt = popcount(bishop_attacks(s, occ) & mob_area);
-                mg += (cnt - MOB_PIVOT[1]) * MOB_MG[1];
-                eg += (cnt - MOB_PIVOT[1]) * MOB_EG[1];
+                mg += (cnt - g_eval.mob_pivot[1]) * g_eval.mob_mg[1];
+                eg += (cnt - g_eval.mob_pivot[1]) * g_eval.mob_eg[1];
             }
         }
         // Rooks (mob index 2)
@@ -370,8 +341,8 @@ static void eval_side(const Position& pos, Color c, int& mg, int& eg) {
             while (rb) {
                 Square s = pop_lsb(rb);
                 int cnt = popcount(rook_attacks(s, occ) & mob_area);
-                mg += (cnt - MOB_PIVOT[2]) * MOB_MG[2];
-                eg += (cnt - MOB_PIVOT[2]) * MOB_EG[2];
+                mg += (cnt - g_eval.mob_pivot[2]) * g_eval.mob_mg[2];
+                eg += (cnt - g_eval.mob_pivot[2]) * g_eval.mob_eg[2];
             }
         }
         // Queens (mob index 3)
@@ -380,8 +351,8 @@ static void eval_side(const Position& pos, Color c, int& mg, int& eg) {
             while (qb) {
                 Square s = pop_lsb(qb);
                 int cnt = popcount(queen_attacks(s, occ) & mob_area);
-                mg += (cnt - MOB_PIVOT[3]) * MOB_MG[3];
-                eg += (cnt - MOB_PIVOT[3]) * MOB_EG[3];
+                mg += (cnt - g_eval.mob_pivot[3]) * g_eval.mob_mg[3];
+                eg += (cnt - g_eval.mob_pivot[3]) * g_eval.mob_eg[3];
             }
         }
     }
@@ -406,12 +377,14 @@ static void eval_side(const Position& pos, Color c, int& mg, int& eg) {
                 }
                 int overlap = popcount(piece_att & zone);
                 if (overlap > 0)
-                    units += KING_ATTACK_UNITS[pt];
+                    units += g_eval.king_attack_units[pt];
             }
         }
         // Quadratic penalty, mg-heavy, conservative divisor
-        int penalty = (units * units) / KING_SAFETY_DIVISOR;
-        if (penalty > KING_SAFETY_MAX) penalty = KING_SAFETY_MAX;
+        int divisor = g_eval.king_safety_divisor;
+        if (divisor < 1) divisor = 1; // guard against a tuner setting it to 0
+        int penalty = (units * units) / divisor;
+        if (penalty > g_eval.king_safety_max) penalty = g_eval.king_safety_max;
         mg -= penalty;
         // eg penalty is 0 (king safety is primarily a midgame concern)
 
@@ -429,7 +402,7 @@ static void eval_side(const Position& pos, Color c, int& mg, int& eg) {
             if (kr - 2 >= RANK_1) shield_ranks |= rank_bb(Rank(kr - 2));
         }
         int shield = popcount(own_pawns & shield_files & shield_ranks);
-        mg += shield * PAWN_SHIELD_MG;
+        mg += shield * g_eval.pawn_shield_mg;
     }
 }
 
@@ -438,7 +411,7 @@ static void eval_side(const Position& pos, Color c, int& mg, int& eg) {
 int evaluate(const Position& pos) {
     int mg = 0, eg = 0, phase = 0;
 
-    // PSQT + material (unchanged from PeSTO base)
+    // PSQT + material
     for (int c = WHITE; c <= BLACK; ++c) {
         const int sign = (c == WHITE) ? +1 : -1;
         for (int pt = PAWN; pt <= KING; ++pt) {
@@ -446,8 +419,8 @@ int evaluate(const Position& pos) {
             while (bb) {
                 Square s = pop_lsb(bb);
                 int idx = (c == WHITE) ? s : (s ^ 56);
-                mg += sign * (MG_VALUE[pt] + MG_PSQT[pt][idx]);
-                eg += sign * (EG_VALUE[pt] + EG_PSQT[pt][idx]);
+                mg += sign * (g_eval.mg_value[pt] + g_eval.mg_psqt[pt][idx]);
+                eg += sign * (g_eval.eg_value[pt] + g_eval.eg_psqt[pt][idx]);
                 phase += PHASE_INC[pt];
             }
         }

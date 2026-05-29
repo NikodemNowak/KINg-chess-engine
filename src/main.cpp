@@ -5,6 +5,7 @@
 #include "attacks.hpp"
 #include "zobrist.hpp"
 #include "crash.hpp"
+#include "tune.hpp"
 #include <iostream>
 #include <string>
 
@@ -18,6 +19,9 @@ int main(int argc, char** argv) {
     zobrist::init();
 
     try {
+        if (argc >= 2 && std::string(argv[1]) == "tune") {
+            return king::run_tuner(argc, argv);
+        }
         if (argc >= 3 && std::string(argv[1]) == "perft") {
             int depth = std::stoi(argv[2]);
             std::string fen = (argc >= 4)
