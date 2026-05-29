@@ -293,6 +293,14 @@ struct Searcher {
             if (nullScore >= beta) return beta; // fail-high prune (return bound)
         }
 
+        // ── Internal Iterative Reduction (IIR) ───────────────────────────────
+        // If we have no TT move at this node (no prior search result to guide
+        // ordering), do a shallower search by reducing depth by 1. This cheap
+        // sacrifice pays off on the next visit when the TT move is available and
+        // the full-depth search is better ordered.
+        // Conditions: no TT move, depth >= 4, not in check.
+        if (!ttMove && depth >= 4 && !inCheck) depth -= 1;
+
         MoveList ml;
         generate_pseudo(pos, ml);
 
@@ -422,7 +430,12 @@ struct Searcher {
             // ── Does this move give check? (opponent now to move) ─────────
             const bool givesCheck = pos.in_check(pos.side_to_move());
 
-            const int newDepth = depth - 1;
+            // ── Check extension ───────────────────────────────────────────
+            // Extend by 1 ply when this move gives check. Checks are forcing
+            // moves that deserve deeper exploration; the MAX_PLY guard in the
+            // recursion prevents depth runaway.
+            const int extension = (givesCheck && ply < MAX_PLY - 1) ? 1 : 0;
+            const int newDepth = depth - 1 + extension;
             int score;
 
             if (firstMove) {
