@@ -10,3 +10,7 @@ nets/*.bin
 # Explicit: always commit harness files used for local Task-16 testing
 !engine-adapter.sh
 !openings.bin
+
+# Baseline binaries -- rebuild from the tagged commit, don't commit binaries
+tools/baseline/king_v1
+tools/baseline/king_v*
