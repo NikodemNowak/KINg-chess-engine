@@ -118,7 +118,7 @@ Move think(Position& pos, const Limits& L, std::atomic<bool>& stop,
     s.stop     = &stop;
     s.hard_ms  = tm.hard_ms;
     s.start    = std::chrono::steady_clock::now();
-    s.nodes    = 0;
+    s.nodes    = 1;  // start at 1 so the first stop/time check fires at nodes=2048
     s.aborted  = false;
 
     int maxDepth = (L.depth > 0) ? std::min(L.depth, MAX_PLY) : MAX_PLY;
