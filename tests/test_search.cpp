@@ -60,6 +60,31 @@ TEST_CASE("grabs a free queen at depth 6 (TT active)") {
     CHECK(m == make_move(E4, D5));
 }
 
+TEST_CASE("quiescence: does not grab a defended pawn losing material") {
+    se_init();
+    // White Qd1; black pawn d5 defended by black pawns e6 and c6. Qxd5?? loses
+    // the queen to a pawn recapture.
+    Position p;
+    p.set_fen("4k3/8/2p1p3/3p4/8/8/8/3QK3 w - - 0 1");
+    Limits L;
+    L.depth = 4;
+    std::atomic<bool> stop{false};
+    Move m = search::think(p, L, stop, 50, 1);
+    CHECK(m != make_move(D1, D5)); // qsearch sees the recapture, avoids the loss
+}
+
+TEST_CASE("quiescence: still grabs a truly free pawn") {
+    se_init();
+    // Qxd5 wins a clean, undefended pawn.
+    Position p;
+    p.set_fen("4k3/8/8/3p4/4Q3/8/8/4K3 w - - 0 1");
+    Limits L;
+    L.depth = 4;
+    std::atomic<bool> stop{false};
+    Move m = search::think(p, L, stop, 50, 1);
+    CHECK(m == make_move(E4, D5));
+}
+
 TEST_CASE("respects movetime and returns legal") {
     se_init();
     Position p;

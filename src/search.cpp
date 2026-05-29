@@ -39,14 +39,20 @@ static inline int fromTT(int score, int ply) {
     return score;
 }
 
+// ── Material values ───────────────────────────────────────────────────────────
+// Centipawn value of a piece type (indexed by PieceType: P N B R Q K).
+static inline int value_of(PieceType pt) {
+    static const int val[6] = { 100, 320, 330, 500, 900, 0 };
+    return val[pt];
+}
+
 // ── Material evaluation ───────────────────────────────────────────────────────
 // Returns a score relative to the side to move (positive = better for mover).
 static int evaluate(const Position& p) {
-    static const int val[6] = { 100, 320, 330, 500, 900, 0 }; // P N B R Q K
     int sc = 0;
     for (int pt = PAWN; pt <= QUEEN; ++pt)
-        sc += val[pt] * (popcount(p.pieces(WHITE, (PieceType)pt))
-                       - popcount(p.pieces(BLACK, (PieceType)pt)));
+        sc += value_of((PieceType)pt) * (popcount(p.pieces(WHITE, (PieceType)pt))
+                                       - popcount(p.pieces(BLACK, (PieceType)pt)));
     return (p.side_to_move() == WHITE) ? sc : -sc;
 }
 
@@ -91,6 +97,103 @@ struct Searcher {
         return false;
     }
 
+    // ── Quiescence search ──────────────────────────────────────────────────
+    // Extends the leaf search through "noisy" moves (captures/promotions, and
+    // all evasions while in check) so the static eval is only taken in a quiet
+    // position. This removes the horizon effect inside capture sequences.
+    int qsearch(Position& pos, int alpha, int beta, int ply) {
+        if (aborted || times_up()) { aborted = true; return 0; }
+        ++nodes;
+
+        if (ply >= MAX_PLY) return evaluate(pos);
+
+        const bool inCheck = pos.in_check(pos.side_to_move());
+
+        int standPat = 0;
+        int best;
+        if (inCheck) {
+            // Cannot "stand pat" while in check: we must answer the check, so
+            // every legal evasion is searched (not just captures).
+            best = -INF;
+        } else {
+            standPat = evaluate(pos);
+            if (standPat >= beta) return standPat; // fail-high: opponent won't allow this
+            if (standPat > alpha) alpha = standPat;
+            best = standPat;
+        }
+
+        MoveList ml;
+        generate_pseudo(pos, ml);
+
+        // Precompute MVV-LVA keys for ordering. For non-capture/non-promo moves
+        // (only relevant when in check) the key is irrelevant; we keep them
+        // last via a very small key.
+        int keys[256];
+        for (int i = 0; i < ml.size; ++i) {
+            Move m = ml.moves[i];
+            const bool isEp      = (type_of(m) == EN_PASSANT);
+            const Piece capPiece = pos.piece_on(to_sq(m));
+            const bool isCapture = isEp || (capPiece != NO_PIECE);
+            const bool isPromo   = (type_of(m) == PROMO);
+            if (isCapture) {
+                PieceType victim   = isEp ? PAWN : piece_type(capPiece);
+                PieceType attacker = piece_type(pos.piece_on(from_sq(m)));
+                keys[i] = value_of(victim) * 16 - value_of(attacker);
+                if (isPromo) keys[i] += value_of(QUEEN); // promo-captures sort high
+            } else if (isPromo) {
+                keys[i] = value_of(QUEEN); // quiet promotions: still noisy, order high
+            } else {
+                keys[i] = -1; // quiet (only used when in check); search after noisy
+            }
+        }
+
+        // Selection sort by key descending (move count here is small).
+        for (int i = 0; i < ml.size; ++i) {
+            int bi = i;
+            for (int j = i + 1; j < ml.size; ++j)
+                if (keys[j] > keys[bi]) bi = j;
+            if (bi != i) { std::swap(ml.moves[i], ml.moves[bi]); std::swap(keys[i], keys[bi]); }
+        }
+
+        for (int i = 0; i < ml.size; ++i) {
+            Move m = ml.moves[i];
+            const bool isEp      = (type_of(m) == EN_PASSANT);
+            const Piece capPiece = pos.piece_on(to_sq(m));
+            const bool isCapture = isEp || (capPiece != NO_PIECE);
+            const bool isPromo   = (type_of(m) == PROMO);
+
+            // When not in check, only consider captures and promotions.
+            if (!inCheck && !isCapture && !isPromo) continue;
+
+            // Delta pruning (only when not in check, plain captures): if even
+            // winning the victim plus a safety margin cannot reach alpha, skip.
+            if (!inCheck && isCapture && !isPromo) {
+                int victim = value_of(isEp ? PAWN : piece_type(capPiece));
+                if (standPat + victim + 200 <= alpha) continue;
+            }
+
+            StateInfo st;
+            pos.do_move(m, st);
+            // Legality: after do_move the mover is the non-side-to-move; legal
+            // iff that mover's king is not in check.
+            if (pos.in_check(Color(!pos.side_to_move()))) {
+                pos.undo_move(m);
+                continue;
+            }
+            int score = -qsearch(pos, -beta, -alpha, ply + 1);
+            pos.undo_move(m);
+            if (aborted) return 0;
+            if (score > best)  best  = score;
+            if (score > alpha) alpha = score;
+            if (alpha >= beta) break; // beta cutoff
+        }
+
+        // If in check and no legal move was found, it is checkmate.
+        if (inCheck && best == -INF) return -(MATE - ply);
+
+        return best;
+    }
+
     int negamax(Position& pos, int depth, int alpha, int beta, int ply) {
         if (aborted || times_up()) { aborted = true; return 0; }
         ++nodes;
@@ -115,7 +218,7 @@ struct Searcher {
             }
         }
 
-        if (depth <= 0) return evaluate(pos);
+        if (depth <= 0) return qsearch(pos, alpha, beta, ply);
 
         MoveList ml;
         generate_pseudo(pos, ml);
