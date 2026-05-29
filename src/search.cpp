@@ -10,6 +10,7 @@
 #include <ostream>
 #include <mutex>
 #include <algorithm>
+#include <cstring>
 #include <utility>
 
 namespace king {
@@ -78,6 +79,13 @@ static std::string to_uci(Move m) {
     return s;
 }
 
+// ── Move-ordering constants ───────────────────────────────────────────────────
+static constexpr int SCORE_TT_MOVE  = 2'000'000;
+static constexpr int SCORE_CAPTURE  = 1'000'000; // base; +MVV-LVA applied
+static constexpr int SCORE_KILLER1  =   900'000;
+static constexpr int SCORE_KILLER2  =   800'000;
+static constexpr int HISTORY_MAX    = 1 << 20;   // ~1M; clamp to stay below killer scores
+
 // ── Searcher ──────────────────────────────────────────────────────────────────
 struct Searcher {
     std::atomic<bool>* stop;
@@ -85,6 +93,10 @@ struct Searcher {
     std::chrono::steady_clock::time_point start;
     uint64_t           nodes;
     bool               aborted;
+
+    // ── Move-ordering tables ───────────────────────────────────────────────
+    Move killers[MAX_PLY][2];          // 2 killer (quiet) moves per ply
+    int  history[2][64][64];           // [side-to-move][from][to] for quiet moves
 
     bool times_up() {
         if ((nodes & 2047) == 0) {
@@ -227,13 +239,47 @@ struct Searcher {
         MoveList ml;
         generate_pseudo(pos, ml);
 
-        // ── Move ordering: try the TT move first if it is in this list ──────
-        // (Verifying membership guards against key16 collisions.)
-        if (ttMove != 0) {
-            for (int i = 0; i < ml.size; ++i) {
-                if (ml.moves[i] == ttMove) {
-                    if (i != 0) std::swap(ml.moves[0], ml.moves[i]);
-                    break;
+        const Color stm = pos.side_to_move();
+
+        // ── Move scoring (for ordering) ───────────────────────────────────────
+        // Assign a score to each pseudo-legal move; we iterate in descending
+        // score order using selection sort (lazy, one pass per iteration).
+        //
+        // Score buckets (non-overlapping):
+        //   TT move:        2,000,000
+        //   Captures/promos: 1,000,000 + MVV-LVA bonus  (max ~14*16+900 ≈ 1,127,300)
+        //   Killer 1:          900,000
+        //   Killer 2:          800,000
+        //   Quiet history:     history[stm][from][to]   (clamped to < 800,000)
+        int scores[256];
+        for (int i = 0; i < ml.size; ++i) {
+            Move m = ml.moves[i];
+            if (ttMove != 0 && m == ttMove) {
+                scores[i] = SCORE_TT_MOVE;
+            } else {
+                const bool isEp      = (type_of(m) == EN_PASSANT);
+                const Piece capPiece = pos.piece_on(to_sq(m));
+                const bool isCapture = isEp || (capPiece != NO_PIECE);
+                const bool isPromo   = (type_of(m) == PROMO);
+
+                if (isCapture || isPromo) {
+                    // MVV-LVA: most-valuable-victim / least-valuable-attacker
+                    PieceType victim   = isEp ? PAWN
+                                       : isCapture ? piece_type(capPiece)
+                                       : PAWN; // quiet promo: no real victim
+                    PieceType attacker = piece_type(pos.piece_on(from_sq(m)));
+                    int mvvlva = value_of(victim) * 16 - value_of(attacker);
+                    if (isPromo) mvvlva += value_of(QUEEN);
+                    scores[i] = SCORE_CAPTURE + mvvlva;
+                } else {
+                    // Quiet move: check killers then history
+                    if (ply < MAX_PLY && m == killers[ply][0]) {
+                        scores[i] = SCORE_KILLER1;
+                    } else if (ply < MAX_PLY && m == killers[ply][1]) {
+                        scores[i] = SCORE_KILLER2;
+                    } else {
+                        scores[i] = history[stm][from_sq(m)][to_sq(m)];
+                    }
                 }
             }
         }
@@ -244,12 +290,22 @@ struct Searcher {
         bool firstMove = true;
 
         for (int i = 0; i < ml.size; ++i) {
+            // ── Selection sort: pick the highest-scored remaining move ─────
+            int bi = i;
+            for (int j = i + 1; j < ml.size; ++j)
+                if (scores[j] > scores[bi]) bi = j;
+            if (bi != i) {
+                std::swap(ml.moves[i], ml.moves[bi]);
+                std::swap(scores[i],   scores[bi]);
+            }
+
+            Move m = ml.moves[i];
             StateInfo st;
-            pos.do_move(ml.moves[i], st);
+            pos.do_move(m, st);
             // Skip illegal pseudo-moves: after do_move the mover is now the
             // non-side-to-move, so we check that color for king safety.
             if (pos.in_check(Color(!pos.side_to_move()))) {
-                pos.undo_move(ml.moves[i]);
+                pos.undo_move(m);
                 continue;
             }
             ++legal;
@@ -268,16 +324,34 @@ struct Searcher {
                 }
             }
 
-            pos.undo_move(ml.moves[i]);
+            pos.undo_move(m);
             if (aborted) return 0;
             firstMove = false;
 
             if (score > best) {
                 best     = score;
-                bestMove = ml.moves[i];
+                bestMove = m;
             }
             if (score > alpha) alpha = score;
-            if (alpha >= beta) break; // beta cutoff
+            if (alpha >= beta) {
+                // ── Beta cutoff: update killers and history for quiet moves ──
+                const bool isEp      = (type_of(m) == EN_PASSANT);
+                const Piece capPiece = pos.piece_on(to_sq(m)); // piece already restored
+                const bool isCapture = isEp || (capPiece != NO_PIECE);
+                const bool isPromo   = (type_of(m) == PROMO);
+                if (!isCapture && !isPromo) {
+                    // Update killers (keep 2 distinct killers per ply)
+                    if (ply < MAX_PLY && m != killers[ply][0]) {
+                        killers[ply][1] = killers[ply][0];
+                        killers[ply][0] = m;
+                    }
+                    // Update history with depth² bonus (clamped to HISTORY_MAX)
+                    int& h = history[stm][from_sq(m)][to_sq(m)];
+                    h += depth * depth;
+                    if (h > HISTORY_MAX) h = HISTORY_MAX;
+                }
+                break; // beta cutoff
+            }
         }
 
         if (legal == 0)
@@ -318,6 +392,12 @@ Move think(Position& pos, const Limits& L, std::atomic<bool>& stop,
     s.start    = std::chrono::steady_clock::now();
     s.nodes    = 1;  // start at 1 so the first stop/time check fires at nodes=2048
     s.aborted  = false;
+
+    // Initialize move-ordering tables before the iterative deepening loop.
+    // These persist across depths within one think() call so killers and
+    // history learned at shallow depths inform deeper searches.
+    std::memset(s.killers, 0, sizeof(s.killers));
+    std::memset(s.history, 0, sizeof(s.history));
 
     int maxDepth = (L.depth > 0) ? std::min(L.depth, MAX_PLY) : MAX_PLY;
 

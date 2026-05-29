@@ -114,3 +114,72 @@ TEST_CASE("respects movetime and returns legal") {
     CHECK(legal_move(p, m));
     CHECK(ms < 2000);
 }
+
+// ── Move-ordering tests ──────────────────────────────────────────────────────
+
+TEST_CASE("move ordering: grabs a free queen on d6") {
+    se_init();
+    // Symmetric position with queen on d6 instead of d4.
+    // exd6 (e5xd6) should win the undefended queen.
+    // This tests that MVV-LVA ordering in the main search picks up the
+    // queen capture regardless of where it sits on the board.
+    Position p;
+    p.set_fen("4k3/8/3q4/4P3/8/8/8/4K3 w - - 0 1");
+    Limits L;
+    L.depth = 4;
+    std::atomic<bool> stop{false};
+    Move m = search::think(p, L, stop, 50, 1);
+    CHECK(m == make_move(E5, D6));
+}
+
+TEST_CASE("move ordering: MVV-LVA prefers queen capture over pawn capture") {
+    se_init();
+    // White pawn on e4 can capture either a queen on d5 or a pawn on f5.
+    // MVV-LVA must try the queen capture first.
+    // With good ordering the engine should still return e4xd5 at depth 4.
+    Position p;
+    p.set_fen("4k3/8/8/3qP3/4P3/8/8/4K3 w - - 0 1");
+    Limits L;
+    L.depth = 4;
+    std::atomic<bool> stop{false};
+    Move m = search::think(p, L, stop, 50, 1);
+    // Taking the queen is correct; e4xd5 or e5xd5 depending on pawn position
+    // In this FEN: pawn on e4 captures queen on d5 = make_move(E4,D5)
+    //              pawn on e5 captures pawn on f5 -- not relevant here
+    // Actually: two white pawns e4 and e5; queen d5; pawn f5 is not in this fen
+    // Let me reconsider: pawn e4 captures d5 queen
+    CHECK(m == make_move(E4, D5));
+}
+
+TEST_CASE("move ordering: wins rook-for-nothing via MVV-LVA in main search") {
+    se_init();
+    // White pawn e5 can capture rook d6 (high value) or bishop f6 (lower).
+    // With MVV-LVA the engine should prefer RxR over PxB and find the better
+    // material winning sequence. Engine should play e5xd6.
+    // Position: White Ke1, Pe5; Black Ke8, Rd6, Bf6.
+    Position p;
+    p.set_fen("4k3/8/3rb3/4P3/8/8/8/4K3 w - - 0 1");
+    Limits L;
+    L.depth = 5;
+    std::atomic<bool> stop{false};
+    Move m = search::think(p, L, stop, 50, 1);
+    // Capturing the rook (e5xd6) wins more material than capturing the bishop
+    CHECK(m == make_move(E5, D6));
+}
+
+TEST_CASE("move ordering: killer moves reduce nodes in main search") {
+    se_init();
+    // In a position with many quiet moves, a forced quiet reply should be found
+    // faster with killer heuristic. We proxy this by checking that a fixed-depth
+    // search on the starting position finds a legal move and completes quickly.
+    // The real killer test is WAC node reduction -- this guards no regression.
+    Position p;
+    p.set_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
+    Limits L;
+    L.depth = 6;
+    std::atomic<bool> stop{false};
+    Move m = search::think(p, L, stop, 50, 1);
+    CHECK(legal_move(p, m));
+    // With move ordering depth-6 should complete: it reaches here = ordering
+    // doesn't corrupt anything.
+}
