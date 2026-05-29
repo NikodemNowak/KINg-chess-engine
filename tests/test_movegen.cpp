@@ -24,3 +24,15 @@ TEST_CASE("check evasion + pins") {
   CHECK(count_legal("4k3/8/8/8/8/8/4r3/4K3 w - - 0 1")==3);    // king in check from rook on e2: Kd1,Kf1,Kxe2
   CHECK(count_legal("4r3/8/8/8/8/8/4N3/4K3 w - - 0 1")==4);    // knight on e2 pinned by rook e8 -> 0 knight moves, 4 king
 }
+
+TEST_CASE("has_legal_moves / mate / stalemate") {
+  mg_init();
+  Position s; s.set_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
+  CHECK(has_legal_moves(s) == true);
+  Position m; m.set_fen("rnb1kbnr/pppp1ppp/8/4p3/6Pq/5P2/PPPPP2P/RNBQKBNR w KQkq - 1 3"); // fool's mate: White is mated
+  CHECK(has_legal_moves(m) == false);
+  CHECK(m.in_check(WHITE) == true);
+  Position st; st.set_fen("7k/5Q2/6K1/8/8/8/8/8 b - - 0 1"); // Black stalemated (not in check, no moves)
+  CHECK(has_legal_moves(st) == false);
+  CHECK(st.in_check(BLACK) == false);
+}

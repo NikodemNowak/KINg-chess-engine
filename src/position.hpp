@@ -1,6 +1,7 @@
 #pragma once
 #include <cstdint>
 #include <string>
+#include <cassert>
 #include "types.hpp"
 #include "bitboard.hpp"
 
@@ -29,6 +30,8 @@ struct StateInfo {
 class Position {
 public:
     Position();
+    Position(const Position&) = delete;
+    Position& operator=(const Position&) = delete;
 
     // FEN I/O
     void        set_fen(const std::string& fen);
@@ -40,7 +43,7 @@ public:
     Bitboard pieces(Color c)               const { return by_color_[c]; }
     Bitboard occupied()                    const { return by_color_[WHITE] | by_color_[BLACK]; }
     Piece    piece_on(Square s)            const { return board_[s]; }
-    Square   king_sq(Color c)              const { return lsb(pieces(c, KING)); }
+    Square   king_sq(Color c)              const { Bitboard bb = pieces(c, KING); assert(bb); return lsb(bb); }
 
     // Attack queries
     Bitboard attackers_to(Square s, Bitboard occ) const;

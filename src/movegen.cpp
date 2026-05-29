@@ -162,4 +162,13 @@ void generate_legal(Position& pos, MoveList& list) {
             list.add(ps.moves[i]);
 }
 
+bool has_legal_moves(Position& pos) {
+    MoveList ps;
+    generate_pseudo(pos, ps);
+    for (int i = 0; i < ps.size; ++i)
+        if (is_legal(pos, ps.moves[i]))
+            return true;
+    return false;
+}
+
 } // namespace king

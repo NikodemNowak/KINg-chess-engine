@@ -158,6 +158,8 @@ Bitboard bishop_attacks(Square s, Bitboard occ) {
 namespace attacks {
 
 void init_leapers() {
+  static bool done = false;
+  if (done) return;          // idempotent
   // Initialize pawn attacks for both colors
   for (Square s = A1; s <= H8; s = Square(s + 1)) {
     Bitboard b = square_bb(s);
@@ -188,6 +190,7 @@ void init_leapers() {
     king_attacks[s] = shift<NORTH>(b) | shift<SOUTH>(b) | shift<EAST>(b) | shift<WEST>(b) |
                       shift<NORTH_EAST>(b) | shift<NORTH_WEST>(b) | shift<SOUTH_EAST>(b) | shift<SOUTH_WEST>(b);
   }
+  done = true;
 }
 
 void init_magics() {

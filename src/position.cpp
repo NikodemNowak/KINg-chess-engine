@@ -44,6 +44,7 @@ void Position::put_piece(Piece p, Square s) {
 
 void Position::remove_piece(Square s) {
     Piece p = board_[s];
+    assert(p != NO_PIECE);
     by_type_[piece_type(p)] &= ~square_bb(s);
     by_color_[color_of(p)]  &= ~square_bb(s);
     board_[s] = NO_PIECE;
@@ -346,7 +347,9 @@ Bitboard Position::attackers_to(Square s, Bitboard occ) const {
 }
 
 bool Position::in_check(Color c) const {
-    return (attackers_to(king_sq(c), occupied()) & by_color_[!c]) != 0;
+    Bitboard k = pieces(c, KING);
+    if (!k) return false;                 // defensive: no king -> avoid OOB on lsb(0)=64
+    return (attackers_to(lsb(k), occupied()) & by_color_[Color(!c)]) != 0;
 }
 
 } // namespace king

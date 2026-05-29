@@ -1,4 +1,5 @@
 #pragma once
+#include <cassert>
 #include "types.hpp"
 #include "position.hpp"
 
@@ -9,7 +10,7 @@ namespace king {
 struct MoveList {
     Move moves[256];
     int  size = 0;
-    void add(Move m) { moves[size++] = m; }
+    void add(Move m) { assert(size < 256); moves[size++] = m; }
 };
 
 // Pseudo-legal generation: king-safety is NOT filtered, EXCEPT castling, which is
@@ -22,5 +23,8 @@ bool is_legal(Position& pos, Move m);
 
 // Fully legal generation: generate_pseudo then keep only is_legal moves.
 void generate_legal(Position& pos, MoveList& list);
+
+// Returns true iff pos has at least one legal move (early-exits on first found).
+bool has_legal_moves(Position& pos);
 
 } // namespace king

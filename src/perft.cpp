@@ -50,20 +50,23 @@ uint64_t perft(Position& pos, int depth) {
 
 void perft_divide(Position& pos, int depth) {
     MoveList ml;
-    generate_legal(pos, ml);
+    generate_pseudo(pos, ml);
 
     uint64_t total = 0;
     for (int i = 0; i < ml.size; ++i) {
+        StateInfo st;
+        pos.do_move(ml.moves[i], st);
+        // Skip illegal pseudo-moves (moving side's king left in check).
+        if (pos.in_check(Color(!pos.side_to_move()))) {
+            pos.undo_move(ml.moves[i]);
+            continue;
+        }
+
         char buf[6];
         move_to_uci(ml.moves[i], buf);
 
-        uint64_t cnt = 1;
-        if (depth > 1) {
-            StateInfo st;
-            pos.do_move(ml.moves[i], st);
-            cnt = perft(pos, depth - 1);
-            pos.undo_move(ml.moves[i]);
-        }
+        uint64_t cnt = (depth > 1) ? perft(pos, depth - 1) : 1;
+        pos.undo_move(ml.moves[i]);
 
         std::printf("%s: %llu\n", buf, (unsigned long long)cnt);
         total += cnt;
