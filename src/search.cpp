@@ -194,6 +194,10 @@ struct Searcher {
         return best;
     }
 
+    // ── PVS negamax ───────────────────────────────────────────────────────────
+    // Principal Variation Search: the first move is searched with the full
+    // window; subsequent moves use a zero-window (scout) search. Only if the
+    // scout exceeds alpha AND is inside beta is a costly re-search done.
     int negamax(Position& pos, int depth, int alpha, int beta, int ply) {
         if (aborted || times_up()) { aborted = true; return 0; }
         ++nodes;
@@ -237,6 +241,8 @@ struct Searcher {
         int  best     = -INF;
         Move bestMove = 0;
         int  legal    = 0;
+        bool firstMove = true;
+
         for (int i = 0; i < ml.size; ++i) {
             StateInfo st;
             pos.do_move(ml.moves[i], st);
@@ -247,15 +253,31 @@ struct Searcher {
                 continue;
             }
             ++legal;
-            int score = -negamax(pos, depth - 1, -beta, -alpha, ply + 1);
+
+            int score;
+            if (firstMove) {
+                // First (best) move: search with full window.
+                score = -negamax(pos, depth - 1, -beta, -alpha, ply + 1);
+            } else {
+                // Subsequent moves: zero-window scout first.
+                score = -negamax(pos, depth - 1, -alpha - 1, -alpha, ply + 1);
+                // If the scout beats alpha and is not a beta cutoff, re-search
+                // with the full window to get the exact score.
+                if (!aborted && score > alpha && score < beta) {
+                    score = -negamax(pos, depth - 1, -beta, -alpha, ply + 1);
+                }
+            }
+
             pos.undo_move(ml.moves[i]);
             if (aborted) return 0;
+            firstMove = false;
+
             if (score > best) {
                 best     = score;
                 bestMove = ml.moves[i];
             }
             if (score > alpha) alpha = score;
-            if (alpha >= beta) break;
+            if (alpha >= beta) break; // beta cutoff
         }
 
         if (legal == 0)
@@ -299,36 +321,117 @@ Move think(Position& pos, const Limits& L, std::atomic<bool>& stop,
 
     int maxDepth = (L.depth > 0) ? std::min(L.depth, MAX_PLY) : MAX_PLY;
 
-    for (int depth = 1; depth <= maxDepth; ++depth) {
-        // Order the previous iteration's best move first (it is also the TT
-        // move for the root). This makes the new window tighten fastest.
+    int prevScore = 0; // tracks score from the last completed depth for aspiration
+
+    // ── root_search lambda ────────────────────────────────────────────────────
+    // Performs PVS over the root legal moves within [alpha, beta].
+    // Updates iterBest/iterScore. Returns the best score found.
+    // On abort, iterBest/iterScore reflect partial results from this depth.
+    // NOTE: this lambda captures root, s, pos by reference so it can mutate them.
+    Move iterBest  = best;
+    int  iterScore = 0;
+
+    auto root_search = [&](int depth, int alpha, int beta) -> int {
+        // Re-order: put iterBest (best from previous aspiration attempt or
+        // previous depth) first so the PVS first-move gets the best candidate.
         for (int i = 0; i < root.size; ++i) {
-            if (root.moves[i] == best) {
+            if (root.moves[i] == iterBest) {
                 if (i != 0) std::swap(root.moves[0], root.moves[i]);
                 break;
             }
         }
 
-        int alpha = -INF, beta = INF, bestScore = -INF;
-        Move iterBest = best;
+        int  bestScore = -INF;
+        Move localBest = iterBest; // keep previous best as fallback
+        bool firstMove = true;
 
         for (int i = 0; i < root.size; ++i) {
             StateInfo st;
             pos.do_move(root.moves[i], st);
-            int score = -s.negamax(pos, depth - 1, -beta, -alpha, 1);
+            int score;
+            if (firstMove) {
+                score = -s.negamax(pos, depth - 1, -beta, -alpha, 1);
+            } else {
+                score = -s.negamax(pos, depth - 1, -alpha - 1, -alpha, 1);
+                if (!s.aborted && score > alpha && score < beta) {
+                    score = -s.negamax(pos, depth - 1, -beta, -alpha, 1);
+                }
+            }
             pos.undo_move(root.moves[i]);
+
             if (s.aborted) break;
+            firstMove = false;
+
             if (score > bestScore) {
                 bestScore = score;
-                iterBest  = root.moves[i];
+                localBest = root.moves[i];
             }
             if (score > alpha) alpha = score;
+            // No beta cutoff at root: we always want to find the best move.
+            // (Early break would miss a better move that beats the window.)
+        }
+
+        // Only update iterBest/iterScore if we got a useful result (not aborted
+        // with no moves tried at all). If aborted after the first move we still
+        // have a valid localBest from that move.
+        if (bestScore > -INF) {
+            iterBest  = localBest;
+            iterScore = bestScore;
+        }
+        return bestScore;
+    };
+
+    for (int depth = 1; depth <= maxDepth; ++depth) {
+        int delta = 20;
+        int alpha, beta;
+        if (depth >= 5) {
+            alpha = prevScore - delta;
+            beta  = prevScore + delta;
+        } else {
+            alpha = -INF;
+            beta  =  INF;
+        }
+
+        int scoreThisDepth = 0;
+        // Reset iterBest to best (last completed depth's best) at the start of
+        // each new depth so root_search has a good first-move candidate.
+        iterBest  = best;
+        iterScore = 0;
+
+        while (true) {
+            scoreThisDepth = root_search(depth, alpha, beta);
+
+            if (s.aborted) break;
+
+            if (scoreThisDepth <= alpha) {
+                // Fail low: widen downward.
+                beta  = (alpha + beta) / 2;
+                alpha = std::max(-INF, scoreThisDepth - delta);
+                delta += delta / 2;
+            } else if (scoreThisDepth >= beta) {
+                // Fail high: widen upward.
+                beta = std::min(INF, scoreThisDepth + delta);
+                delta += delta / 2;
+            } else {
+                // In window: accept the result.
+                break;
+            }
+
+            // Safety valve: bail to full window to prevent loops on weird positions.
+            if (delta > 2000) {
+                alpha = -INF;
+                beta  =  INF;
+            }
         }
 
         if (s.aborted) break;
-        best = iterBest;
+
+        // Commit the completed depth's result.
+        prevScore = scoreThisDepth;
+        best      = iterBest;
+
         // Store the completed root result (EXACT — full window, full search).
-        tt.store(pos.key(), best, toTT(bestScore, 0), 0, (uint8_t)depth, BOUND_EXACT);
+        tt.store(pos.key(), best, toTT(scoreThisDepth, 0), 0, (uint8_t)depth, BOUND_EXACT);
         crash::arm_fallback(to_uci(best).c_str());
 
         auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -336,7 +439,7 @@ Move think(Position& pos, const Limits& L, std::atomic<bool>& stop,
                       .count();
         if (out_mtx) out_mtx->lock();
         out << "info depth " << depth
-            << " score cp " << bestScore
+            << " score cp " << scoreThisDepth
             << " nodes " << s.nodes
             << " time " << ms
             << " pv " << to_uci(best) << std::endl;

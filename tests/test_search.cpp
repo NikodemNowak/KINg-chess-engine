@@ -85,6 +85,20 @@ TEST_CASE("quiescence: still grabs a truly free pawn") {
     CHECK(m == make_move(E4, D5));
 }
 
+TEST_CASE("finds forced mate in 1") {
+    se_init();
+    // Ra8# is the only mating move. White rook on a1, black king on g8
+    // surrounded by its own pawns on f7/g7/h7.
+    Position p;
+    p.set_fen("6k1/5ppp/8/8/8/8/8/R5K1 w - - 0 1");
+    Limits L;
+    L.depth = 3;
+    std::atomic<bool> stop{false};
+    Move m = search::think(p, L, stop, 50, 1);
+    // a1a8 delivers checkmate
+    CHECK(m == make_move(A1, A8));
+}
+
 TEST_CASE("respects movetime and returns legal") {
     se_init();
     Position p;
