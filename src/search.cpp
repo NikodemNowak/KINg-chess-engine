@@ -259,6 +259,18 @@ struct Searcher {
         const bool inCheck = pos.in_check(pos.side_to_move());
         const Color stm    = pos.side_to_move();
 
+        // ── Static evaluation (cached for pruning) ────────────────────────────
+        // Not meaningful while in check (king is in danger, eval is unstable).
+        const int staticEval = inCheck ? -INF : evaluate(pos);
+
+        // ── Reverse Futility Pruning (static null move) ───────────────────────
+        // If the static eval already beats beta by a large margin (depth*75), the
+        // position is so good we can prune without searching further.
+        if (!isPV && !inCheck && depth <= 8
+            && beta < MATE - MAX_PLY && beta > -(MATE - MAX_PLY)
+            && staticEval - 75 * depth >= beta)
+            return staticEval;
+
         // ── Null-move pruning (NMP) ───────────────────────────────────────────
         // Skip our turn and see if the opponent can still fail high. If they
         // can't beat beta even with a free move, the position is so good that we
@@ -358,6 +370,19 @@ struct Searcher {
                     && depth >= 3 && depth <= 6
                     && moveCount >= 4 + depth * depth
                     && best > -(MATE - MAX_PLY)) {
+                continue;
+            }
+
+            // ── Futility Pruning (frontier) ───────────────────────────────
+            // At very shallow depths, if the static eval plus a margin cannot
+            // reach alpha, this quiet move almost certainly can't raise alpha.
+            // Guard: only fire when the position isn't already losing (eval >=
+            // -150) to avoid pruning in sharp positions where material eval
+            // underestimates piece activity.
+            if (!isPV && !inCheck && isQuiet && depth <= 6
+                    && best > -(MATE - MAX_PLY)
+                    && staticEval >= -150
+                    && staticEval + 100 + 80 * depth <= alpha) {
                 continue;
             }
 
