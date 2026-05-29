@@ -1,7 +1,9 @@
 #pragma once
 // NNUE inference for the KINg engine.
 //
-// Perspective net (768 -> 256) x2 -> 1, clipped-ReLU, INT16/INT32 quantized.
+// Perspective net (768 -> HL) x2 -> 1, clipped-ReLU, INT16/INT32 quantized.
+// HL (accumulator size per perspective) is a compile-time constant controlled
+// by -DNNUE_HL=<n> (default 256 for the committed net; 512 for the full retrain).
 // The net is embedded in the binary (see nnue_net_data.cpp, generated at build
 // time from nets/king_nnue.bin), so no external file is needed at runtime.
 //
@@ -16,8 +18,15 @@ class Position;
 namespace nnue {
 
 // Architecture constants (also validated against the embedded net header).
+// HL (accumulator size per perspective) is set at build time via -DNNUE_HL=<n>
+// (default 256 for the committed HL=256 net; override to 512 for the full
+// retrain).  All other constants are fixed.
 constexpr int INPUT = 768;
-constexpr int HL    = 256;          // accumulator size per perspective
+#ifndef NNUE_HL
+constexpr int HL    = 256;
+#else
+constexpr int HL    = NNUE_HL;
+#endif
 constexpr int QA    = 255;
 constexpr int QB    = 64;
 constexpr int SCALE = 400;

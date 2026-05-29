@@ -24,15 +24,22 @@ extern "C" const unsigned int  king_nnue_data_len;
 
 namespace {
 
-// Parsed network. W1 is transposed to [input][output] so that the 256 weights
+// Parsed network. W1 is transposed to [input][output] so that the HL weights
 // belonging to one feature are contiguous (the usual NNUE layout) — that makes
 // the accumulator update a single contiguous add/sub over HL int16s.
+// HL is a compile-time constant set by -DNNUE_HL (default 256; use 512 for the
+// full retrain). All loops and array sizes below use HL, so changing the define
+// is sufficient — nothing here is hardcoded to 256.
 struct Net {
     int16_t W1t[INPUT][HL]; // transposed: W1t[i][o] == W1q[o][i]
     int16_t b1[HL];
-    int16_t W2[2 * HL];     // [0..255] stm, [256..511] nonstm
+    int16_t W2[2 * HL];     // [0..HL-1] stm perspective, [HL..2*HL-1] nonstm
     int32_t b2;
 };
+
+// AVX2 loops in dot_half / acc_add / acc_sub process 16 int16s per iteration;
+// HL must be a multiple of 16 for them to be correct.
+static_assert(HL % 16 == 0, "NNUE_HL must be a multiple of 16 (AVX2 loop requirement)");
 
 Net g_net;
 bool g_loaded = false;
@@ -55,7 +62,7 @@ void init() {
     // Header: magic(u32) HL(u16) QA(u16) QB(u16) SCALE(u16) = 12 bytes.
     constexpr unsigned int kExpected =
         12u + (unsigned)(HL * INPUT) * 2u + (unsigned)HL * 2u +
-        (unsigned)(2 * HL) * 2u + 4u; // 394768
+        (unsigned)(2 * HL) * 2u + 4u; // 394768 at HL=256, 1573900 at HL=512
     if (n != kExpected) std::abort();
 
     uint32_t magic = read_le<uint32_t>(p + 0);
@@ -95,8 +102,9 @@ static inline int crelu(int v) {
 // layer. BIT-EXACTNESS CONTRACT: this MUST equal the scalar sum below for any
 // inputs — integer add is associative and no intermediate overflows (each
 // crelu(a)∈[0,QA=255], |w|≤32767 → |product|≤8.36M, two summed in madd ≤16.7M <
-// 2^31; the int32 partials are then widened to int64 before accumulating, so the
-// running sum never wraps). The AVX2 path therefore reproduces the reference int.
+// 2^31; the int32 partials are then widened to int64 before accumulating so the
+// running sum never wraps even at HL=1024). The AVX2 path reproduces the
+// reference integer exactly. Requires HL % 16 == 0 (see static_assert above).
 static inline int64_t dot_half(const int16_t* a, const int16_t* w) {
 #ifdef __AVX2__
     const __m256i zero = _mm256_setzero_si256();
@@ -129,7 +137,7 @@ static inline int64_t dot_half(const int16_t* a, const int16_t* w) {
 // ── Output layer on an up-to-date accumulator ───────────────────────────────
 int evaluate_acc(const Accumulator& acc, Color stm) {
     const Color nonstm = Color(!stm);
-    // stm perspective FIRST -> W2[0..255]; nonstm -> W2[256..511].
+    // stm perspective FIRST -> W2[0..HL-1]; nonstm -> W2[HL..2*HL-1].
     int64_t sum = (int64_t)g_net.b2;
     sum += dot_half(acc.v[stm],    g_net.W2);
     sum += dot_half(acc.v[nonstm], g_net.W2 + HL);

@@ -11,25 +11,28 @@ All multi-byte values in the binary are **little-endian**.
 
 ## 1. Architecture
 
-Perspective net, **`(768 → 256)×2 → 1`**, clipped-ReLU.
+Perspective net, **`(768 → HL)×2 → 1`**, clipped-ReLU.  Default **`HL = 512`**
+for new training runs (pass `--hl` to override).  The committed net
+`nets/king_nnue.bin` stores its actual HL in the header (bytes 4–5); the C++
+loader reads it back at initialisation time.
 
 ```
             stm features (768)            nonstm features (768)
                   │                              │
-            W1 [256×768] + b1            W1 [256×768] + b1     (SAME W1,b1)
+            W1 [HL×768] + b1             W1 [HL×768] + b1      (SAME W1,b1)
                   │                              │
-              acc_stm (256)                 acc_nst (256)
+              acc_stm (HL)                  acc_nst (HL)
                   │  clipped-ReLU                │  clipped-ReLU
             crelu(acc_stm)                crelu(acc_nst)
                   └──────────────┬───────────────┘
-                       concat (stm first)  → x (512)
+                       concat (stm first)  → x (2*HL)
                                  │
-                          W2 [1×512] + b2
+                        W2 [1×(2*HL)] + b2
                                  │
                               y (scalar)
 ```
 
-* `HL = 256` (accumulator size per perspective).
+* `HL` (accumulator size per perspective) — default **512** for new training; stored in the binary header so the C++ can load any value without recompilation.
 * Both perspectives share the **same** feature transformer `W1`, `b1`.
 * The concatenation order is **stm perspective first**, then nonstm.
 * Output `y` is the eval from the **side-to-move POV** (positive = good for the
@@ -55,10 +58,10 @@ each piece type occupying 64 squares.
 ### 1.2 Forward pass (float, training domain)
 
 ```
-acc_P = b1 + Σ_{features of P} W1[:, idx]          # W1 shape [256,768], b1 [256]
+acc_P = b1 + Σ_{features of P} W1[:, idx]          # W1 shape [HL,768], b1 [HL]
 crelu(v) = clamp(v, 0.0, 1.0)                      # float clipped-ReLU
-x = concat( crelu(acc_stm), crelu(acc_nst) )       # size 512, stm first
-y = b2 + W2 · x                                    # W2 [1,512], b2 scalar
+x = concat( crelu(acc_stm), crelu(acc_nst) )       # size 2*HL, stm first
+y = b2 + W2 · x                                    # W2 [1,2*HL], b2 scalar
 ```
 
 The training loss treats `y` as a centipawn-scale logit:
@@ -90,9 +93,9 @@ batch `16384`, 45 epochs (val loss plateaus well before then).
 Constants: **`QA = 255`, `QB = 64`, `SCALE = 400`**.
 
 ```
-W1q = round(W1 * QA)          # int16,  shape [256, 768]
-b1q = round(b1 * QA)          # int16,  shape [256]      → accumulator is int16
-W2q = round(W2 * QB)          # int16,  shape [512]
+W1q = round(W1 * QA)          # int16,  shape [HL, 768]
+b1q = round(b1 * QA)          # int16,  shape [HL]       → accumulator is int16
+W2q = round(W2 * QB)          # int16,  shape [2*HL]
 b2q = round(b2 * QA * QB)     # int32   scalar
 ```
 
@@ -107,16 +110,16 @@ cr(v) = clamp(v, 0, QA)       # v is an int16 accumulator entry
 ```
 acc_stm[i] = b1q[i] + Σ_{features of stm}    W1q[i, idx]      # int16 accumulate
 acc_nst[i] = b1q[i] + Σ_{features of nonstm} W1q[i, idx]
-acc = concat( cr(acc_stm), cr(acc_nst) )                      # 512 ints in [0,QA]
+acc = concat( cr(acc_stm), cr(acc_nst) )                      # 2*HL ints in [0,QA]
 
-sum = b2q + Σ_{i=0..511} acc[i] * W2q[i]                      # accumulate in int32/int64
+sum = b2q + Σ_{i=0..2*HL-1} acc[i] * W2q[i]                   # accumulate in int32/int64
 eval_cp = sum * SCALE / (QA * QB)                             # integer division
 ```
 
 * `acc` entries are in `[0, 255]`; `W2q` fits in int16. The product `acc[i]*W2q[i]`
   and the running `sum` must be accumulated in **at least int32** (int64 is safe;
-  worst case ≈ 512 · 255 · 32767 ≈ 4.3e9 which exceeds int32 — so **use int64 for
-  the dot-product accumulator**, then the final value fits comfortably).
+  worst case at HL=512: 1024 · 255 · 32767 ≈ 8.6e9 which exceeds int32 — so
+  **use int64 for the dot-product accumulator**, then the final value fits comfortably).
 * `eval_cp` is from the **side-to-move POV**.
 * Integer division truncates toward zero (C/C++ `/`, and Python `int(a*b//c)` for
   non-negative; the reference uses `out * SCALE // (QA*QB)` matching C++ trunc for
@@ -149,26 +152,25 @@ Expect agreement within a few centipawns (typically mean < 3 cp).
 
 ## 4. Binary format — `nets/king_nnue.bin`
 
-Little-endian. Sizes: `HL = 256`, `INPUT = 768`.
+Little-endian. `HL` is written in the header (read by the C++ loader at init).
+Default for new training runs: `HL = 512`, `INPUT = 768`.
 
-| Offset (bytes) | Field      | Type            | Count       | Notes                                   |
-|----------------|------------|-----------------|-------------|-----------------------------------------|
-| 0              | `magic`    | `uint32`        | 1           | `0x4B4E5545` ("KNUE")                   |
-| 4              | `HL`       | `uint16`        | 1           | `256`                                   |
-| 6              | `QA`       | `uint16`        | 1           | `255`                                   |
-| 8              | `QB`       | `uint16`        | 1           | `64`                                    |
-| 10             | `SCALE`    | `uint16`        | 1           | `400`                                   |
-| 12             | `W1q`      | `int16`         | `256 * 768` | **row-major `[output o][input i]`**: o outer, i inner |
-| 12 + 393216    | `b1q`      | `int16`         | `256`       |                                         |
-| 393228 ...     | `W2q`      | `int16`         | `512`       | index `0..255` = **stm**, `256..511` = **nonstm** |
-| ... + 1024     | `b2q`      | `int32`         | 1           |                                         |
+| Offset (bytes)        | Field      | Type            | Count       | Notes                                          |
+|-----------------------|------------|-----------------|-------------|------------------------------------------------|
+| 0                     | `magic`    | `uint32`        | 1           | `0x4B4E5545` ("KNUE")                          |
+| 4                     | `HL`       | `uint16`        | 1           | accumulator size (e.g. 512)                    |
+| 6                     | `QA`       | `uint16`        | 1           | `255`                                          |
+| 8                     | `QB`       | `uint16`        | 1           | `64`                                           |
+| 10                    | `SCALE`    | `uint16`        | 1           | `400`                                          |
+| 12                    | `W1q`      | `int16`         | `HL * 768`  | **row-major `[output o][input i]`**: o outer   |
+| 12 + HL*768*2         | `b1q`      | `int16`         | `HL`        |                                                |
+| 12 + HL*768*2 + HL*2  | `W2q`      | `int16`         | `2*HL`      | `0..HL-1` = **stm**, `HL..2HL-1` = **nonstm** |
+| + 2*HL*2              | `b2q`      | `int32`         | 1           |                                                |
 
 * Header size = 12 bytes.
-* `W1q` size = `256 * 768 * 2 = 393216` bytes.
-* `b1q` size = `256 * 2 = 512` bytes.
-* `W2q` size = `512 * 2 = 1024` bytes.
-* `b2q` size = `4` bytes.
-* **Total file size = `12 + 393216 + 512 + 1024 + 4 = 394768` bytes.**
+* **Total file size = `12 + HL*768*2 + HL*2 + 2*HL*2 + 4` bytes.**
+  * HL=256: 394 768 bytes (old committed net).
+  * HL=512: 789 524 bytes (default for the ≥30M retrain).
 
 ### 4.1 `W1q` indexing in the accumulator update
 
@@ -177,29 +179,31 @@ Little-endian. Sizes: `HL = 256`, `INPUT = 768`.
 flat index `o * 768 + idx`. A cache-friendly C++ loop is:
 
 ```cpp
-for (int o = 0; o < 256; ++o)
+for (int o = 0; o < HL; ++o)
     acc[o] += W1q[o * 768 + idx];
 ```
 
 (or, equivalently, transpose `W1q` to `[input][output]` once at load time so each
-feature's 256 weights are contiguous — that is the usual NNUE layout; either is
+feature's HL weights are contiguous — that is the usual NNUE layout; either is
 fine as long as the math is identical.)
 
 ### 4.2 `W2q` ordering
 
-`W2q[0..255]` multiply `cr(acc_stm)` and `W2q[256..511]` multiply `cr(acc_nst)`,
-matching the **stm-first** concatenation.
+`W2q[0..HL-1]` multiply `cr(acc_stm)` and `W2q[HL..2*HL-1]` multiply
+`cr(acc_nst)`, matching the **stm-first** concatenation.
 
 ---
 
 ## 5. Files
 
-* `trainer/train_nnue.py` — data loader + model + training + quantize + export +
-  sample generation (single self-contained script).
+* `trainer/preprocess_nnue.py` — one-time text→binary conversion (72 B/pos,
+  numpy memmap format).  Run once; re-run only if the dataset changes.
+* `trainer/train_nnue.py` — streaming trainer (reads binary cache via memmap),
+  model, quantize, export, sample generation.
 * `trainer/README_NNUE.md` — this contract.
 * `trainer/nnue_samples.txt` — `~25` lines `FEN <quantized_eval_cp_stm_pov>`; the
   C++ inference must reproduce each integer exactly.
-* `nets/king_nnue.bin` — the exported quantized network (≈ 386 KB).
+* `nets/king_nnue.bin` — the exported quantized network.
 
 Data lives under `data/` (git-ignored).
 
@@ -208,10 +212,16 @@ Data lives under `data/` (git-ignored).
 ## 6. Reproduce
 
 ```powershell
-# 1. dataset (≈3.5M positions)
-build\engine.exe datagen data\nnue_data.txt 62000 6 24
+# 1. Generate large dataset (~30M positions, CPU datagen)
+build\engine.exe datagen data\nnue_big.txt ...
 
-# 2. train + quantize + export + samples
-py trainer\train_nnue.py --data data\nnue_data.txt `
-    --out nets\king_nnue.bin --samples trainer\nnue_samples.txt
+# 2. Pre-process text → binary cache (ONCE; ~2GB output for 30M positions)
+py trainer\preprocess_nnue.py `
+    --data data\nnue_big.txt --out data\nnue_big.bin
+
+# 3. Train (streams from binary cache; HL=512 default)
+py trainer\train_nnue.py `
+    --cache data\nnue_big.bin `
+    --out nets\king_nnue.bin `
+    --samples trainer\nnue_samples.txt
 ```

@@ -34,3 +34,16 @@ data/
 # Don't commit trainer dev/test scratch files.
 trainer/_*.py
 trainer/__pycache__/
+
+# NNUE binary caches (large memmap files; regenerate from text dataset).
+*.bin
+!nets/king_nnue.bin
+!openings.bin
+# Smoke-run / temp validation artifacts (not production).
+trainer/smoke_big.txt
+trainer/smoke_big.bin
+trainer/tmp_*.bin
+trainer/tmp_*.txt
+nets/smoke_nnue.bin
+# build-nnue/ is a local validation build dir, not a standard out-of-tree build.
+build-nnue/
