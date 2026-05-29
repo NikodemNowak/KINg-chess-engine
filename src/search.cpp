@@ -2,6 +2,7 @@
 #include "movegen.hpp"
 #include "bitboard.hpp"
 #include "timeman.hpp"
+#include "crash.hpp"
 #include <atomic>
 #include <chrono>
 #include <iostream>
@@ -113,6 +114,7 @@ Move think(Position& pos, const Limits& L, std::atomic<bool>& stop,
     if (root.size == 0) return 0; // no legal move (mate/stalemate); UCI layer handles
 
     Move best = root.moves[0]; // safety default: always a legal move
+    crash::arm_fallback(to_uci(best).c_str());
 
     Searcher s;
     s.stop     = &stop;
@@ -142,6 +144,7 @@ Move think(Position& pos, const Limits& L, std::atomic<bool>& stop,
 
         if (s.aborted) break;
         best = iterBest;
+        crash::arm_fallback(to_uci(best).c_str());
 
         auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                       std::chrono::steady_clock::now() - s.start)
