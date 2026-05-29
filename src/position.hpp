@@ -29,9 +29,12 @@ struct StateInfo {
     int        prev_fullmove;
     uint64_t   prev_key;
     StateInfo* previous;
-#ifdef EVAL_NNUE
-    nnue::Accumulator prev_acc; // accumulator snapshot before the move (for undo)
-#endif
+    // NOTE: no NNUE accumulator snapshot here. undo_move physically restores the
+    // board with the exact inverse put/remove/move operations, and each of those
+    // updates the live accumulator incrementally (add/sub the same feature
+    // columns). Re-applying that inverse set returns acc_ to its prior bits
+    // (int16 column add/sub is commutative/associative), so a per-ply 1 KB
+    // snapshot+copy is unnecessary — this is the "delta-undo" accumulator.
 };
 
 class Position {

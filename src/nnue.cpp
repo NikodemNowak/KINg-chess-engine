@@ -11,6 +11,10 @@
 #include <cstring>
 #include <cstdlib>
 
+#ifdef __AVX2__
+#include <immintrin.h>
+#endif
+
 namespace king {
 namespace nnue {
 
@@ -86,19 +90,52 @@ static inline int crelu(int v) {
     return v;
 }
 
+// ── Half-accumulator dot product: Σ crelu(a[i]) * w[i] over HL int16s ─────────
+// Returns an int64. This is the per-perspective inner product used by the output
+// layer. BIT-EXACTNESS CONTRACT: this MUST equal the scalar sum below for any
+// inputs — integer add is associative and no intermediate overflows (each
+// crelu(a)∈[0,QA=255], |w|≤32767 → |product|≤8.36M, two summed in madd ≤16.7M <
+// 2^31; the int32 partials are then widened to int64 before accumulating, so the
+// running sum never wraps). The AVX2 path therefore reproduces the reference int.
+static inline int64_t dot_half(const int16_t* a, const int16_t* w) {
+#ifdef __AVX2__
+    const __m256i zero = _mm256_setzero_si256();
+    const __m256i qa   = _mm256_set1_epi16((short)QA);
+    __m256i acc0 = _mm256_setzero_si256(); // int64 x4
+    __m256i acc1 = _mm256_setzero_si256(); // int64 x4
+    for (int i = 0; i < HL; i += 16) {
+        __m256i av = _mm256_loadu_si256((const __m256i*)(a + i));
+        __m256i wv = _mm256_loadu_si256((const __m256i*)(w + i));
+        // crelu: clamp to [0, QA] exactly as the scalar helper.
+        av = _mm256_min_epi16(_mm256_max_epi16(av, zero), qa);
+        // 16 int16 pairs -> 8 int32 partial sums (each = a[2k]*w[2k]+a[2k+1]*w[2k+1]).
+        __m256i prod = _mm256_madd_epi16(av, wv);
+        // Sign-extend the 8 int32 to int64 and accumulate (no int32 overflow risk).
+        acc0 = _mm256_add_epi64(acc0, _mm256_cvtepi32_epi64(_mm256_castsi256_si128(prod)));
+        acc1 = _mm256_add_epi64(acc1, _mm256_cvtepi32_epi64(_mm256_extracti128_si256(prod, 1)));
+    }
+    __m256i acc = _mm256_add_epi64(acc0, acc1);
+    int64_t lanes[4];
+    _mm256_storeu_si256((__m256i*)lanes, acc);
+    return lanes[0] + lanes[1] + lanes[2] + lanes[3];
+#else
+    int64_t sum = 0;
+    for (int i = 0; i < HL; ++i)
+        sum += (int64_t)crelu(a[i]) * w[i];
+    return sum;
+#endif
+}
+
 // ── Output layer on an up-to-date accumulator ───────────────────────────────
 int evaluate_acc(const Accumulator& acc, Color stm) {
     const Color nonstm = Color(!stm);
-    int64_t sum = g_net.b2;
     // stm perspective FIRST -> W2[0..255]; nonstm -> W2[256..511].
-    const int16_t* a_stm = acc.v[stm];
-    const int16_t* a_nst = acc.v[nonstm];
-    for (int i = 0; i < HL; ++i)
-        sum += (int64_t)crelu(a_stm[i]) * g_net.W2[i];
-    for (int i = 0; i < HL; ++i)
-        sum += (int64_t)crelu(a_nst[i]) * g_net.W2[HL + i];
+    int64_t sum = (int64_t)g_net.b2;
+    sum += dot_half(acc.v[stm],    g_net.W2);
+    sum += dot_half(acc.v[nonstm], g_net.W2 + HL);
 
     // eval = floor( sum * SCALE / (QA*QB) ) with floor toward -inf (Python //).
+    // Kept SCALAR on the int64 sum so the result is bit-exact vs the reference.
     int64_t num = sum * (int64_t)SCALE;
     int64_t den = (int64_t)QA * QB; // 16320
     int64_t q = num / den;
@@ -124,24 +161,45 @@ void refresh(Accumulator& acc, const Position& pos) {
         }
 }
 
+// dst[o] += col[o] over HL int16s (wraps mod 2^16 identically to the scalar +=,
+// which is what the int16 accumulator contract relies on).
+static inline void acc_add(int16_t* dst, const int16_t* col) {
+#ifdef __AVX2__
+    for (int o = 0; o < HL; o += 16) {
+        __m256i d = _mm256_loadu_si256((const __m256i*)(dst + o));
+        __m256i c = _mm256_loadu_si256((const __m256i*)(col + o));
+        _mm256_storeu_si256((__m256i*)(dst + o), _mm256_add_epi16(d, c));
+    }
+#else
+    for (int o = 0; o < HL; ++o) dst[o] += col[o];
+#endif
+}
+
+// dst[o] -= col[o] over HL int16s.
+static inline void acc_sub(int16_t* dst, const int16_t* col) {
+#ifdef __AVX2__
+    for (int o = 0; o < HL; o += 16) {
+        __m256i d = _mm256_loadu_si256((const __m256i*)(dst + o));
+        __m256i c = _mm256_loadu_si256((const __m256i*)(col + o));
+        _mm256_storeu_si256((__m256i*)(dst + o), _mm256_sub_epi16(d, c));
+    }
+#else
+    for (int o = 0; o < HL; ++o) dst[o] -= col[o];
+#endif
+}
+
 void add_feature(Accumulator& acc, Color c, PieceType t, Square s) {
     const int iw = feature_index(c, t, s, WHITE);
     const int ib = feature_index(c, t, s, BLACK);
-    const int16_t* cw = g_net.W1t[iw];
-    const int16_t* cb = g_net.W1t[ib];
-    int16_t* aw = acc.v[WHITE];
-    int16_t* ab = acc.v[BLACK];
-    for (int o = 0; o < HL; ++o) { aw[o] += cw[o]; ab[o] += cb[o]; }
+    acc_add(acc.v[WHITE], g_net.W1t[iw]);
+    acc_add(acc.v[BLACK], g_net.W1t[ib]);
 }
 
 void sub_feature(Accumulator& acc, Color c, PieceType t, Square s) {
     const int iw = feature_index(c, t, s, WHITE);
     const int ib = feature_index(c, t, s, BLACK);
-    const int16_t* cw = g_net.W1t[iw];
-    const int16_t* cb = g_net.W1t[ib];
-    int16_t* aw = acc.v[WHITE];
-    int16_t* ab = acc.v[BLACK];
-    for (int o = 0; o < HL; ++o) { aw[o] -= cw[o]; ab[o] -= cb[o]; }
+    acc_sub(acc.v[WHITE], g_net.W1t[iw]);
+    acc_sub(acc.v[BLACK], g_net.W1t[ib]);
 }
 
 // ── From-scratch reference evaluation ────────────────────────────────────────

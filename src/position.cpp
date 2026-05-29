@@ -114,11 +114,9 @@ void Position::do_move(Move m, StateInfo& st) {
     st.prev_fullmove = fullmove_;
     st.prev_key      = key_;
     st_              = &st;
-#ifdef EVAL_NNUE
-    // Snapshot the accumulator so undo_move can restore it; the put/remove_piece
-    // calls below update acc_ incrementally for both perspectives.
-    st.prev_acc = acc_;
-#endif
+    // NNUE: no accumulator snapshot. The put/remove/move_piece calls below update
+    // acc_ incrementally (both perspectives); undo_move re-applies the exact
+    // inverse of those calls, restoring acc_ without any per-ply copy.
 
     // 2. Remove the old en-passant file from the key (if any).
     if (ep_ != NO_SQ) key_ ^= zobrist::enpassant[file_of(ep_)];
@@ -229,10 +227,8 @@ void Position::undo_move(Move m) {
     halfmove_ = st->prev_halfmove;
     fullmove_ = st->prev_fullmove;
     key_      = st->prev_key;
-#ifdef EVAL_NNUE
-    // The board mutations above also touched acc_; just restore the snapshot.
-    acc_ = st->prev_acc;
-#endif
+    // NNUE: the put/remove/move_piece calls above already restored acc_ by
+    // applying the exact inverse feature deltas of the original move (delta-undo).
     st_       = st->previous;
 }
 
