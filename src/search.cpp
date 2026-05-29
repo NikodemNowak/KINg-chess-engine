@@ -2,6 +2,7 @@
 #include "movegen.hpp"
 #include "bitboard.hpp"
 #include "timeman.hpp"
+#include "tt.hpp"
 #include "crash.hpp"
 #include <atomic>
 #include <chrono>
@@ -9,6 +10,7 @@
 #include <ostream>
 #include <mutex>
 #include <algorithm>
+#include <utility>
 
 namespace king {
 namespace search {
@@ -17,6 +19,25 @@ namespace search {
 static constexpr int INF     = 32000;
 static constexpr int MATE    = 30000;
 static constexpr int MAX_PLY = 64;
+
+// ── Mate-score TT adjustment ────────────────────────────────────────────────
+// Mate scores are stored relative to the *root*, but searched relative to the
+// node. A score of (MATE - ply) means "mate in `ply` half-moves from here".
+// On store we fold `ply` out (toTT); on read we fold the current `ply` back in
+// (fromTT). These are exact inverses.
+static inline bool is_mate_score(int s) {
+    return s >= MATE - MAX_PLY || s <= -(MATE - MAX_PLY);
+}
+static inline int16_t toTT(int score, int ply) {
+    if (score >=  MATE - MAX_PLY) score += ply;
+    else if (score <= -(MATE - MAX_PLY)) score -= ply;
+    return (int16_t)score;
+}
+static inline int fromTT(int score, int ply) {
+    if (score >=  MATE - MAX_PLY) score -= ply;
+    else if (score <= -(MATE - MAX_PLY)) score += ply;
+    return score;
+}
 
 // ── Material evaluation ───────────────────────────────────────────────────────
 // Returns a score relative to the side to move (positive = better for mover).
@@ -74,12 +95,45 @@ struct Searcher {
         if (aborted || times_up()) { aborted = true; return 0; }
         ++nodes;
 
+        const int  alphaOrig = alpha;
+        const bool isPV       = (beta - alpha) > 1; // wide window ⇒ PV node
+
+        // ── TT probe ───────────────────────────────────────────────────────
+        Move ttMove = 0;
+        TTEntry tte;
+        bool ttHit = tt.probe(pos.key(), tte);
+        if (ttHit) {
+            ttMove = tte.move;
+            // Cutoff only on non-PV nodes with a deep-enough entry whose bound
+            // is compatible with the window. (Keeps the PV exact/intact.)
+            if (!isPV && tte.depth >= depth) {
+                int s = fromTT(tte.score, ply);
+                Bound b = Bound(tte.genBound & 3);
+                if (b == BOUND_EXACT) return s;
+                if (b == BOUND_LOWER && s >= beta)  return s;
+                if (b == BOUND_UPPER && s <= alpha) return s;
+            }
+        }
+
         if (depth <= 0) return evaluate(pos);
 
         MoveList ml;
         generate_pseudo(pos, ml);
 
-        int best = -INF, legal = 0;
+        // ── Move ordering: try the TT move first if it is in this list ──────
+        // (Verifying membership guards against key16 collisions.)
+        if (ttMove != 0) {
+            for (int i = 0; i < ml.size; ++i) {
+                if (ml.moves[i] == ttMove) {
+                    if (i != 0) std::swap(ml.moves[0], ml.moves[i]);
+                    break;
+                }
+            }
+        }
+
+        int  best     = -INF;
+        Move bestMove = 0;
+        int  legal    = 0;
         for (int i = 0; i < ml.size; ++i) {
             StateInfo st;
             pos.do_move(ml.moves[i], st);
@@ -93,13 +147,22 @@ struct Searcher {
             int score = -negamax(pos, depth - 1, -beta, -alpha, ply + 1);
             pos.undo_move(ml.moves[i]);
             if (aborted) return 0;
-            if (score > best) best = score;
+            if (score > best) {
+                best     = score;
+                bestMove = ml.moves[i];
+            }
             if (score > alpha) alpha = score;
             if (alpha >= beta) break;
         }
 
         if (legal == 0)
             return pos.in_check(pos.side_to_move()) ? -(MATE - ply) : 0;
+
+        // ── TT store ─────────────────────────────────────────────────────────
+        Bound bound = (best <= alphaOrig) ? BOUND_UPPER
+                    : (best >= beta)       ? BOUND_LOWER
+                    :                        BOUND_EXACT;
+        tt.store(pos.key(), bestMove, toTT(best, ply), 0, (uint8_t)depth, bound);
 
         return best;
     }
@@ -111,6 +174,11 @@ Move think(Position& pos, const Limits& L, std::atomic<bool>& stop,
            std::ostream& out, std::mutex* out_mtx) {
     TimeManager tm;
     tm.init(L, pos.side_to_move(), overhead);
+
+    // Ensure the TT is sized before the first search (covers direct callers
+    // that never went through the UCI `Hash` option). Default 64 MB.
+    if (tt.size() == 0) tt.resize(64);
+    tt.new_search();
 
     MoveList root;
     generate_legal(pos, root);
@@ -129,6 +197,15 @@ Move think(Position& pos, const Limits& L, std::atomic<bool>& stop,
     int maxDepth = (L.depth > 0) ? std::min(L.depth, MAX_PLY) : MAX_PLY;
 
     for (int depth = 1; depth <= maxDepth; ++depth) {
+        // Order the previous iteration's best move first (it is also the TT
+        // move for the root). This makes the new window tighten fastest.
+        for (int i = 0; i < root.size; ++i) {
+            if (root.moves[i] == best) {
+                if (i != 0) std::swap(root.moves[0], root.moves[i]);
+                break;
+            }
+        }
+
         int alpha = -INF, beta = INF, bestScore = -INF;
         Move iterBest = best;
 
@@ -147,6 +224,8 @@ Move think(Position& pos, const Limits& L, std::atomic<bool>& stop,
 
         if (s.aborted) break;
         best = iterBest;
+        // Store the completed root result (EXACT — full window, full search).
+        tt.store(pos.key(), best, toTT(bestScore, 0), 0, (uint8_t)depth, BOUND_EXACT);
         crash::arm_fallback(to_uci(best).c_str());
 
         auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(

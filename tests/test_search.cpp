@@ -47,6 +47,19 @@ TEST_CASE("grabs a free queen") {
     CHECK(m == make_move(E4, D5));
 }
 
+TEST_CASE("grabs a free queen at depth 6 (TT active)") {
+    se_init();
+    // Same position, deeper search: the transposition table must not corrupt
+    // the result. e4xd5 wins the undefended queen.
+    Position p;
+    p.set_fen("4k3/8/8/3q4/4P3/8/8/4K3 w - - 0 1");
+    Limits L;
+    L.depth = 6;
+    std::atomic<bool> stop{false};
+    Move m = search::think(p, L, stop, 50, 1);
+    CHECK(m == make_move(E4, D5));
+}
+
 TEST_CASE("respects movetime and returns legal") {
     se_init();
     Position p;

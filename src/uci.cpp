@@ -6,6 +6,7 @@
 #include "bitboard.hpp"
 #include "attacks.hpp"
 #include "zobrist.hpp"
+#include "tt.hpp"
 #include "types.hpp"
 
 #include <iostream>
@@ -99,6 +100,10 @@ void run(std::istream& in, std::ostream& out) {
 
     EngineState es;
 
+    // Size the transposition table to the default before any search; the
+    // `Hash` option (setoption) can resize it later.
+    tt.resize(64);
+
     // stop flag shared with the worker thread.
     // search::think checks this flag every 2047 nodes (nodes starts at 1 in
     // the searcher, so the first check fires at nodes=2048). This means a
@@ -153,6 +158,7 @@ void run(std::istream& in, std::ostream& out) {
                 stop_and_join();
                 stop = false;
                 es.reset_to_startpos();
+                tt.clear(); // fresh table for a new game
             }
 
             // ── setoption ────────────────────────────────────────────────────
@@ -176,7 +182,10 @@ void run(std::istream& in, std::ostream& out) {
                 std::transform(opt_lower.begin(), opt_lower.end(), opt_lower.begin(), ::tolower);
 
                 if (opt_lower == "hash") {
-                    try { hashMB = std::max(1, std::min(1024, std::stoi(val_str))); } catch (...) {}
+                    try {
+                        hashMB = std::max(1, std::min(1024, std::stoi(val_str)));
+                        tt.resize(hashMB); // (re)allocate + clear the TT
+                    } catch (...) {}
                 } else if (opt_lower == "threads") {
                     try { threads = std::max(1, std::min(256, std::stoi(val_str))); } catch (...) {}
                 } else if (opt_lower == "move overhead") {
