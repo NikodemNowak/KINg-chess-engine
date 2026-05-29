@@ -18,3 +18,7 @@ tools/baseline/king_v*
 # Texel tuning dataset (public Zurichess quiet-labeled.epd, ~41MB) -- large, fetch separately
 tools/quiet-labeled.epd
 tools/*.epd.gz
+
+# Generated self-play data (NNUE training; can be very large -- regenerate as needed)
+*.txt
+build/dg_*.txt

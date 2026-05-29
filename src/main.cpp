@@ -6,6 +6,7 @@
 #include "zobrist.hpp"
 #include "crash.hpp"
 #include "tune.hpp"
+#include "datagen.hpp"
 #include <iostream>
 #include <string>
 
@@ -21,6 +22,9 @@ int main(int argc, char** argv) {
     try {
         if (argc >= 2 && std::string(argv[1]) == "tune") {
             return king::run_tuner(argc, argv);
+        }
+        if (argc >= 4 && std::string(argv[1]) == "datagen") {
+            return king::run_datagen(argc, argv);
         }
         if (argc >= 3 && std::string(argv[1]) == "perft") {
             int depth = std::stoi(argv[2]);

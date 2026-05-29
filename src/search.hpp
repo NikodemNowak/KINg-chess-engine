@@ -22,5 +22,18 @@ Move think(Position& pos, const Limits& limits, std::atomic<bool>& stop,
            int move_overhead, int threads,
            std::ostream& out = std::cout, std::mutex* out_mtx = nullptr);
 
+// Result returned by think_result: both the best move and the root score
+// from the engine's point of view (side to move = positive is good for mover).
+struct SearchResult {
+    Move move;
+    int  score; // engine POV (side-to-move positive)
+};
+
+// Like think() but also returns the root score. Silent (no info output).
+// For use by datagen where the score is needed for labeling.
+SearchResult think_result(Position& pos, const Limits& limits,
+                          std::atomic<bool>& stop, int move_overhead,
+                          int threads);
+
 } // namespace search
 } // namespace king

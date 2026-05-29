@@ -62,7 +62,7 @@ static void init_lmr() {
 }
 
 // One-time init guard (init_lmr() is called from think() before the first search).
-static bool lmr_ready = false;
+static std::atomic<bool> lmr_ready{false};
 
 // ── Material values ───────────────────────────────────────────────────────────
 // Centipawn value of a piece type — kept for move-ordering / SEE helpers.
@@ -528,7 +528,8 @@ static void smp_worker(Searcher& s, Position& pos, const TimeManager& tm,
                        int maxDepth, bool isMain,
                        Move startBest, std::atomic<bool>& stop,
                        std::ostream& out, std::mutex* out_mtx,
-                       Move& outBest, int& outScore, int& outDepth) {
+                       Move& outBest, int& outScore, int& outDepth,
+                       bool arm_crash = true) {
     MoveList root;
     generate_legal(pos, root);
     if (root.size == 0) { outBest = 0; outScore = 0; outDepth = 0; return; }
@@ -637,7 +638,7 @@ static void smp_worker(Searcher& s, Position& pos, const TimeManager& tm,
         tt.store(pos.key(), best, toTT(scoreThisDepth, 0), 0, (uint8_t)depth, BOUND_EXACT);
 
         if (isMain) {
-            crash::arm_fallback(to_uci(best).c_str());
+            if (arm_crash) crash::arm_fallback(to_uci(best).c_str());
 
             auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                           std::chrono::steady_clock::now() - s.start)
@@ -756,6 +757,89 @@ Move think(Position& pos, const Limits& L, std::atomic<bool>& stop,
     Move best = bestMoves[0];
     if (best == 0) best = startBest; // ultra-defensive: never return null here
     return best;
+}
+
+// ── NullStreambuf / NullStream ────────────────────────────────────────────────
+// A streambuf that discards all output. Used by think_result to suppress the
+// UCI info lines that think() emits, without hitting a null-pointer in the
+// default ostream constructor (which crashes on write attempts on some platforms).
+struct NullStreambuf : std::streambuf {
+    int overflow(int c) override { return c; }       // accept and discard
+    std::streamsize xsputn(const char*, std::streamsize n) override { return n; }
+};
+
+// ── think_result ──────────────────────────────────────────────────────────────
+// Identical to think() but returns both the best move and the root score.
+// Uses a null-sink ostream so no info lines are emitted — suitable for datagen
+// workers that run in parallel and would otherwise spam each other's output.
+SearchResult think_result(Position& pos, const Limits& L,
+                          std::atomic<bool>& stop,
+                          int overhead, int threads) {
+    TimeManager tm;
+    tm.init(L, pos.side_to_move(), overhead);
+
+    if (!lmr_ready) { init_lmr(); lmr_ready = true; }
+    if (tt.size() == 0) tt.resize(64);
+    tt.new_search();
+
+    MoveList root0;
+    generate_legal(pos, root0);
+    if (root0.size == 0) return {0, 0};
+
+    Move startBest = root0.moves[0];
+
+    const int nThreads = std::max(1, std::min(256, threads));
+    const int maxDepth = (L.depth > 0) ? std::min(L.depth, MAX_PLY) : MAX_PLY;
+    const auto startTime = std::chrono::steady_clock::now();
+
+    std::vector<Searcher> searchers(nThreads);
+    std::vector<Position> positions(nThreads);
+    std::vector<Move>     bestMoves(nThreads, startBest);
+    std::vector<int>      bestScores(nThreads, 0);
+    std::vector<int>      bestDepths(nThreads, 0);
+
+    // Per-call null sink (not static, to avoid data races between concurrent
+    // think_result calls in datagen threads).
+    NullStreambuf null_buf;
+    std::ostream  null_out(&null_buf);
+
+    for (int t = 0; t < nThreads; ++t) {
+        Searcher& s = searchers[t];
+        s.stop    = &stop;
+        s.hard_ms = tm.hard_ms;
+        s.start   = startTime;
+        s.nodes   = 1;
+        s.aborted = false;
+        std::memset(s.killers, 0, sizeof(s.killers));
+        std::memset(s.history, 0, sizeof(s.history));
+        positions[t].copy_from(pos);
+    }
+
+    std::vector<std::thread> helpers;
+    helpers.reserve(nThreads > 0 ? nThreads - 1 : 0);
+    for (int t = 1; t < nThreads; ++t) {
+        helpers.emplace_back([&, t]() {
+            smp_worker(searchers[t], positions[t], tm, maxDepth,
+                       false, startBest, stop,
+                       null_out, nullptr,
+                       bestMoves[t], bestScores[t], bestDepths[t],
+                       /*arm_crash=*/false);
+        });
+    }
+
+    smp_worker(searchers[0], positions[0], tm, maxDepth,
+               true, startBest, stop,
+               null_out, nullptr,
+               bestMoves[0], bestScores[0], bestDepths[0],
+               /*arm_crash=*/false);
+
+    for (auto& h : helpers)
+        if (h.joinable()) h.join();
+
+    Move best  = bestMoves[0];
+    int  score = bestScores[0];
+    if (best == 0) best = startBest;
+    return {best, score};
 }
 
 } // namespace search
