@@ -3,6 +3,7 @@
 #include "bitboard.hpp"
 #include "timeman.hpp"
 #include "tt.hpp"
+#include "see.hpp"
 #include "crash.hpp"
 #include <atomic>
 #include <chrono>
@@ -100,11 +101,12 @@ static std::string to_uci(Move m) {
 }
 
 // ── Move-ordering constants ───────────────────────────────────────────────────
-static constexpr int SCORE_TT_MOVE  = 2'000'000;
-static constexpr int SCORE_CAPTURE  = 1'000'000; // base; +MVV-LVA applied
-static constexpr int SCORE_KILLER1  =   900'000;
-static constexpr int SCORE_KILLER2  =   800'000;
-static constexpr int HISTORY_MAX    = 1 << 20;   // ~1M; clamp to stay below killer scores
+static constexpr int SCORE_TT_MOVE     =  2'000'000;
+static constexpr int SCORE_CAPTURE     =  1'000'000; // good/equal capture base; +MVV-LVA
+static constexpr int SCORE_KILLER1     =    900'000;
+static constexpr int SCORE_KILLER2     =    800'000;
+static constexpr int HISTORY_MAX       = 1 << 20;    // ~1M; clamp to stay below killer scores
+static constexpr int SCORE_BAD_CAPTURE = -1'000'000; // SEE<0 capture base; tried after quiets
 
 // ── Searcher ──────────────────────────────────────────────────────────────────
 struct Searcher {
@@ -202,6 +204,12 @@ struct Searcher {
             if (!inCheck && isCapture && !isPromo) {
                 int victim = value_of(isEp ? PAWN : piece_type(capPiece));
                 if (standPat + victim + 200 <= alpha) continue;
+
+                // SEE pruning: don't search captures that lose material outright
+                // (the static exchange comes out negative).  This is the main
+                // qsearch sharpener — equal/winning captures and promotions are
+                // always kept.
+                if (see(pos, m) < 0) continue;
             }
 
             StateInfo st;
@@ -322,7 +330,14 @@ struct Searcher {
                     PieceType attacker = piece_type(pos.piece_on(from_sq(m)));
                     int mvvlva = value_of(victim) * 16 - value_of(attacker);
                     if (isPromo) mvvlva += value_of(QUEEN);
-                    scores[i] = SCORE_CAPTURE + mvvlva;
+                    // Split captures by SEE: good/equal captures keep the high
+                    // band; captures that lose material (SEE<0) drop below all
+                    // quiets/history so they are tried last.  Promotions are
+                    // always treated as good (kept high).
+                    if (!isPromo && isCapture && see(pos, m) < 0)
+                        scores[i] = SCORE_BAD_CAPTURE + mvvlva;
+                    else
+                        scores[i] = SCORE_CAPTURE + mvvlva;
                 } else {
                     // Quiet move: check killers then history
                     if (ply < MAX_PLY && m == killers[ply][0]) {
@@ -383,6 +398,18 @@ struct Searcher {
                     && best > -(MATE - MAX_PLY)
                     && staticEval >= -150
                     && staticEval + 100 + 80 * depth <= alpha) {
+                continue;
+            }
+
+            // ── Shallow SEE pruning ───────────────────────────────────────
+            // At low depth in a non-PV node, prune moves whose static exchange
+            // is clearly bad: losing captures, or quiets that walk onto a
+            // square where the piece is lost.  The margin grows with depth² so
+            // we prune more conservatively as depth rises.  Guarded by
+            // best > mate-loss so the first move (best == -INF) is never pruned.
+            if (!isPV && !inCheck && depth <= 6
+                    && best > -(MATE - MAX_PLY)
+                    && see(pos, m) < -20 * depth * depth) {
                 continue;
             }
 
