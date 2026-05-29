@@ -45,15 +45,49 @@ make test-game   # two-game self-play via engine-adapter.sh
 
 ## Provenance
 
-Evaluation weights (material values, piece-square tables, and the handcrafted
-structural-term weights) are Texel-tuned with the in-engine coordinate-descent
-tuner (`engine tune <epd>`, see `src/tune.cpp`). Training data is the public
-Zurichess **quiet-labeled.epd** dataset (~725k FEN + game-result positions,
-Alexandru Moșoi et al.), mirrored at
-<https://github.com/KierenP/ChessTrainingSets>. The base piece-square tables are
-PeSTO by Ronald Friederich (Chess Programming Wiki). The dataset file itself is
-not committed (gitignored); fetch it before re-running the tuner.
+### Engine
 
-TODO: list remaining techniques and sources (alpha-beta, MCTS, NNUE references),
-third-party libraries, AI-conversation links — to be completed before submission
-per competition regulations.
+KINg is an original C++20 implementation by the KINg team. All search and board
+code was written from scratch; techniques and algorithms were implemented following
+descriptions on the **Chess Programming Wiki** (https://www.chessprogramming.org):
+
+- Board representation: bitboards, magic bitboard sliding-piece attacks
+- Search: alpha-beta / Principal Variation Search (PVS), iterative deepening,
+  aspiration windows, transposition table (Zobrist hashing), null-move pruning,
+  Late Move Reductions (LMR), futility pruning / Reverse Futility Pruning (RFP),
+  Static Exchange Evaluation (SEE), quiescence search, killer heuristic,
+  history heuristic, Lazy SMP (shared hash table, parallel threads)
+
+### Evaluation
+
+Two evaluation back-ends are supported, selected at build time via `-DEVAL=`:
+
+- **HCE** (`-DEVAL=HCE`, default — "No Deep Learning" category): handcrafted
+  evaluation built on **PeSTO** piece-square tables (Ronald Friederich, Chess
+  Programming Wiki). All material values and structural term weights are
+  **Texel-tuned** with the in-engine coordinate-descent tuner (`src/tune.cpp`)
+  on the public **Zurichess quiet-labeled.epd** dataset (~725k FEN + game-result
+  positions, Alexandru Moșoi et al.), mirrored at
+  <https://github.com/KierenP/ChessTrainingSets>.
+
+- **NNUE** (`-DEVAL=NNUE` — "Open" category): a `(768→256)×2→1` halfKA-style
+  network trained with a custom PyTorch trainer (`trainer/`) on self-generated
+  self-play data produced by the engine's built-in datagen (`src/datagen.cpp`).
+  The trained net is committed at `nets/king_nnue.bin` and embedded into the
+  binary at build time.
+
+### Tools and libraries
+
+- **CMake** — build system
+- **doctest** — unit testing framework (`third_party/`)
+- **cutechess-cli** — engine self-play and SPRT testing
+- **PyTorch** — NNUE network training
+- **python-chess** — WAC/EPD test suite tooling
+
+### AI assistance disclosure (competition regulation §5.8)
+
+KINg was developed with AI assistance. Large parts of the implementation,
+debugging, and design were done interactively with **Claude / Claude Code**
+(Anthropic).
+
+AI conversation link: `<INSERT BEFORE SUBMISSION>`

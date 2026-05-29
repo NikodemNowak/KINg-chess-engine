@@ -19,7 +19,77 @@
 #include <deque>
 #include <algorithm>
 
+#ifdef __linux__
+#include <sched.h>
+#include <fstream>
+#include <cmath>
+#endif
+
 namespace king {
+
+// ── available_cores() ─────────────────────────────────────────────────────────
+// Returns the effective number of CPU cores available to this process.
+// On Linux: MIN of sched_getaffinity count, cgroup CPU quota (v2 then v1),
+//           and hardware_concurrency(), clamped to ≥1.
+// On Windows / other: hardware_concurrency() clamped to ≥1.
+int available_cores() {
+#ifdef __linux__
+    int hc = static_cast<int>(std::thread::hardware_concurrency());
+    if (hc <= 0) hc = 1;
+
+    // (a) sched_getaffinity: number of CPUs in the affinity mask
+    int affinity_count = hc;
+    {
+        cpu_set_t cs;
+        CPU_ZERO(&cs);
+        if (sched_getaffinity(0, sizeof(cs), &cs) == 0)
+            affinity_count = static_cast<int>(CPU_COUNT(&cs));
+        if (affinity_count <= 0) affinity_count = hc;
+    }
+
+    // (b) cgroup CPU quota
+    int cgroup_count = hc;
+
+    // Try cgroup v2 first: /sys/fs/cgroup/cpu.max  →  "<quota> <period>" or "max <period>"
+    {
+        std::ifstream f("/sys/fs/cgroup/cpu.max");
+        if (f.is_open()) {
+            std::string quota_str, period_str;
+            if (f >> quota_str >> period_str && quota_str != "max") {
+                try {
+                    long long quota  = std::stoll(quota_str);
+                    long long period = std::stoll(period_str);
+                    if (quota > 0 && period > 0)
+                        cgroup_count = static_cast<int>(
+                            std::max(1LL, (long long)std::ceil((double)quota / (double)period)));
+                } catch (...) {}
+            }
+        }
+    }
+
+    // Fall back to cgroup v1 if cgroup_count is still hc
+    if (cgroup_count == hc) {
+        std::ifstream fq("/sys/fs/cgroup/cpu/cpu.cfs_quota_us");
+        std::ifstream fp("/sys/fs/cgroup/cpu/cpu.cfs_period_us");
+        if (fq.is_open() && fp.is_open()) {
+            long long quota = -1, period = 0;
+            fq >> quota;
+            fp >> period;
+            if (quota > 0 && period > 0)
+                cgroup_count = static_cast<int>(
+                    std::max(1LL, (long long)std::ceil((double)quota / (double)period)));
+        }
+    }
+
+    // Effective = MIN of all three, clamped ≥1
+    int result = std::min({hc, affinity_count, cgroup_count});
+    return std::max(1, result);
+#else
+    unsigned hc = std::thread::hardware_concurrency();
+    return std::max(1, hc == 0 ? 1 : static_cast<int>(hc));
+#endif
+}
+
 namespace uci {
 
 // ── Local helper: Move → UCI string ───────────────────────────────────────────
@@ -113,11 +183,9 @@ void run(std::istream& in, std::ostream& out) {
     std::thread worker;
 
     int hashMB       = 64;
-    // Default Threads = all hardware cores (clamped to [1,256]) so the
-    // competition harness auto-uses every core even if it never sets the option.
-    // hardware_concurrency() can return 0 if it can't detect — fall back to 1.
-    unsigned hc = std::thread::hardware_concurrency();
-    int threads      = std::max(1, std::min(256, hc == 0 ? 1 : (int)hc));
+    // Default Threads = available_cores() so that Docker --cpus / cpuset limits
+    // are respected on Linux (cgroup v2/v1 + affinity), clamped to [1,256].
+    int threads      = std::max(1, std::min(256, available_cores()));
     int moveOverhead = 200;
 
     auto join_worker = [&]() {
