@@ -114,7 +114,7 @@ void run(std::istream& in, std::ostream& out) {
 
     int hashMB       = 64;
     int threads      = 1;
-    int moveOverhead = 30;
+    int moveOverhead = 200;
 
     auto join_worker = [&]() {
         if (worker.joinable()) worker.join();
@@ -140,7 +140,7 @@ void run(std::istream& in, std::ostream& out) {
                 out << "id author KINg Team\n";
                 out << "option name Hash type spin default 64 min 1 max 1024\n";
                 out << "option name Threads type spin default 1 min 1 max 256\n";
-                out << "option name Move Overhead type spin default 30 min 0 max 5000\n";
+                out << "option name Move Overhead type spin default 200 min 0 max 5000\n";
                 out << "option name Ponder type check default false\n";
                 out << "uciok\n";
                 out.flush();

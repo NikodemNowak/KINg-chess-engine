@@ -16,9 +16,12 @@ TEST_CASE("panic under 1s") {
   CHECK(tm.hard_ms < 500);
 }
 TEST_CASE("movetime fixed") {
+  // movetime uses ~all the allotted time; only a tiny guard (min(overhead,20))
+  // is subtracted, so with overhead=300 we still get 980ms out of 1000ms.
   Limits L; L.movetime=1000;
   TimeManager tm; tm.init(L, WHITE, 300);
-  CHECK(tm.hard_ms <= 700);
+  CHECK(tm.hard_ms >= 980);
+  CHECK(tm.hard_ms <= 1000);
   CHECK(tm.soft_ms == tm.hard_ms);
 }
 TEST_CASE("increment") {

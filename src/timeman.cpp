@@ -7,11 +7,11 @@ namespace king {
 void TimeManager::init(const Limits& L, Color us, int overhead) {
     // fixed movetime
     if (L.movetime > 0) {
-        // Reserve the move overhead, but never more than half of the allotted
-        // time — otherwise a short movetime with a large overhead collapses the
-        // search budget to ~0 and the engine plays at depth 1.
-        int64_t ovh = std::min<int64_t>(overhead, (int64_t)L.movetime / 2);
-        soft_ms = hard_ms = std::max<int64_t>(1, (int64_t)L.movetime - ovh);
+        // Use nearly all of the requested movetime. Only subtract a tiny fixed
+        // guard (capped at 20ms) so the engine doesn't flag on slow I/O.
+        // The full Move Overhead is NOT subtracted here — that cushion is for
+        // clock mode where the engine manages its own time budget over the game.
+        soft_ms = hard_ms = std::max<int64_t>(1, (int64_t)L.movetime - std::min(overhead, 20));
         return;
     }
     // no clock info (infinite / depth- or nodes-limited) -> effectively unlimited
