@@ -236,10 +236,30 @@ struct Searcher {
 
         if (depth <= 0) return qsearch(pos, alpha, beta, ply);
 
+        const bool inCheck = pos.in_check(pos.side_to_move());
+        const Color stm    = pos.side_to_move();
+
+        // ── Null-move pruning (NMP) ───────────────────────────────────────────
+        // Skip our turn and see if the opponent can still fail high. If they
+        // can't beat beta even with a free move, the position is so good that we
+        // can prune without searching further.
+        // Conditions: not PV, not in check, depth >= 3, side has non-pawn
+        // material (avoids zugzwang in pure K+P endings), and beta is finite.
+        bool hasNonPawn = (pos.pieces(stm, KNIGHT) | pos.pieces(stm, BISHOP)
+                         | pos.pieces(stm, ROOK)   | pos.pieces(stm, QUEEN)) != 0;
+        if (!isPV && !inCheck && depth >= 3 && hasNonPawn
+            && beta < MATE - MAX_PLY && beta > -(MATE - MAX_PLY)) {
+            int R = 3 + depth / 3;
+            StateInfo nullSt;
+            pos.do_null_move(nullSt);
+            int nullScore = -negamax(pos, std::max(0, depth - 1 - R), -beta, -beta + 1, ply + 1);
+            pos.undo_null_move();
+            if (aborted) return 0;
+            if (nullScore >= beta) return beta; // fail-high prune (return bound)
+        }
+
         MoveList ml;
         generate_pseudo(pos, ml);
-
-        const Color stm = pos.side_to_move();
 
         // ── Move scoring (for ordering) ───────────────────────────────────────
         // Assign a score to each pseudo-legal move; we iterate in descending
@@ -355,7 +375,7 @@ struct Searcher {
         }
 
         if (legal == 0)
-            return pos.in_check(pos.side_to_move()) ? -(MATE - ply) : 0;
+            return inCheck ? -(MATE - ply) : 0;
 
         // ── TT store ─────────────────────────────────────────────────────────
         Bound bound = (best <= alphaOrig) ? BOUND_UPPER

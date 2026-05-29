@@ -83,3 +83,53 @@ TEST_CASE("do/undo identity + special moves") {
     StateInfo st2; q.do_move(make_move(E2,E4), st2);
     CHECK(file_of(NO_SQ==NO_SQ?E3:E3)==FILE_E); // ep target file e (sanity)
 }
+
+TEST_CASE("do_null_move / undo_null_move roundtrip") {
+    init_all();
+
+    // Position WITH an en-passant square: after 1.e4 (ep square = e3).
+    const char* epFen = "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq e3 0 1";
+    Position p;
+    p.set_fen(epFen);
+
+    std::string fenBefore = p.fen();
+    uint64_t    keyBefore = p.key();
+    CHECK(keyBefore == p.compute_key()); // sanity: key consistent before null
+
+    // After do_null_move:
+    StateInfo st;
+    p.do_null_move(st);
+
+    CHECK(p.side_to_move() == WHITE);      // side flipped (was BLACK)
+    CHECK(p.ep_square()    == NO_SQ);      // ep square cleared
+    CHECK(p.key() == p.compute_key());     // incremental key still consistent
+
+    // Key must differ from the before-state (side+ep were changed).
+    CHECK(p.key() != keyBefore);
+
+    // After undo_null_move: everything must be restored exactly.
+    p.undo_null_move();
+
+    CHECK(p.fen() == fenBefore);           // board + scalars fully restored
+    CHECK(p.key() == keyBefore);           // key restored
+    CHECK(p.key() == p.compute_key());     // and still consistent with board
+
+    // Test on a position WITHOUT an ep square (no ep xor should fire).
+    const char* noEpFen = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
+    Position p2;
+    p2.set_fen(noEpFen);
+
+    std::string fen2Before = p2.fen();
+    uint64_t    key2Before = p2.key();
+
+    StateInfo st2;
+    p2.do_null_move(st2);
+    CHECK(p2.side_to_move() == BLACK);
+    CHECK(p2.ep_square()    == NO_SQ);
+    CHECK(p2.key() == p2.compute_key());
+
+    p2.undo_null_move();
+    CHECK(p2.fen() == fen2Before);
+    CHECK(p2.key() == key2Before);
+    CHECK(p2.key() == p2.compute_key());
+}

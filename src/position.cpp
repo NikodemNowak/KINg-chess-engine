@@ -181,6 +181,48 @@ void Position::undo_move(Move m) {
     st_       = st->previous;
 }
 
+// ── Null-move make/unmake ─────────────────────────────────────────────────────
+
+void Position::do_null_move(StateInfo& st) {
+    // Snapshot current state (mirrors do_move preamble, captured = NO_PIECE).
+    st.previous      = st_;
+    st.prev_ep       = ep_;
+    st.prev_castling = castling_;
+    st.prev_halfmove = halfmove_;
+    st.prev_fullmove = fullmove_;
+    st.prev_key      = key_;
+    st.captured      = NO_PIECE;
+    st_              = &st;
+
+    // Clear en-passant square (a null move passes without a pawn double-push).
+    if (ep_ != NO_SQ) {
+        key_ ^= zobrist::enpassant[file_of(ep_)];
+        ep_   = NO_SQ;
+    }
+
+    // Flip side to move.
+    stm_  = Color(!stm_);
+    key_ ^= zobrist::side;
+
+    // Advance halfmove clock (conservative; won't trigger draw checks on this).
+    halfmove_++;
+
+    // NOTE: hist_ is intentionally NOT modified — null moves are search-internal
+    // and must not affect repetition detection.
+}
+
+void Position::undo_null_move() {
+    StateInfo* st = st_;
+    stm_      = Color(!stm_);
+    ep_       = st->prev_ep;
+    castling_ = st->prev_castling;
+    halfmove_ = st->prev_halfmove;
+    fullmove_ = st->prev_fullmove;
+    key_      = st->prev_key;
+    st_       = st->previous;
+    // hist_ untouched (was not modified in do_null_move).
+}
+
 // ── FEN parsing ───────────────────────────────────────────────────────────────
 
 void Position::set_fen(const std::string& fen) {

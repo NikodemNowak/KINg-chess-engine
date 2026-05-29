@@ -66,6 +66,10 @@ public:
     void do_move(Move m, StateInfo& st);
     void undo_move(Move m);
 
+    // Null-move make/unmake (search-internal; does not touch hist_)
+    void do_null_move(StateInfo& st);
+    void undo_null_move();
+
     // Incremental helpers — also used by T7 make/unmake
     void put_piece(Piece p, Square s);
     void remove_piece(Square s);
