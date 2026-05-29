@@ -7,3 +7,6 @@ build/
 syzygy/
 nets/*.bin
 *.pdf
+# Explicit: always commit harness files used for local Task-16 testing
+!engine-adapter.sh
+!openings.bin
