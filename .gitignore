@@ -22,3 +22,14 @@ tools/*.epd.gz
 # Generated self-play data (NNUE training; can be very large -- regenerate as needed)
 *.txt
 build/dg_*.txt
+
+# NNUE training: ignore the whole data dir (datasets + numpy caches, large).
+data/
+
+# ...but DO commit the exported net and the C++ contract sample file, despite
+# the broad `nets/*.bin` and `*.txt` ignores above.
+!nets/king_nnue.bin
+!trainer/nnue_samples.txt
+# Don't commit trainer dev/test scratch files.
+trainer/_*.py
+trainer/__pycache__/
