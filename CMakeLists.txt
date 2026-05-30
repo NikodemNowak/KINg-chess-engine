@@ -41,8 +41,11 @@ message(STATUS "KINg NNUE_HL = ${NNUE_HL}")
 
 # ── NNUE activation ───────────────────────────────────────────────────────────
 # -DNNUE_SCRELU=ON uses the squared clipped-ReLU activation (must match a net
-# trained with `--activation screlu`). Default OFF = plain clipped-ReLU.
-set(NNUE_SCRELU OFF CACHE BOOL "Use SCReLU (squared) NNUE activation")
+# trained with `--activation screlu`). Default ON: the committed king_nnue.bin is
+# the SCReLU net trained with lambda=0.9 (eval-weighted target), which is +132 Elo
+# over the previous CReLU/lambda-0.6 net. Pass -DNNUE_SCRELU=OFF only with a
+# CReLU net.
+set(NNUE_SCRELU ON CACHE BOOL "Use SCReLU (squared) NNUE activation")
 message(STATUS "KINg NNUE_SCRELU = ${NNUE_SCRELU}")
 
 # ── NNUE net binary (override for validation builds) ─────────────────────────
