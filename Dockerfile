@@ -21,9 +21,10 @@ COPY tests ./tests
 COPY nets ./nets
 COPY tools ./tools
 COPY trainer/nnue_samples.txt ./trainer/nnue_samples.txt
-# NOTE: CMakeLists.txt builds with -mavx2 -mpopcnt (see CMAKE_CXX_FLAGS_RELEASE).
-# Exact target arch will be confirmed when the organizer publishes the eval hardware
-# (~07.06); a later task may switch to a portable baseline or add runtime dispatch.
+# NOTE: CMakeLists.txt builds a PORTABLE x86-64 baseline (-march=x86-64, no -mavx2).
+# AVX2 is selected at runtime in src/nnue.cpp (init_simd_dispatch via
+# __builtin_cpu_supports), so the binary runs on ANY x86-64 CPU and never SIGILLs
+# if the eval hardware lacks AVX2 — critical because crash == lost game.
 RUN cmake -B build -DCMAKE_BUILD_TYPE=Release -DEVAL=${EVAL} \
     && cmake --build build --target engine -j
 

@@ -8,8 +8,16 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif()
-set(CMAKE_CXX_FLAGS_RELEASE "-O3 -mavx2 -mpopcnt -DNDEBUG")
-set(CMAKE_C_FLAGS_RELEASE   "-O3 -mavx2 -mpopcnt -DNDEBUG")
+# ── Portable baseline (crash-safety: crash == lost game) ──────────────────────
+# Compile for the generic x86-64 baseline (SSE2 only — present on EVERY x86-64
+# CPU) so the binary can NEVER hit an illegal instruction on hardware without
+# AVX2/POPCNT/BMI.  AVX2 acceleration for the NNUE kernels is selected at RUNTIME
+# via __builtin_cpu_supports (see src/nnue.cpp init_simd_dispatch); popcount uses
+# std::popcount / __builtin_popcountll which are portable without -mpopcnt; and
+# Fathom (third_party/fathom) falls back to a builtin popcount when __SSE4_2__ is
+# undefined.  Do NOT add -march=native / -mavx2 here — it reintroduces SIGILL.
+set(CMAKE_CXX_FLAGS_RELEASE "-O3 -march=x86-64 -mtune=generic -DNDEBUG")
+set(CMAKE_C_FLAGS_RELEASE   "-O3 -march=x86-64 -mtune=generic -DNDEBUG")
 
 # ── Evaluation selector ───────────────────────────────────────────────────────
 # -DEVAL=NNUE (default): embedded NNUE net + incremental accumulator ("Open").

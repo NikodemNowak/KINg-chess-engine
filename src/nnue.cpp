@@ -11,8 +11,18 @@
 #include <cstring>
 #include <cstdlib>
 
-#ifdef __AVX2__
-#include <immintrin.h>
+// ── Portable build + runtime AVX2 dispatch ───────────────────────────────────
+// The binary is compiled for a portable x86-64 baseline (SSE2 only — universal
+// on every x86-64 CPU) so it NEVER executes an illegal instruction on hardware
+// without AVX2.  The three hot SIMD kernels below are each provided in a scalar
+// form AND an `__attribute__((target("avx2")))` form; init() probes the CPU once
+// via __builtin_cpu_supports("avx2") and points the dispatch pointers at the
+// AVX2 versions only when the running CPU actually supports them.  This removes
+// the SIGILL-on-startup catastrophe (crash == lost game) while keeping full AVX2
+// speed wherever AVX2 is present.  See CMakeLists.txt (no global -mavx2).
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+#  define KING_X86 1
+#  include <immintrin.h>
 #endif
 
 namespace king {
@@ -53,8 +63,13 @@ T read_le(const unsigned char* p) {
 
 } // namespace
 
+static void init_simd_dispatch(); // defined below (after the SIMD kernels)
+
 void init() {
     if (g_loaded) return;
+
+    // Pick scalar vs AVX2 kernels for THIS CPU before any eval runs.
+    init_simd_dispatch();
 
     const unsigned char* p = king_nnue_data;
     const unsigned int   n = king_nnue_data_len;
@@ -99,14 +114,32 @@ static inline int crelu(int v) {
 
 // ── Half-accumulator dot product: Σ crelu(a[i]) * w[i] over HL int16s ─────────
 // Returns an int64. This is the per-perspective inner product used by the output
-// layer. BIT-EXACTNESS CONTRACT: this MUST equal the scalar sum below for any
-// inputs — integer add is associative and no intermediate overflows (each
-// crelu(a)∈[0,QA=255], |w|≤32767 → |product|≤8.36M, two summed in madd ≤16.7M <
-// 2^31; the int32 partials are then widened to int64 before accumulating so the
-// running sum never wraps even at HL=1024). The AVX2 path reproduces the
-// reference integer exactly. Requires HL % 16 == 0 (see static_assert above).
-static inline int64_t dot_half(const int16_t* a, const int16_t* w) {
-#ifdef __AVX2__
+// layer. BIT-EXACTNESS CONTRACT: the scalar and AVX2 forms MUST return the same
+// value for any inputs — integer add is associative and no intermediate overflows
+// (each crelu(a)∈[0,QA=255], |w|≤32767 → |product|≤8.36M, two summed in madd
+// ≤16.7M < 2^31; the int32 partials are then widened to int64 before accumulating
+// so the running sum never wraps even at HL=1024). Requires HL % 16 == 0.
+static int64_t dot_half_scalar(const int16_t* a, const int16_t* w) {
+    int64_t sum = 0;
+    for (int i = 0; i < HL; ++i)
+        sum += (int64_t)crelu(a[i]) * w[i];
+    return sum;
+}
+
+static void acc_add_scalar(int16_t* dst, const int16_t* col) {
+    for (int o = 0; o < HL; ++o) dst[o] += col[o];
+}
+
+static void acc_sub_scalar(int16_t* dst, const int16_t* col) {
+    for (int o = 0; o < HL; ++o) dst[o] -= col[o];
+}
+
+#if defined(KING_X86) && defined(__GNUC__)
+// AVX2 forms — compiled with an AVX2 target attribute so the intrinsics are
+// legal even though the rest of the TU targets the portable baseline. These are
+// only *called* after init() confirms __builtin_cpu_supports("avx2").
+__attribute__((target("avx2")))
+static int64_t dot_half_avx2(const int16_t* a, const int16_t* w) {
     const __m256i zero = _mm256_setzero_si256();
     const __m256i qa   = _mm256_set1_epi16((short)QA);
     __m256i acc0 = _mm256_setzero_si256(); // int64 x4
@@ -114,11 +147,8 @@ static inline int64_t dot_half(const int16_t* a, const int16_t* w) {
     for (int i = 0; i < HL; i += 16) {
         __m256i av = _mm256_loadu_si256((const __m256i*)(a + i));
         __m256i wv = _mm256_loadu_si256((const __m256i*)(w + i));
-        // crelu: clamp to [0, QA] exactly as the scalar helper.
         av = _mm256_min_epi16(_mm256_max_epi16(av, zero), qa);
-        // 16 int16 pairs -> 8 int32 partial sums (each = a[2k]*w[2k]+a[2k+1]*w[2k+1]).
         __m256i prod = _mm256_madd_epi16(av, wv);
-        // Sign-extend the 8 int32 to int64 and accumulate (no int32 overflow risk).
         acc0 = _mm256_add_epi64(acc0, _mm256_cvtepi32_epi64(_mm256_castsi256_si128(prod)));
         acc1 = _mm256_add_epi64(acc1, _mm256_cvtepi32_epi64(_mm256_extracti128_si256(prod, 1)));
     }
@@ -126,12 +156,50 @@ static inline int64_t dot_half(const int16_t* a, const int16_t* w) {
     int64_t lanes[4];
     _mm256_storeu_si256((__m256i*)lanes, acc);
     return lanes[0] + lanes[1] + lanes[2] + lanes[3];
-#else
-    int64_t sum = 0;
-    for (int i = 0; i < HL; ++i)
-        sum += (int64_t)crelu(a[i]) * w[i];
-    return sum;
+}
+
+__attribute__((target("avx2")))
+static void acc_add_avx2(int16_t* dst, const int16_t* col) {
+    for (int o = 0; o < HL; o += 16) {
+        __m256i d = _mm256_loadu_si256((const __m256i*)(dst + o));
+        __m256i c = _mm256_loadu_si256((const __m256i*)(col + o));
+        _mm256_storeu_si256((__m256i*)(dst + o), _mm256_add_epi16(d, c));
+    }
+}
+
+__attribute__((target("avx2")))
+static void acc_sub_avx2(int16_t* dst, const int16_t* col) {
+    for (int o = 0; o < HL; o += 16) {
+        __m256i d = _mm256_loadu_si256((const __m256i*)(dst + o));
+        __m256i c = _mm256_loadu_si256((const __m256i*)(col + o));
+        _mm256_storeu_si256((__m256i*)(dst + o), _mm256_sub_epi16(d, c));
+    }
+}
+#endif // KING_X86 && __GNUC__
+
+// Dispatch pointers — default to the universally-safe scalar kernels; init()
+// upgrades them to the AVX2 kernels when the CPU supports AVX2.
+static int64_t (*s_dot_half)(const int16_t*, const int16_t*) = dot_half_scalar;
+static void    (*s_acc_add )(int16_t*, const int16_t*)       = acc_add_scalar;
+static void    (*s_acc_sub )(int16_t*, const int16_t*)       = acc_sub_scalar;
+
+static void init_simd_dispatch() {
+#if defined(KING_X86) && defined(__GNUC__)
+    // Escape hatch: KING_NO_AVX2=1 forces the scalar kernels even on AVX2 CPUs
+    // (used to validate the portable path; also a safety valve if AVX2 is ever
+    // suspect on the target hardware).
+    if (const char* e = std::getenv("KING_NO_AVX2"); e && e[0] == '1') return;
+    __builtin_cpu_init();
+    if (__builtin_cpu_supports("avx2")) {
+        s_dot_half = dot_half_avx2;
+        s_acc_add  = acc_add_avx2;
+        s_acc_sub  = acc_sub_avx2;
+    }
 #endif
+}
+
+static inline int64_t dot_half(const int16_t* a, const int16_t* w) {
+    return s_dot_half(a, w);
 }
 
 // ── Output layer on an up-to-date accumulator ───────────────────────────────
@@ -170,31 +238,12 @@ void refresh(Accumulator& acc, const Position& pos) {
 }
 
 // dst[o] += col[o] over HL int16s (wraps mod 2^16 identically to the scalar +=,
-// which is what the int16 accumulator contract relies on).
-static inline void acc_add(int16_t* dst, const int16_t* col) {
-#ifdef __AVX2__
-    for (int o = 0; o < HL; o += 16) {
-        __m256i d = _mm256_loadu_si256((const __m256i*)(dst + o));
-        __m256i c = _mm256_loadu_si256((const __m256i*)(col + o));
-        _mm256_storeu_si256((__m256i*)(dst + o), _mm256_add_epi16(d, c));
-    }
-#else
-    for (int o = 0; o < HL; ++o) dst[o] += col[o];
-#endif
-}
+// which is what the int16 accumulator contract relies on). Dispatched to the
+// scalar or AVX2 kernel by init_simd_dispatch().
+static inline void acc_add(int16_t* dst, const int16_t* col) { s_acc_add(dst, col); }
 
 // dst[o] -= col[o] over HL int16s.
-static inline void acc_sub(int16_t* dst, const int16_t* col) {
-#ifdef __AVX2__
-    for (int o = 0; o < HL; o += 16) {
-        __m256i d = _mm256_loadu_si256((const __m256i*)(dst + o));
-        __m256i c = _mm256_loadu_si256((const __m256i*)(col + o));
-        _mm256_storeu_si256((__m256i*)(dst + o), _mm256_sub_epi16(d, c));
-    }
-#else
-    for (int o = 0; o < HL; ++o) dst[o] -= col[o];
-#endif
-}
+static inline void acc_sub(int16_t* dst, const int16_t* col) { s_acc_sub(dst, col); }
 
 void add_feature(Accumulator& acc, Color c, PieceType t, Square s) {
     const int iw = feature_index(c, t, s, WHITE);
