@@ -396,6 +396,59 @@ def _rss_gb() -> float:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# GPU-resident dataset: precompute padded per-position feature indices (both
+# perspectives) + labels ONCE and keep them on the GPU, so training needs no CPU
+# dataloader and the GPU runs at full utilisation. Feature math mirrors
+# feature_index()/collate_fn EXACTLY (bit-exact contract). ~4 GB on the GPU for
+# 30M positions; falls back to the DataLoader path on CPU / huge datasets.
+# ──────────────────────────────────────────────────────────────────────────────
+MAXP = 32  # max pieces per position (record layout)
+
+def build_gpu_dataset(cache_path: str, total: int, device):
+    mm = np.memmap(cache_path, dtype=RECORD_DTYPE, mode='r', shape=(total,))
+    sf_pad = np.zeros((total, MAXP), dtype=np.int16)
+    nf_pad = np.zeros((total, MAXP), dtype=np.int16)
+    lengths = np.empty(total, dtype=np.int64)
+    scores  = np.empty(total, dtype=np.float32)
+    results = np.empty(total, dtype=np.float32)
+    CH = 1_000_000
+    for lo in range(0, total, CH):
+        hi = min(lo + CH, total)
+        rec = mm[lo:hi]
+        stm = rec['stm'].astype(np.int64)[:, None]      # [c,1]
+        squares = rec['squares'].astype(np.int64)        # [c,32]
+        pieces  = rec['pieces']                           # [c,32] uint8
+        color = ((pieces >> 4) & 1).astype(np.int64)
+        ptype = (pieces & 0x0F).astype(np.int64)
+        os_s = np.where(stm == WHITE, squares, squares ^ 56)
+        sf_pad[lo:hi] = ((color != stm).astype(np.int64) * 384 + ptype * 64 + os_s).astype(np.int16)
+        nstm = stm ^ 1
+        os_n = np.where(nstm == WHITE, squares, squares ^ 56)
+        nf_pad[lo:hi] = ((color != nstm).astype(np.int64) * 384 + ptype * 64 + os_n).astype(np.int16)
+        lengths[lo:hi] = rec['n'].astype(np.int64)
+        scores[lo:hi]  = rec['score'].astype(np.float32)
+        results[lo:hi] = rec['result'].astype(np.float32)
+    del mm
+    return (torch.from_numpy(sf_pad).to(device),
+            torch.from_numpy(nf_pad).to(device),
+            torch.from_numpy(lengths).to(device),
+            torch.from_numpy(scores).to(device),
+            torch.from_numpy(results).to(device))
+
+def gpu_batch_inputs(sf_g, nf_g, len_g, rows, device):
+    """EmbeddingBag (flat indices + offsets) for a batch of rows — all on GPU.
+    Both perspectives share the same per-row piece counts, hence the same offsets."""
+    L = len_g[rows]                                       # [B]
+    mask = torch.arange(MAXP, device=device)[None, :] < L[:, None]
+    s_flat = sf_g[rows][mask].long()
+    n_flat = nf_g[rows][mask].long()
+    offsets = torch.zeros(rows.numel(), device=device, dtype=torch.long)
+    if rows.numel() > 1:
+        offsets[1:] = torch.cumsum(L, 0)[:-1]
+    return s_flat, offsets, n_flat, offsets
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Training entry point
 # ──────────────────────────────────────────────────────────────────────────────
 def main():
@@ -457,20 +510,7 @@ def main():
     train_idx = perm[n_val:]
     print(f"[data] train={len(train_idx):,}  val={n_val:,}")
 
-    num_workers = args.workers
-    loader_kw = dict(
-        batch_size=args.batch,
-        collate_fn=collate_fn,
-        num_workers=num_workers,
-        pin_memory=(device.type == 'cuda'),
-        persistent_workers=(num_workers > 0),
-        prefetch_factor=(2 if num_workers > 0 else None),
-    )
-
-    val_ds = StreamingNNUEDataset(cache_path, val_idx)
-    val_loader = DataLoader(val_ds, shuffle=False, **loader_kw)
-
-    print(f"[data] RAM after dataset setup: {_rss_gb():.2f} GB")
+    use_gpu = (device.type == 'cuda')
 
     squared = (args.activation == 'screlu')
     model = NNUE(HL, squared=squared).to(device)
@@ -484,65 +524,103 @@ def main():
     sched = torch.optim.lr_scheduler.StepLR(opt, step_size=15, gamma=0.3)
     loss_fn = nn.MSELoss()
 
-    def make_target(scores_t, results_t):
-        s = scores_t.to(device)
-        r = results_t.to(device)
-        return 0.6 * torch.sigmoid(s / SCALE) + 0.4 * r
-
-    def to_dev(si, so, ni, no):
-        return (si.to(device), so.to(device), ni.to(device), no.to(device))
-
-    def run_val():
-        model.eval()
-        total_loss, cnt = 0.0, 0
-        with torch.no_grad():
-            for si, so, ni, no, sc, rs in val_loader:
-                si, so, ni, no = to_dev(si, so, ni, no)
-                pred = torch.sigmoid(model(si, so, ni, no))
-                tgt = make_target(sc, rs)
-                bs = sc.shape[0]
-                total_loss += loss_fn(pred, tgt).item() * bs
-                cnt += bs
-        model.train()
-        return total_loss / max(1, cnt)
-
     first_train, first_val, last_train, last_val = None, None, 0.0, 0.0
     best_val = float('inf')
 
-    print("[train] starting")
-    for epoch in range(args.epochs):
-        t0 = time.time()
-        # Re-shuffle training indices each epoch for better convergence.
-        ep_order = train_idx[rng.permutation(len(train_idx))]
-        ep_ds = StreamingNNUEDataset(cache_path, ep_order)
-        ep_loader = DataLoader(ep_ds, shuffle=False, **loader_kw)
+    if use_gpu:
+        # ── GPU-resident path: whole dataset on the GPU, no CPU dataloader ────
+        print("[data] building GPU-resident dataset (one-time) ...")
+        t_b = time.time()
+        sf_g, nf_g, len_g, sc_g, rs_g = build_gpu_dataset(cache_path, total, device)
+        tr_g = torch.from_numpy(train_idx).to(device)
+        va_g = torch.from_numpy(val_idx).to(device)
+        gb = (sf_g.numel()*2 + nf_g.numel()*2 + len_g.numel()*8
+              + sc_g.numel()*4 + rs_g.numel()*4) / 1e9
+        print(f"[data] GPU dataset ready in {time.time()-t_b:.1f}s  (~{gb:.2f} GB on device)")
 
-        model.train()
-        ep_loss, ep_cnt = 0.0, 0
-        for si, so, ni, no, sc, rs in ep_loader:
-            si, so, ni, no = to_dev(si, so, ni, no)
-            pred = torch.sigmoid(model(si, so, ni, no))
-            tgt = make_target(sc, rs)
-            loss = loss_fn(pred, tgt)
-            opt.zero_grad()
-            loss.backward()
-            opt.step()
-            model.clip_weights()  # quant-safety guard (rarely binds)
-            bs = sc.shape[0]
-            ep_loss += loss.item() * bs
-            ep_cnt += bs
+        def make_tgt(rows):
+            return 0.6 * torch.sigmoid(sc_g[rows] / SCALE) + 0.4 * rs_g[rows]
 
-        sched.step()
-        train_loss = ep_loss / max(1, ep_cnt)
-        val_loss = run_val()
-        if first_train is None:
-            first_train, first_val = train_loss, val_loss
-        last_train, last_val = train_loss, val_loss
-        best_val = min(best_val, val_loss)
-        print(f"[train] epoch {epoch+1:3d}/{args.epochs}  "
-              f"train={train_loss:.6f}  val={val_loss:.6f}  "
-              f"lr={opt.param_groups[0]['lr']:.2e}  "
-              f"RAM={_rss_gb():.2f}GB  {time.time()-t0:.1f}s")
+        def run_val():
+            model.eval()
+            tot, cnt = 0.0, 0
+            with torch.no_grad():
+                for b in range(0, va_g.numel(), args.batch):
+                    rows = va_g[b:b + args.batch]
+                    si, so, ni, no = gpu_batch_inputs(sf_g, nf_g, len_g, rows, device)
+                    pred = torch.sigmoid(model(si, so, ni, no))
+                    bs = rows.numel()
+                    tot += loss_fn(pred, make_tgt(rows)).item() * bs
+                    cnt += bs
+            model.train()
+            return tot / max(1, cnt)
+
+        print("[train] starting (GPU-resident)")
+        for epoch in range(args.epochs):
+            t0 = time.time()
+            order = tr_g[torch.randperm(tr_g.numel(), device=device)]
+            model.train()
+            ep_loss, ep_cnt = 0.0, 0
+            for b in range(0, order.numel(), args.batch):
+                rows = order[b:b + args.batch]
+                si, so, ni, no = gpu_batch_inputs(sf_g, nf_g, len_g, rows, device)
+                pred = torch.sigmoid(model(si, so, ni, no))
+                loss = loss_fn(pred, make_tgt(rows))
+                opt.zero_grad(); loss.backward(); opt.step()
+                model.clip_weights()
+                bs = rows.numel()
+                ep_loss += loss.item() * bs; ep_cnt += bs
+            sched.step()
+            train_loss = ep_loss / max(1, ep_cnt); val_loss = run_val()
+            if first_train is None: first_train, first_val = train_loss, val_loss
+            last_train, last_val = train_loss, val_loss
+            best_val = min(best_val, val_loss)
+            print(f"[train] epoch {epoch+1:3d}/{args.epochs}  "
+                  f"train={train_loss:.6f}  val={val_loss:.6f}  "
+                  f"lr={opt.param_groups[0]['lr']:.2e}  {time.time()-t0:.1f}s")
+    else:
+        # ── CPU fallback: streaming DataLoader path ──────────────────────────
+        num_workers = args.workers
+        loader_kw = dict(batch_size=args.batch, collate_fn=collate_fn,
+                         num_workers=num_workers, pin_memory=False,
+                         persistent_workers=(num_workers > 0),
+                         prefetch_factor=(2 if num_workers > 0 else None))
+        val_loader = DataLoader(StreamingNNUEDataset(cache_path, val_idx),
+                                shuffle=False, **loader_kw)
+
+        def make_target(sc, rs):
+            return 0.6 * torch.sigmoid(sc.to(device) / SCALE) + 0.4 * rs.to(device)
+
+        def run_val():
+            model.eval(); tot, cnt = 0.0, 0
+            with torch.no_grad():
+                for si, so, ni, no, sc, rs in val_loader:
+                    pred = torch.sigmoid(model(si.to(device), so.to(device),
+                                               ni.to(device), no.to(device)))
+                    bs = sc.shape[0]
+                    tot += loss_fn(pred, make_target(sc, rs)).item() * bs; cnt += bs
+            model.train(); return tot / max(1, cnt)
+
+        print("[train] starting (DataLoader)")
+        for epoch in range(args.epochs):
+            t0 = time.time()
+            ep_order = train_idx[rng.permutation(len(train_idx))]
+            ep_loader = DataLoader(StreamingNNUEDataset(cache_path, ep_order),
+                                   shuffle=False, **loader_kw)
+            model.train(); ep_loss, ep_cnt = 0.0, 0
+            for si, so, ni, no, sc, rs in ep_loader:
+                pred = torch.sigmoid(model(si.to(device), so.to(device),
+                                           ni.to(device), no.to(device)))
+                loss = loss_fn(pred, make_target(sc, rs))
+                opt.zero_grad(); loss.backward(); opt.step(); model.clip_weights()
+                bs = sc.shape[0]; ep_loss += loss.item() * bs; ep_cnt += bs
+            sched.step()
+            train_loss = ep_loss / max(1, ep_cnt); val_loss = run_val()
+            if first_train is None: first_train, first_val = train_loss, val_loss
+            last_train, last_val = train_loss, val_loss
+            best_val = min(best_val, val_loss)
+            print(f"[train] epoch {epoch+1:3d}/{args.epochs}  train={train_loss:.6f}  "
+                  f"val={val_loss:.6f}  lr={opt.param_groups[0]['lr']:.2e}  {time.time()-t0:.1f}s")
 
     print(f"[train] DONE  "
           f"first_train={first_train:.6f} -> last_train={last_train:.6f}  "
