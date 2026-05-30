@@ -405,6 +405,19 @@ def _rss_gb() -> float:
 MAXP = 32  # max pieces per position (record layout)
 
 def build_gpu_dataset(cache_path: str, total: int, device):
+    # Disk-cache the padded feature tensors (feature-only → reusable across ALL
+    # trainings on this data cache, regardless of HL/activation/lambda). First run
+    # builds + saves (~60s); later runs load (~15s) so the GPU never idles on a
+    # rebuild during a sweep.
+    npz = cache_path + ".gpures.npz"
+    if Path(npz).exists() and Path(npz).stat().st_size > 0:
+        print(f"[data] loading cached GPU tensors from {npz}")
+        d = np.load(npz)
+        return (torch.from_numpy(d['sf']).to(device),
+                torch.from_numpy(d['nf']).to(device),
+                torch.from_numpy(d['ln']).to(device),
+                torch.from_numpy(d['sc']).to(device),
+                torch.from_numpy(d['rs']).to(device))
     mm = np.memmap(cache_path, dtype=RECORD_DTYPE, mode='r', shape=(total,))
     sf_pad = np.zeros((total, MAXP), dtype=np.int16)
     nf_pad = np.zeros((total, MAXP), dtype=np.int16)
@@ -429,6 +442,11 @@ def build_gpu_dataset(cache_path: str, total: int, device):
         scores[lo:hi]  = rec['score'].astype(np.float32)
         results[lo:hi] = rec['result'].astype(np.float32)
     del mm
+    try:
+        np.savez(npz, sf=sf_pad, nf=nf_pad, ln=lengths, sc=scores, rs=results)
+        print(f"[data] cached GPU tensors -> {npz}")
+    except Exception as e:
+        print(f"[data] (cache save skipped: {e})")
     return (torch.from_numpy(sf_pad).to(device),
             torch.from_numpy(nf_pad).to(device),
             torch.from_numpy(lengths).to(device),
@@ -470,6 +488,8 @@ def main():
     ap.add_argument('--activation', choices=['crelu', 'screlu'], default='crelu',
                     help='Hidden activation: crelu (default) or screlu (squared). '
                          'screlu nets MUST be compiled with -DNNUE_SCRELU.')
+    ap.add_argument('--lam', type=float, default=0.6,
+                    help='Target blend: lam*sigmoid(eval) + (1-lam)*game_result (default 0.6)')
     ap.add_argument('--val-frac', type=float, default=0.02)
     ap.add_argument('--workers', type=int, default=0,
                     help='DataLoader worker processes (default 0 = main thread; '
@@ -539,7 +559,7 @@ def main():
         print(f"[data] GPU dataset ready in {time.time()-t_b:.1f}s  (~{gb:.2f} GB on device)")
 
         def make_tgt(rows):
-            return 0.6 * torch.sigmoid(sc_g[rows] / SCALE) + 0.4 * rs_g[rows]
+            return args.lam * torch.sigmoid(sc_g[rows] / SCALE) + (1.0 - args.lam) * rs_g[rows]
 
         def run_val():
             model.eval()
@@ -589,7 +609,7 @@ def main():
                                 shuffle=False, **loader_kw)
 
         def make_target(sc, rs):
-            return 0.6 * torch.sigmoid(sc.to(device) / SCALE) + 0.4 * rs.to(device)
+            return args.lam * torch.sigmoid(sc.to(device) / SCALE) + (1.0 - args.lam) * rs.to(device)
 
         def run_val():
             model.eval(); tot, cnt = 0.0, 0
