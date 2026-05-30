@@ -119,8 +119,45 @@ static constexpr int SCORE_TT_MOVE     =  2'000'000;
 static constexpr int SCORE_CAPTURE     =  1'000'000; // good/equal capture base; +MVV-LVA
 static constexpr int SCORE_KILLER1     =    900'000;
 static constexpr int SCORE_KILLER2     =    800'000;
-static constexpr int HISTORY_MAX       = 1 << 20;    // ~1M; clamp to stay below killer scores
+static constexpr int SCORE_COUNTER     =    700'000; // countermove bonus band
 static constexpr int SCORE_BAD_CAPTURE = -1'000'000; // SEE<0 capture base; tried after quiets
+
+// ── Ordering-component toggles (bisection; default all on) ────────────────────
+#ifndef ORD_CAPTHIST
+#define ORD_CAPTHIST 1
+#endif
+#ifndef ORD_CONTHIST
+#define ORD_CONTHIST 1
+#endif
+#ifndef ORD_COUNTER
+#define ORD_COUNTER 1
+#endif
+
+// ── History (gravity-updated, capped) ─────────────────────────────────────────
+// Butterfly + capture + continuation histories all use the same int16 gravity
+// scheme: a bonus pulls the score toward ±HIST_CAP without ever overflowing, so
+// the table self-normalises instead of saturating like the old `+= depth*depth`.
+static constexpr int HIST_CAP = 16384;
+
+static inline int hist_bonus(int depth) {
+    return std::min(2048, 4 * depth * depth + 120 * depth - 120);
+}
+static inline void hist_update(int16_t& h, int bonus) {
+    h += (int16_t)(bonus - (int)h * std::abs(bonus) / HIST_CAP);
+}
+
+// ── Per-ply search stack ───────────────────────────────────────────────────────
+// Records, for each ply, the move chosen at that node (and the piece/target it
+// moved) plus the static eval. Children read the PARENT entry (ss[ply-1]) for
+// countermove / continuation-history indexing and the grandparent (ss[ply-2])
+// static eval for the "improving" heuristic.
+struct Stack {
+    Move      currentMove = 0;   // move being searched at this ply
+    PieceType movedPiece  = PAWN;// piece type that made currentMove
+    Square    toSq        = A1;
+    int       staticEval  = 0;
+    Move      excluded    = 0;   // singular-extension excluded move (batch E)
+};
 
 // ── Searcher ──────────────────────────────────────────────────────────────────
 struct Searcher {
@@ -131,8 +168,14 @@ struct Searcher {
     bool               aborted;
 
     // ── Move-ordering tables ───────────────────────────────────────────────
-    Move killers[MAX_PLY][2];          // 2 killer (quiet) moves per ply
-    int  history[2][64][64];           // [side-to-move][from][to] for quiet moves
+    Move    killers[MAX_PLY][2];          // 2 killer (quiet) moves per ply
+    int16_t history[2][64][64];           // [stm][from][to] butterfly history (quiets)
+    int16_t captHist[2][6][64][6];        // [stm][attacker][to][victim] capture history
+    Move    counterMove[12][64];          // [prevPiece12][prevTo] -> refutation reply
+    // Continuation history: [prevPiece12][prevTo][curPiece12][curTo]. Indexed by
+    // the parent (1-ply) and grandparent (2-ply) moves; ~1.2 MB/thread.
+    int16_t contHist[12][64][12][64];
+    Stack   ss[MAX_PLY + 4];
 
     bool times_up() {
         if ((nodes & 2047) == 0) {
@@ -256,6 +299,11 @@ struct Searcher {
         if (aborted || times_up()) { aborted = true; return 0; }
         ++nodes;
 
+        // Hard ply cap: bounds every ply-indexed table (killers, search stack).
+        // Reachable only via long checking/extension chains; returning the static
+        // eval here is a safe emergency horizon.
+        if (ply >= MAX_PLY) return evaluate(pos);
+
         const int  alphaOrig = alpha;
         const bool isPV       = (beta - alpha) > 1; // wide window ⇒ PV node
 
@@ -348,6 +396,9 @@ struct Searcher {
             && beta < MATE - MAX_PLY && beta > -(MATE - MAX_PLY)) {
             int R = 3 + depth / 3;
             StateInfo nullSt;
+            // Mark this ply as "no move" so the child doesn't index countermove /
+            // continuation history off a stale sibling move.
+            ss[ply].currentMove = 0;
             pos.do_null_move(nullSt);
             int nullScore = -negamax(pos, std::max(0, depth - 1 - R), -beta, -beta + 1, ply + 1);
             pos.undo_null_move();
@@ -366,16 +417,33 @@ struct Searcher {
         MoveList ml;
         generate_pseudo(pos, ml);
 
+        // ── Parent / grandparent move context (for countermove & cont-history) ─
+        // The parent move (ply-1) was made by the opponent (!stm); the
+        // grandparent (ply-2) by us (stm). pPiece12/gPiece12 are Piece (0..11)
+        // indices; -1 means "no such move" (root / after a null move).
+        int  pPiece12 = -1, pTo = 0, gPiece12 = -1, gTo = 0;
+        Move counter  = 0;
+        if (ply >= 1 && ss[ply - 1].currentMove != 0) {
+            pPiece12 = make_piece(Color(!stm), ss[ply - 1].movedPiece);
+            pTo      = ss[ply - 1].toSq;
+            counter  = counterMove[pPiece12][pTo];
+        }
+        if (ply >= 2 && ss[ply - 2].currentMove != 0) {
+            gPiece12 = make_piece(stm, ss[ply - 2].movedPiece);
+            gTo      = ss[ply - 2].toSq;
+        }
+
         // ── Move scoring (for ordering) ───────────────────────────────────────
         // Assign a score to each pseudo-legal move; we iterate in descending
         // score order using selection sort (lazy, one pass per iteration).
         //
         // Score buckets (non-overlapping):
         //   TT move:        2,000,000
-        //   Captures/promos: 1,000,000 + MVV-LVA bonus  (max ~14*16+900 ≈ 1,127,300)
-        //   Killer 1:          900,000
-        //   Killer 2:          800,000
-        //   Quiet history:     history[stm][from][to]   (clamped to < 800,000)
+        //   Good captures:   1,000,000 + MVV-LVA + capture-history
+        //   Killer 1/2:        900,000 / 800,000
+        //   Countermove:       700,000
+        //   Quiet:           butterfly + continuation history
+        //   Bad captures:   -1,000,000 + MVV-LVA + capture-history
         int scores[256];
         for (int i = 0; i < ml.size; ++i) {
             Move m = ml.moves[i];
@@ -386,31 +454,41 @@ struct Searcher {
                 const Piece capPiece = pos.piece_on(to_sq(m));
                 const bool isCapture = isEp || (capPiece != NO_PIECE);
                 const bool isPromo   = (type_of(m) == PROMO);
+                const Square from    = from_sq(m), to = to_sq(m);
+                const PieceType mover = piece_type(pos.piece_on(from));
 
                 if (isCapture || isPromo) {
                     // MVV-LVA: most-valuable-victim / least-valuable-attacker
                     PieceType victim   = isEp ? PAWN
                                        : isCapture ? piece_type(capPiece)
                                        : PAWN; // quiet promo: no real victim
-                    PieceType attacker = piece_type(pos.piece_on(from_sq(m)));
-                    int mvvlva = value_of(victim) * 16 - value_of(attacker);
+                    int mvvlva = value_of(victim) * 16 - value_of(mover);
                     if (isPromo) mvvlva += value_of(QUEEN);
+                    int ch = ORD_CAPTHIST ? (int)captHist[stm][mover][to][victim] : 0;
                     // Split captures by SEE: good/equal captures keep the high
                     // band; captures that lose material (SEE<0) drop below all
                     // quiets/history so they are tried last.  Promotions are
                     // always treated as good (kept high).
                     if (!isPromo && isCapture && see(pos, m) < 0)
-                        scores[i] = SCORE_BAD_CAPTURE + mvvlva;
+                        scores[i] = SCORE_BAD_CAPTURE + mvvlva + ch;
                     else
-                        scores[i] = SCORE_CAPTURE + mvvlva;
+                        scores[i] = SCORE_CAPTURE + mvvlva + ch;
                 } else {
-                    // Quiet move: check killers then history
+                    // Quiet move: killers, then countermove, then histories.
                     if (ply < MAX_PLY && m == killers[ply][0]) {
                         scores[i] = SCORE_KILLER1;
                     } else if (ply < MAX_PLY && m == killers[ply][1]) {
                         scores[i] = SCORE_KILLER2;
+                    } else if (ORD_COUNTER && counter != 0 && m == counter) {
+                        scores[i] = SCORE_COUNTER;
                     } else {
-                        scores[i] = history[stm][from_sq(m)][to_sq(m)];
+                        const int cp12 = make_piece(stm, mover);
+                        int q = (int)history[stm][from][to];
+                        if (ORD_CONTHIST && pPiece12 >= 0) {
+                            q += (int)contHist[pPiece12][pTo][cp12][to];
+                            if (gPiece12 >= 0) q += (int)contHist[gPiece12][gTo][cp12][to];
+                        }
+                        scores[i] = q;
                     }
                 }
             }
@@ -421,6 +499,11 @@ struct Searcher {
         int  legal     = 0;
         int  moveCount = 0;  // post-legality counter (for LMR/LMP thresholds)
         bool firstMove = true;
+
+        // Quiet/capture moves actually searched at this node — used to apply a
+        // history MALUS to the moves that did NOT cause the cutoff.
+        Move quietsTried[64]; int nQuiets = 0;
+        Move capsTried[64];   int nCaps   = 0;
 
         for (int i = 0; i < ml.size; ++i) {
             // ── Selection sort: pick the highest-scored remaining move ─────
@@ -478,6 +561,10 @@ struct Searcher {
                 continue;
             }
 
+            // Mover piece type captured BEFORE do_move (board still unmoved),
+            // for the search-stack / history indexing.
+            const PieceType moverPt = piece_type(pos.piece_on(from_sq(m)));
+
             StateInfo st;
             pos.do_move(m, st);
             // Skip illegal pseudo-moves: after do_move the mover is now the
@@ -488,6 +575,16 @@ struct Searcher {
             }
             ++legal;
             ++moveCount;
+
+            // Record into the search stack (children read this as their parent),
+            // and remember the move for the history malus pass.
+            ss[ply].currentMove = m;
+            ss[ply].movedPiece  = moverPt;
+            ss[ply].toSq        = to_sq(m);
+            if (isQuiet) { if (nQuiets < 64) quietsTried[nQuiets++] = m; }
+            else if (isEpPre || capPiecePre != NO_PIECE) {
+                if (nCaps < 64) capsTried[nCaps++] = m;
+            }
 
             // ── Does this move give check? (opponent now to move) ─────────
             const bool givesCheck = pos.in_check(pos.side_to_move());
@@ -537,21 +634,50 @@ struct Searcher {
             }
             if (score > alpha) alpha = score;
             if (alpha >= beta) {
-                // ── Beta cutoff: update killers and history for quiet moves ──
+                // ── Beta cutoff: gravity-update the move-ordering histories ──
+                // Board is fully restored here (undo_move already ran), so
+                // piece_on(from) is the mover and piece_on(to) the captured
+                // victim again — safe to read for indexing.
+                const int bonus = hist_bonus(depth);
+
+                // Quiet-history helpers (butterfly + 1/2-ply continuation).
+                auto quietBonus = [&](Move mv, int bo) {
+                    const Square f = from_sq(mv), t = to_sq(mv);
+                    const int cp12 = make_piece(stm, piece_type(pos.piece_on(f)));
+                    hist_update(history[stm][f][t], bo);
+                    if (pPiece12 >= 0) hist_update(contHist[pPiece12][pTo][cp12][t], bo);
+                    if (gPiece12 >= 0) hist_update(contHist[gPiece12][gTo][cp12][t], bo);
+                };
+                auto capBonus = [&](Move mv, int bo) {
+                    const Square f = from_sq(mv), t = to_sq(mv);
+                    const PieceType att = piece_type(pos.piece_on(f));
+                    const PieceType vic = (type_of(mv) == EN_PASSANT)
+                                        ? PAWN : piece_type(pos.piece_on(t));
+                    hist_update(captHist[stm][att][t][vic], bo);
+                };
+
                 const bool isEpPost      = (type_of(m) == EN_PASSANT);
-                const Piece capPiecePost = pos.piece_on(to_sq(m)); // piece already restored
+                const Piece capPiecePost = pos.piece_on(to_sq(m));
                 const bool isCapturePost = isEpPost || (capPiecePost != NO_PIECE);
                 const bool isPromoPost   = (type_of(m) == PROMO);
+
                 if (!isCapturePost && !isPromoPost) {
-                    // Update killers (keep 2 distinct killers per ply)
+                    // Killers (keep 2 distinct per ply).
                     if (ply < MAX_PLY && m != killers[ply][0]) {
                         killers[ply][1] = killers[ply][0];
                         killers[ply][0] = m;
                     }
-                    // Update history with depth² bonus (clamped to HISTORY_MAX)
-                    int& h = history[stm][from_sq(m)][to_sq(m)];
-                    h += depth * depth;
-                    if (h > HISTORY_MAX) h = HISTORY_MAX;
+                    // Countermove: this quiet refutes the parent move.
+                    if (pPiece12 >= 0) counterMove[pPiece12][pTo] = m;
+                    // Reward the cutting quiet; punish the quiets that didn't cut.
+                    quietBonus(m, bonus);
+                    for (int q = 0; q < nQuiets; ++q)
+                        if (quietsTried[q] != m) quietBonus(quietsTried[q], -bonus);
+                } else if (isCapturePost) {
+                    // Reward the cutting capture; punish the others.
+                    capBonus(m, bonus);
+                    for (int c = 0; c < nCaps; ++c)
+                        if (capsTried[c] != m) capBonus(capsTried[c], -bonus);
                 }
                 break; // beta cutoff
             }
@@ -844,6 +970,10 @@ Move think(Position& pos, const Limits& L, std::atomic<bool>& stop,
         s.aborted = false;
         std::memset(s.killers, 0, sizeof(s.killers));
         std::memset(s.history, 0, sizeof(s.history));
+        std::memset(s.captHist, 0, sizeof(s.captHist));
+        std::memset(s.counterMove, 0, sizeof(s.counterMove));
+        std::memset(s.contHist, 0, sizeof(s.contHist));
+        std::memset(s.ss, 0, sizeof(s.ss));
         positions[t].copy_from(pos); // private clone with full repetition history
     }
 
@@ -929,6 +1059,10 @@ SearchResult think_result(Position& pos, const Limits& L,
         s.aborted = false;
         std::memset(s.killers, 0, sizeof(s.killers));
         std::memset(s.history, 0, sizeof(s.history));
+        std::memset(s.captHist, 0, sizeof(s.captHist));
+        std::memset(s.counterMove, 0, sizeof(s.counterMove));
+        std::memset(s.contHist, 0, sizeof(s.contHist));
+        std::memset(s.ss, 0, sizeof(s.ss));
         positions[t].copy_from(pos);
     }
 
