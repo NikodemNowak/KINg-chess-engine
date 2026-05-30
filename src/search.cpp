@@ -352,10 +352,15 @@ struct Searcher {
 
         const int alphaOrig = alpha;
 
+        // Singular-extension verification re-enters this node with one move
+        // excluded; in that mode we must not take the TT cutoff (the entry covers
+        // the full node) nor store a result under the normal key.
+        const Move excluded = ss[ply].excluded;
+
         // ── TT probe ───────────────────────────────────────────────────────
         Move ttMove = 0;
         TTEntry tte;
-        bool ttHit = tt.probe(pos.key(), tte);
+        bool ttHit = !excluded && tt.probe(pos.key(), tte);
         if (ttHit) {
             ttMove = tte.move;
             // Cutoff only on non-PV nodes with a deep-enough entry whose bound
@@ -592,6 +597,7 @@ struct Searcher {
             }
 
             Move m = ml.moves[i];
+            if (m == excluded) continue;   // singular verification skips this move
 
             // ── Classify move BEFORE do_move (board is still unmoved) ─────
             // isQuiet: not a capture, not en passant, not a promotion.
@@ -655,6 +661,28 @@ struct Searcher {
                 }
             }
 
+            // ── Singular extension ─────────────────────────────────────────
+            // If the TT move appears to be the ONLY good move — a reduced search
+            // of every OTHER move fails below (ttScore - margin) — then it holds
+            // the position together and deserves a deeper search. Verified on the
+            // undisturbed board (before do_move), only for the TT move at depth.
+            int singularExt = 0;
+            if (!excluded && m == ttMove && depth >= 8 && ply > 0
+                    && ttHit && (int)tte.depth >= depth - 3
+                    && Bound(tte.genBound & 3) != BOUND_UPPER) {
+                int ttScore = fromTT(tte.score, ply);
+                if (!is_mate_score(ttScore)) {
+                    int singularBeta  = ttScore - 2 * depth;
+                    int singularDepth = (depth - 1) / 2;
+                    ss[ply].excluded = ttMove;
+                    int v = negamax(pos, singularDepth, singularBeta - 1, singularBeta,
+                                    ply, /*nmpAllowed=*/false);
+                    ss[ply].excluded = 0;
+                    if (aborted) return 0;
+                    if (v < singularBeta) singularExt = 1;
+                }
+            }
+
             StateInfo st;
             pos.do_move(m, st);
             // Skip illegal pseudo-moves: after do_move the mover is now the
@@ -679,12 +707,12 @@ struct Searcher {
             // ── Does this move give check? (opponent now to move) ─────────
             const bool givesCheck = pos.in_check(pos.side_to_move());
 
-            // ── Check extension ───────────────────────────────────────────
-            // Extend by 1 ply when this move gives check. Checks are forcing
-            // moves that deserve deeper exploration; the MAX_PLY guard in the
-            // recursion prevents depth runaway.
-            const int extension = (givesCheck && ply < MAX_PLY - 1) ? 1 : 0;
-            const int newDepth = depth - 1 + extension;
+            // ── Extensions: singular (computed above) + check ──────────────
+            // Checks are forcing; the singular move is forced. Cap the combined
+            // extension at 2 and guard against ply runaway.
+            const int checkExt  = (givesCheck && ply < MAX_PLY - 1) ? 1 : 0;
+            const int extension = (ply < MAX_PLY - 1) ? std::min(singularExt + checkExt, 2) : 0;
+            const int newDepth  = depth - 1 + extension;
             int score;
 
             if (firstMove) {
@@ -779,11 +807,15 @@ struct Searcher {
             return inCheck ? -(MATE - ply) : 0;
 
         // ── TT store (cache the static eval for future probes) ────────────────
-        Bound bound = (best <= alphaOrig) ? BOUND_UPPER
-                    : (best >= beta)       ? BOUND_LOWER
-                    :                        BOUND_EXACT;
-        tt.store(pos.key(), bestMove, toTT(best, ply),
-                 inCheck ? TT_EVAL_NONE : (int16_t)staticEval, (uint8_t)depth, bound);
+        // Skipped during a singular verification: the result excludes one move
+        // and must not overwrite the full-node entry.
+        if (!excluded) {
+            Bound bound = (best <= alphaOrig) ? BOUND_UPPER
+                        : (best >= beta)       ? BOUND_LOWER
+                        :                        BOUND_EXACT;
+            tt.store(pos.key(), bestMove, toTT(best, ply),
+                     inCheck ? TT_EVAL_NONE : (int16_t)staticEval, (uint8_t)depth, bound);
+        }
 
         return best;
     }
