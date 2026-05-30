@@ -39,6 +39,12 @@ message(STATUS "KINg eval = ${EVAL}")
 set(NNUE_HL "512" CACHE STRING "NNUE accumulator hidden-layer size per perspective (default 512)")
 message(STATUS "KINg NNUE_HL = ${NNUE_HL}")
 
+# ── NNUE activation ───────────────────────────────────────────────────────────
+# -DNNUE_SCRELU=ON uses the squared clipped-ReLU activation (must match a net
+# trained with `--activation screlu`). Default OFF = plain clipped-ReLU.
+set(NNUE_SCRELU OFF CACHE BOOL "Use SCReLU (squared) NNUE activation")
+message(STATUS "KINg NNUE_SCRELU = ${NNUE_SCRELU}")
+
 # ── NNUE net binary (override for validation builds) ─────────────────────────
 # Default: the committed HL=256 production net.
 # Override with -DNNUE_NET=/abs/path/to/other.bin for temp-net validation.
@@ -61,6 +67,9 @@ set(EXTRA_SRC "")
 if(EVAL STREQUAL "NNUE")
   add_compile_definitions(EVAL_NNUE)
   add_compile_definitions(NNUE_HL=${NNUE_HL})
+  if(NNUE_SCRELU)
+    add_compile_definitions(NNUE_SCRELU)
+  endif()
 
   # Embed the net into the binary: generate a C++ byte-array source from
   # nets/king_nnue.bin (or the override) at build time.

@@ -138,89 +138,121 @@ class StreamingNNUEDataset(Dataset):
 
     def __getitem__(self, i: int):
         self._open()
-        rec = self._mm[self.indices[i]]
-        stm = int(rec['stm'])
-        n = int(rec['n'])
-        score_stm = float(rec['score'])    # already STM POV, already clamped
-        result_stm = float(rec['result'])  # already STM POV
-
-        # Expand piece list to feature index pairs.
-        sf, nf = [], []
-        for k in range(n):
-            p = int(rec['pieces'][k])
-            color = (p >> 4) & 1
-            ptype = p & 0x0F
-            sq = int(rec['squares'][k])
-            sf.append(feature_index(stm, color, ptype, sq))
-            nf.append(feature_index(stm ^ 1, color, ptype, sq))
-
-        return sf, nf, score_stm, result_stm
+        # Return the raw structured record; ALL feature-index math is done
+        # vectorised over the whole batch in collate_fn (no Python per-piece
+        # loop), which keeps the GPU fed instead of starved.
+        return self._mm[self.indices[i]]
 
 
 def collate_fn(batch):
-    """Collate a list of (sf, nf, score, result) into dense float tensors.
+    """Vectorised collate: a list of raw records -> EmbeddingBag inputs.
 
-    Vectorized COO → dense construction; avoids Python loops over batch rows.
+    Computes every active feature index for the whole batch with numpy array ops
+    (no Python per-piece loop), then packs them into a flat index tensor + offsets
+    for nn.EmbeddingBag(mode='sum'). Both perspectives share the SAME piece order,
+    so they share offsets. The feature_index math here MUST match feature_index()
+    and the C++ inference EXACTLY (bit-exact contract).
     """
-    B = len(batch)
-    all_sf, all_nf, scores, results = zip(*batch)
+    recs = np.asarray(batch)                       # structured array [B]
+    B = len(recs)
+    stm = recs['stm'].astype(np.int64)             # [B]
+    n   = recs['n'].astype(np.int64)               # [B]
+    pieces  = recs['pieces']                        # [B,32] uint8
+    squares = recs['squares']                       # [B,32] uint8
 
-    scores_t = torch.tensor(scores, dtype=torch.float32)
-    results_t = torch.tensor(results, dtype=torch.float32)
+    scores_t  = torch.from_numpy(np.ascontiguousarray(recs['score']).astype(np.float32))
+    results_t = torch.from_numpy(np.ascontiguousarray(recs['result']).astype(np.float32))
 
-    def make_dense(feat_lists):
-        counts = np.array([len(fl) for fl in feat_lists], dtype=np.int64)
-        total = int(counts.sum())
-        if total == 0:
-            return torch.zeros((B, INPUT_SIZE), dtype=torch.float32)
-        rows = np.repeat(np.arange(B, dtype=np.int64), counts)
-        cols = np.concatenate([np.array(fl, dtype=np.int64) for fl in feat_lists])
-        i = torch.from_numpy(np.stack([rows, cols]))
-        v = torch.ones(total, dtype=torch.float32)
-        sp = torch.sparse_coo_tensor(i, v, (B, INPUT_SIZE))
-        return sp.to_dense()
+    # Mask of valid piece slots (k < n) and flat per-piece attributes.
+    valid = np.arange(32)[None, :] < n[:, None]    # [B,32] bool
+    rows  = np.repeat(np.arange(B, dtype=np.int64), n)   # sample index per piece
+    p = pieces[valid]                               # [T] uint8
+    s = squares[valid].astype(np.int64)            # [T]
+    color = ((p >> 4) & 1).astype(np.int64)
+    ptype = (p & 0x0F).astype(np.int64)
+    stm_f = stm[rows]                               # [T] perspective owner
 
-    x_stm = make_dense(all_sf)
-    x_nst = make_dense(all_nf)
-    return x_stm, x_nst, scores_t, results_t
+    # STM perspective (persp = stm).
+    os_s = np.where(stm_f == WHITE, s, s ^ 56)
+    cr_s = (color != stm_f).astype(np.int64)
+    sf = cr_s * 384 + ptype * 64 + os_s
+    # NSTM perspective (persp = stm ^ 1).
+    nstm = stm_f ^ 1
+    os_n = np.where(nstm == WHITE, s, s ^ 56)
+    cr_n = (color != nstm).astype(np.int64)
+    nf = cr_n * 384 + ptype * 64 + os_n
+
+    offsets = np.zeros(B, dtype=np.int64)
+    if B > 1:
+        np.cumsum(n[:-1], out=offsets[1:])
+    off_t = torch.from_numpy(offsets)
+    return (torch.from_numpy(sf), off_t,
+            torch.from_numpy(nf), off_t.clone(), scores_t, results_t)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Model — HL is a parameter; EXACT same architecture as before, just flexible.
 # ──────────────────────────────────────────────────────────────────────────────
 class NNUE(nn.Module):
-    def __init__(self, hl: int):
+    def __init__(self, hl: int, squared: bool = False):
         super().__init__()
         self.hl = hl
-        # W1: [HL, INPUT_SIZE], applied as acc = x @ W1.T + b1
-        self.l1 = nn.Linear(INPUT_SIZE, hl)
+        self.squared = squared  # SCReLU (clamp then square) vs CReLU
+        # Feature transformer as a sparse EmbeddingBag (sum over active features).
+        # ft.weight is [INPUT_SIZE, HL]; the equivalent dense Linear weight W1 is
+        # [HL, INPUT_SIZE] == ft.weight.T (used by quantize()/export). The bias b1
+        # is a separate parameter added after the bag sum.
+        self.ft = nn.EmbeddingBag(INPUT_SIZE, hl, mode='sum')
+        self.b1 = nn.Parameter(torch.zeros(hl))
         # W2: [1, 2*HL]
         self.l2 = nn.Linear(2 * hl, 1)
+        # Match the old nn.Linear default init scale so training dynamics/quant
+        # ranges stay comparable.
+        nn.init.kaiming_uniform_(self.ft.weight, a=5 ** 0.5)
 
-    def forward(self, x_stm, x_nst):
-        acc_stm = self.l1(x_stm)
-        acc_nst = self.l1(x_nst)
+    def forward(self, s_idx, s_off, n_idx, n_off):
+        acc_stm = self.ft(s_idx, s_off) + self.b1
+        acc_nst = self.ft(n_idx, n_off) + self.b1
         # Clipped ReLU in float domain: clamp to [0,1] (quant uses [0,QA]).
         c_stm = torch.clamp(acc_stm, 0.0, 1.0)
         c_nst = torch.clamp(acc_nst, 0.0, 1.0)
+        if self.squared:  # SCReLU: square the clamped activation
+            c_stm = c_stm * c_stm
+            c_nst = c_nst * c_nst
         x = torch.cat([c_stm, c_nst], dim=1)   # stm first
         # Output is the WIN-LOGIT y.  Float eval in cp == y * SCALE.
         return self.l2(x).squeeze(1)            # [B]
+
+    @torch.no_grad()
+    def clip_weights(self):
+        """Quant-safety guard: keep weights inside int16-safe magnitudes so the
+        exported net can never silently saturate/diverge. Bounds are loose enough
+        that they essentially never bind in healthy training (catastrophe guard).
+        FT: |w|<=1.98 keeps the 32-active accumulator inside int16 for any HL
+        (32*1.98*QA + bias < 32767); real trained values peak ~1.86 so it rarely
+        binds. L2: |w|<=64 keeps W2q in int16 (64*QB=4096) while never binding on
+        real values (which peak ~4.75) — pure divergence insurance."""
+        self.ft.weight.clamp_(-1.98, 1.98)
+        self.b1.clamp_(-1.98, 1.98)
+        self.l2.weight.clamp_(-64.0, 64.0)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Quantized integer forward pass (pure numpy int math == the C++ contract).
 # ──────────────────────────────────────────────────────────────────────────────
 class QuantNet:
-    def __init__(self, W1q, b1q, W2q, b2q, hl: int):
+    def __init__(self, W1q, b1q, W2q, b2q, hl: int, squared: bool = False):
         self.W1q = W1q.astype(np.int64)  # [HL, INPUT]
         self.b1q = b1q.astype(np.int64)  # [HL]
         self.W2q = W2q.astype(np.int64)  # [2*HL]
         self.b2q = int(b2q)
         self.hl = hl
+        self.squared = squared
+        # SCReLU squares the [0,QA] activation, adding one factor of QA to scale.
+        self.den = (QA * QA * QB) if squared else (QA * QB)
 
     def eval_features(self, stm_feat_idx, nst_feat_idx) -> int:
-        """Quantized eval in cp, STM POV."""
+        """Quantized eval in cp, STM POV. Mirrors the C++ integer inference."""
         acc_stm = self.b1q.copy()
         for c in stm_feat_idx:
             acc_stm += self.W1q[:, c]
@@ -229,11 +261,14 @@ class QuantNet:
             acc_nst += self.W1q[:, c]
         cr_stm = np.clip(acc_stm, 0, QA)
         cr_nst = np.clip(acc_nst, 0, QA)
+        if self.squared:
+            cr_stm = cr_stm * cr_stm
+            cr_nst = cr_nst * cr_nst
         acc = np.concatenate([cr_stm, cr_nst])   # stm first
         dot = int(np.dot(acc, self.W2q))
         out = self.b2q + dot
-        # Python floor division — matches README_NNUE.md / C++ floor-div snippet.
-        return int(out * SCALE // (QA * QB))
+        # Python floor division — matches the C++ floor-div snippet exactly.
+        return int(out * SCALE // self.den)
 
     def eval_fen(self, fen: str) -> int:
         fields = fen.split()
@@ -258,15 +293,19 @@ class QuantNet:
 
 def quantize(model: NNUE):
     hl = model.hl
-    W1 = model.l1.weight.detach().cpu().numpy()     # [HL, INPUT]
-    b1 = model.l1.bias.detach().cpu().numpy()       # [HL]
+    # EmbeddingBag weight is [INPUT, HL]; the dense-equivalent W1 is its transpose
+    # [HL, INPUT]. b1 is the separate bias parameter.
+    W1 = model.ft.weight.detach().cpu().numpy().T   # [HL, INPUT]
+    b1 = model.b1.detach().cpu().numpy()            # [HL]
     W2 = model.l2.weight.detach().cpu().numpy()[0]  # [2*HL]
     b2 = float(model.l2.bias.detach().cpu().numpy()[0])
 
+    squared = getattr(model, 'squared', False)
     W1q = np.round(W1 * QA).astype(np.int32)
     b1q = np.round(b1 * QA).astype(np.int32)
     W2q = np.round(W2 * QB).astype(np.int32)
-    b2q = int(round(b2 * QA * QB))
+    # SCReLU's squared activation carries an extra QA factor into the output scale.
+    b2q = int(round(b2 * (QA * QA * QB if squared else QA * QB)))
 
     def chk(name, arr, lo, hi):
         amin, amax = int(arr.min()), int(arr.max())
@@ -280,7 +319,7 @@ def quantize(model: NNUE):
     W1q = np.clip(W1q, -32768, 32767).astype(np.int16)
     b1q = np.clip(b1q, -32768, 32767).astype(np.int16)
     W2q = np.clip(W2q, -32768, 32767).astype(np.int16)
-    return QuantNet(W1q, b1q, W2q, b2q, hl), (W1q, b1q, W2q, b2q)
+    return QuantNet(W1q, b1q, W2q, b2q, hl, squared), (W1q, b1q, W2q, b2q)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -375,6 +414,9 @@ def main():
     ap.add_argument('--lr', type=float, default=1e-3)
     ap.add_argument('--hl', type=int, default=512,
                     help='Hidden layer size per perspective (default 512)')
+    ap.add_argument('--activation', choices=['crelu', 'screlu'], default='crelu',
+                    help='Hidden activation: crelu (default) or screlu (squared). '
+                         'screlu nets MUST be compiled with -DNNUE_SCRELU.')
     ap.add_argument('--val-frac', type=float, default=0.02)
     ap.add_argument('--workers', type=int, default=0,
                     help='DataLoader worker processes (default 0 = main thread; '
@@ -430,7 +472,9 @@ def main():
 
     print(f"[data] RAM after dataset setup: {_rss_gb():.2f} GB")
 
-    model = NNUE(HL).to(device)
+    squared = (args.activation == 'screlu')
+    model = NNUE(HL, squared=squared).to(device)
+    print(f"[model] activation={args.activation}")
     n_params = sum(p.numel() for p in model.parameters())
     print(f"[model] HL={HL}  params={n_params:,}  "
           f"({n_params*4/1e6:.2f} MB float32)  "
@@ -445,17 +489,20 @@ def main():
         r = results_t.to(device)
         return 0.6 * torch.sigmoid(s / SCALE) + 0.4 * r
 
+    def to_dev(si, so, ni, no):
+        return (si.to(device), so.to(device), ni.to(device), no.to(device))
+
     def run_val():
         model.eval()
         total_loss, cnt = 0.0, 0
         with torch.no_grad():
-            for xs, xn, sc, rs in val_loader:
-                xs = xs.to(device)
-                xn = xn.to(device)
-                pred = torch.sigmoid(model(xs, xn))
+            for si, so, ni, no, sc, rs in val_loader:
+                si, so, ni, no = to_dev(si, so, ni, no)
+                pred = torch.sigmoid(model(si, so, ni, no))
                 tgt = make_target(sc, rs)
-                total_loss += loss_fn(pred, tgt).item() * xs.shape[0]
-                cnt += xs.shape[0]
+                bs = sc.shape[0]
+                total_loss += loss_fn(pred, tgt).item() * bs
+                cnt += bs
         model.train()
         return total_loss / max(1, cnt)
 
@@ -472,17 +519,18 @@ def main():
 
         model.train()
         ep_loss, ep_cnt = 0.0, 0
-        for xs, xn, sc, rs in ep_loader:
-            xs = xs.to(device)
-            xn = xn.to(device)
-            pred = torch.sigmoid(model(xs, xn))
+        for si, so, ni, no, sc, rs in ep_loader:
+            si, so, ni, no = to_dev(si, so, ni, no)
+            pred = torch.sigmoid(model(si, so, ni, no))
             tgt = make_target(sc, rs)
             loss = loss_fn(pred, tgt)
             opt.zero_grad()
             loss.backward()
             opt.step()
-            ep_loss += loss.item() * xs.shape[0]
-            ep_cnt += xs.shape[0]
+            model.clip_weights()  # quant-safety guard (rarely binds)
+            bs = sc.shape[0]
+            ep_loss += loss.item() * bs
+            ep_cnt += bs
 
         sched.step()
         train_loss = ep_loss / max(1, ep_cnt)
@@ -514,8 +562,9 @@ def main():
     check_loader = DataLoader(check_ds, batch_size=check_n, shuffle=False,
                               collate_fn=collate_fn, num_workers=0)
     with torch.no_grad():
-        xs, xn, _, _ = next(iter(check_loader))
-        yf = model(xs.to(device), xn.to(device)).cpu().numpy() * SCALE
+        si, so, ni, no, _, _ = next(iter(check_loader))
+        yf = model(si.to(device), so.to(device),
+                   ni.to(device), no.to(device)).cpu().numpy() * SCALE
 
     mm = np.memmap(cache_path, dtype=RECORD_DTYPE, mode='r', shape=(total,))
     diffs = []

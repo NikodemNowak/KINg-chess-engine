@@ -121,8 +121,14 @@ static inline int crelu(int v) {
 // so the running sum never wraps even at HL=1024). Requires HL % 16 == 0.
 static int64_t dot_half_scalar(const int16_t* a, const int16_t* w) {
     int64_t sum = 0;
-    for (int i = 0; i < HL; ++i)
-        sum += (int64_t)crelu(a[i]) * w[i];
+    for (int i = 0; i < HL; ++i) {
+        int c = crelu(a[i]);            // clamp to [0,QA]
+#ifdef NNUE_SCRELU
+        sum += (int64_t)c * c * w[i];   // SCReLU: squared activation
+#else
+        sum += (int64_t)c * w[i];       // CReLU
+#endif
+    }
     return sum;
 }
 
@@ -138,6 +144,30 @@ static void acc_sub_scalar(int16_t* dst, const int16_t* col) {
 // AVX2 forms — compiled with an AVX2 target attribute so the intrinsics are
 // legal even though the rest of the TU targets the portable baseline. These are
 // only *called* after init() confirms __builtin_cpu_supports("avx2").
+#ifdef NNUE_SCRELU
+__attribute__((target("avx2")))
+static int64_t dot_half_avx2(const int16_t* a, const int16_t* w) {
+    // SCReLU: Σ clamp(a,0,QA)² · w, widened to int32 per element then int64-summed.
+    // Bit-exact with dot_half_scalar (same integer products; add is associative).
+    const __m256i zero = _mm256_setzero_si256();
+    const __m256i qa   = _mm256_set1_epi32(QA);
+    __m256i acc = _mm256_setzero_si256(); // int64 x4
+    for (int i = 0; i < HL; i += 8) {
+        __m128i a128 = _mm_loadu_si128((const __m128i*)(a + i)); // 8 int16
+        __m128i w128 = _mm_loadu_si128((const __m128i*)(w + i));
+        __m256i s  = _mm256_cvtepi16_epi32(a128);               // 8 int32
+        s = _mm256_min_epi32(_mm256_max_epi32(s, zero), qa);    // clamp [0,QA]
+        __m256i wv  = _mm256_cvtepi16_epi32(w128);
+        __m256i sw  = _mm256_mullo_epi32(s, wv);                // scr·w  (int32)
+        __m256i ssw = _mm256_mullo_epi32(sw, s);                // scr²·w (int32)
+        acc = _mm256_add_epi64(acc, _mm256_cvtepi32_epi64(_mm256_castsi256_si128(ssw)));
+        acc = _mm256_add_epi64(acc, _mm256_cvtepi32_epi64(_mm256_extracti128_si256(ssw, 1)));
+    }
+    int64_t lanes[4];
+    _mm256_storeu_si256((__m256i*)lanes, acc);
+    return lanes[0] + lanes[1] + lanes[2] + lanes[3];
+}
+#else
 __attribute__((target("avx2")))
 static int64_t dot_half_avx2(const int16_t* a, const int16_t* w) {
     const __m256i zero = _mm256_setzero_si256();
@@ -157,6 +187,7 @@ static int64_t dot_half_avx2(const int16_t* a, const int16_t* w) {
     _mm256_storeu_si256((__m256i*)lanes, acc);
     return lanes[0] + lanes[1] + lanes[2] + lanes[3];
 }
+#endif
 
 __attribute__((target("avx2")))
 static void acc_add_avx2(int16_t* dst, const int16_t* col) {
@@ -210,10 +241,15 @@ int evaluate_acc(const Accumulator& acc, Color stm) {
     sum += dot_half(acc.v[stm],    g_net.W2);
     sum += dot_half(acc.v[nonstm], g_net.W2 + HL);
 
-    // eval = floor( sum * SCALE / (QA*QB) ) with floor toward -inf (Python //).
+    // eval = floor( sum * SCALE / den ) with floor toward -inf (Python //).
+    // SCReLU's squared activation carries an extra QA factor → den = QA*QA*QB.
     // Kept SCALAR on the int64 sum so the result is bit-exact vs the reference.
     int64_t num = sum * (int64_t)SCALE;
+#ifdef NNUE_SCRELU
+    int64_t den = (int64_t)QA * QA * QB;
+#else
     int64_t den = (int64_t)QA * QB; // 16320
+#endif
     int64_t q = num / den;
     if ((num % den != 0) && ((num < 0) != (den < 0))) q -= 1;
     return (int)q;
