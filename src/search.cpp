@@ -349,6 +349,20 @@ struct Searcher {
             if (alpha >= beta) return alpha;
         }
 
+        // ── Draw detection (repetition / 50-move / insufficient material) ─────
+        // The search must recognise draws so it neither walks into a lost-on-the
+        // board "draw" it thinks is fine nor misses forcing a draw when worse.
+        // Repetition uses the first in-line repeat (the side to move can force it).
+        // The 50-move rule is suppressed while in check, since a position can be
+        // checkmate exactly on the 100th half-move (checkmate beats the draw claim);
+        // in_check() is only evaluated in that rare case (short-circuit).
+        if (ply > 0
+            && (pos.is_repetition()
+                || pos.insufficient_material()
+                || (pos.halfmove_clock() >= 100
+                    && !pos.in_check(pos.side_to_move()))))
+            return 0;
+
         const int alphaOrig = alpha;
 
         // ── TT probe ───────────────────────────────────────────────────────
