@@ -107,6 +107,12 @@ struct Accumulator {
 // Reset `acc` to the bias and add every piece on the board (full refresh).
 void refresh(Accumulator& acc, const Position& pos);
 
+// Rebuild ONE perspective only. Used after a king move: the moving side's king
+// bucket changed (so its whole perspective must be rebuilt), but the other
+// perspective only saw the enemy king shift squares and was already updated
+// incrementally — so refreshing it too would be wasted work.
+void refresh_perspective(Accumulator& acc, const Position& pos, Color persp);
+
 // Run the output layer on a (already up-to-date) accumulator for the given stm.
 // piece_count (total pieces on the board, 2..32) selects the output bucket.
 int evaluate_acc(const Accumulator& acc, Color stm, int piece_count);

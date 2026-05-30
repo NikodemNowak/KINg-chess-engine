@@ -99,6 +99,8 @@ public:
     // copy_from. Read by nnue::evaluate via evaluate_acc(acc, stm).
     const nnue::Accumulator& accumulator() const { return acc_; }
     void refresh_accumulator() { nnue::refresh(acc_, *this); }
+    // Rebuild only one perspective (after a king move of that side).
+    void refresh_accumulator(Color persp) { nnue::refresh_perspective(acc_, *this, persp); }
 #endif
 
 private:

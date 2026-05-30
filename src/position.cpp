@@ -189,7 +189,7 @@ void Position::do_move(Move m, StateInfo& st) {
     // updates above used the stale-but-valid king square and are overwritten).
     if (piece_type(pc) == KING) {
         ksq_[us] = to;
-        if (nnue::KB > 1) refresh_accumulator();
+        if (nnue::KB > 1) refresh_accumulator(us); // only the moving side's bucket changed
     }
 #endif
 
@@ -248,7 +248,7 @@ void Position::undo_move(Move m) {
 #ifdef EVAL_NNUE
     if (piece_type(piece_on(from)) == KING) {
         ksq_[us] = from;
-        if (nnue::KB > 1) refresh_accumulator();
+        if (nnue::KB > 1) refresh_accumulator(us); // only the moving side's bucket changed
     }
 #endif
     st_       = st->previous;

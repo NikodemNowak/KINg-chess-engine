@@ -330,6 +330,22 @@ void sub_feature(Accumulator& acc, Color c, PieceType t, Square s, Square wking,
     acc_sub(acc.v[BLACK], g_net.W1t[ib]);
 }
 
+// Rebuild a single perspective from scratch (king bucket of `persp` changed).
+void refresh_perspective(Accumulator& acc, const Position& pos, Color persp) {
+    if (!g_loaded) init();
+    const Square king = pos.king_sq(persp);
+    std::memcpy(acc.v[persp], g_net.b1, sizeof(g_net.b1));
+    for (int c = WHITE; c <= BLACK; ++c)
+        for (int pt = PAWN; pt <= KING; ++pt) {
+            Bitboard bb = pos.pieces((Color)c, (PieceType)pt);
+            while (bb) {
+                Square s = pop_lsb(bb);
+                acc_add(acc.v[persp],
+                        g_net.W1t[feature_index((Color)c, (PieceType)pt, s, persp, king)]);
+            }
+        }
+}
+
 // ── From-scratch reference evaluation ────────────────────────────────────────
 int evaluate_from_scratch(const Position& pos) {
     Accumulator acc;
