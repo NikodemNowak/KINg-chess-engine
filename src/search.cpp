@@ -955,9 +955,16 @@ static void smp_worker(Searcher& s, Position& pos, const TimeManager& tm,
                           std::chrono::steady_clock::now() - s.start)
                           .count();
             if (out_mtx) out_mtx->lock();
-            out << "info depth " << depth
-                << " score cp " << scoreThisDepth
-                << " nodes " << s.nodes
+            out << "info depth " << depth;
+            if (is_mate_score(scoreThisDepth)) {
+                // UCI "score mate N": N is in MOVES (not plies), signed.
+                int mate_plies = MATE - std::abs(scoreThisDepth);
+                int mate_moves = (mate_plies + 1) / 2;
+                out << " score mate " << (scoreThisDepth > 0 ? mate_moves : -mate_moves);
+            } else {
+                out << " score cp " << scoreThisDepth;
+            }
+            out << " nodes " << s.nodes
                 << " time " << ms
                 << " pv " << to_uci(best) << std::endl;
             if (out_mtx) out_mtx->unlock();
