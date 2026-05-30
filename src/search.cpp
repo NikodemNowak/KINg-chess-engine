@@ -808,6 +808,7 @@ static void smp_worker(Searcher& s, Position& pos, const TimeManager& tm,
     int  bestScore = 0;
     int  bestDepth = 0;
     int  prevScore = 0;
+    int  stableCnt = 0;   // consecutive depths where the root best move was unchanged
 
     Move iterBest  = best;
     int  iterScore = 0;
@@ -897,6 +898,11 @@ static void smp_worker(Searcher& s, Position& pos, const TimeManager& tm,
 
         if (s.aborted) break;
 
+        // ── Time-management signals (vs the PREVIOUS committed iteration) ─────
+        const bool moveStable = (depth > 1 && iterBest == best);
+        if (moveStable) ++stableCnt; else stableCnt = 0;
+        const int scoreDrop = prevScore - scoreThisDepth; // >0 ⇒ eval just fell
+
         // Commit the completed depth.
         prevScore = scoreThisDepth;
         best      = iterBest;
@@ -928,10 +934,17 @@ static void smp_worker(Searcher& s, Position& pos, const TimeManager& tm,
                 << " pv " << to_uci(best) << std::endl;
             if (out_mtx) out_mtx->unlock();
 
-            // Soft-time management is the MAIN thread's job only. When the main
-            // thread decides to stop starting new iterations, it raises the
-            // shared stop flag so every helper aborts its current search too.
-            if (ms >= tm.soft_ms) { stop.store(true); break; }
+            // Soft-time management is the MAIN thread's job only. Dynamic soft
+            // limit: stop earlier when the best move has been stable for a while
+            // (we're confident — bank the time), spend longer when the score just
+            // dropped (fail-low panic — resolve it). Never exceed the hard limit.
+            double factor = 1.0;
+            if (depth >= 6 && stableCnt >= 3) factor *= 0.65;
+            if (scoreDrop >= 30) factor *= 1.6;
+            factor = std::clamp(factor, 0.5, 2.5);
+            int64_t softLimit = (int64_t)(tm.soft_ms * factor);
+            if (softLimit > tm.hard_ms) softLimit = tm.hard_ms;
+            if (ms >= softLimit) { stop.store(true); break; }
         } else {
             // Helpers ignore soft time; they keep deepening (filling the TT)
             // until the shared stop flag / hard limit aborts them.
