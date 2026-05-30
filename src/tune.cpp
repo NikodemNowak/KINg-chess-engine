@@ -108,7 +108,11 @@ size_t load_dataset(const std::string& path, size_t maxPositions) {
 // ── MSE (multi-threaded) ──────────────────────────────────────────────────────
 // White-POV static eval for a sample.
 inline int qeval_white(const Sample& s) {
-    int e = evaluate(*s.pos); // side-to-move relative
+    // Always tune the HANDCRAFTED eval (the No-Deep-Learning entry), regardless
+    // of the build's EVAL selection. Calling evaluate() here would be a silent
+    // no-op in an NNUE build (it would optimise g_eval against the NN eval, which
+    // ignores g_eval entirely).
+    int e = evaluate_hce(*s.pos); // side-to-move relative
     return (s.pos->side_to_move() == WHITE) ? e : -e;
 }
 
