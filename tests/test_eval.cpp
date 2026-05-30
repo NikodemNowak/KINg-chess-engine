@@ -26,7 +26,9 @@ TEST_CASE("eval startpos ~ 0 (symmetry)") {
     ev_init();
     Position p;
     p.set_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
-    CHECK(std::abs(evaluate(p)) <= 30);
+    // Startpos is materially symmetric; the residual is the (tapered) tempo bonus
+    // for the side to move, so allow a slightly wider band than pure zero.
+    CHECK(std::abs(evaluate(p)) <= 50);
 }
 
 TEST_CASE("eval color symmetry") {

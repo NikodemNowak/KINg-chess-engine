@@ -52,6 +52,15 @@ struct EvalParams {
     // Piece-square tables (White POV, a1=0 .. h8=63), per PieceType.
     int mg_psqt[6][64];
     int eg_psqt[6][64];
+
+    // Tempo: small bonus for the side to move.
+    int tempo_mg, tempo_eg;
+
+    // Threats: per-attacked-piece bonus when a lower-valued attacker hits a
+    // higher-valued enemy piece (computed per side, color-symmetric).
+    int threat_pawn_mg,  threat_pawn_eg;   // pawn attacks any enemy non-pawn
+    int threat_minor_mg, threat_minor_eg;  // knight/bishop attacks enemy rook/queen
+    int threat_rook_mg,  threat_rook_eg;   // rook attacks enemy queen
 };
 
 // The single mutable instance read by evaluate(); default-initialised in eval.cpp.

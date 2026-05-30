@@ -209,6 +209,12 @@ void collect_scalar_params(std::vector<Param>& v) {
     v.push_back({ &g.pawn_shield_mg,      "pawn_shield_mg" });
     v.push_back({ &g.king_safety_max,     "king_safety_max" });
     v.push_back({ &g.king_safety_divisor, "king_safety_divisor" });
+
+    // Tempo + threats.
+    v.push_back({ &g.tempo_mg, "tempo_mg" });   v.push_back({ &g.tempo_eg, "tempo_eg" });
+    v.push_back({ &g.threat_pawn_mg,  "threat_pawn_mg" });  v.push_back({ &g.threat_pawn_eg,  "threat_pawn_eg" });
+    v.push_back({ &g.threat_minor_mg, "threat_minor_mg" }); v.push_back({ &g.threat_minor_eg, "threat_minor_eg" });
+    v.push_back({ &g.threat_rook_mg,  "threat_rook_mg" });  v.push_back({ &g.threat_rook_eg,  "threat_rook_eg" });
 }
 
 void collect_psqt_params(std::vector<Param>& v) {
@@ -321,6 +327,10 @@ void dump_params(std::ostream& os) {
     os << "    " << g.king_safety_divisor << ", // king_safety_divisor\n";
     dump_psqt(os, "mg_psqt[6][64]", g.mg_psqt);
     dump_psqt(os, "eg_psqt[6][64]", g.eg_psqt);
+    os << "    " << g.tempo_mg << ", " << g.tempo_eg << ", // tempo mg,eg\n";
+    os << "    " << g.threat_pawn_mg  << ", " << g.threat_pawn_eg  << ", // threat_pawn  mg,eg\n";
+    os << "    " << g.threat_minor_mg << ", " << g.threat_minor_eg << ", // threat_minor mg,eg\n";
+    os << "    " << g.threat_rook_mg  << ", " << g.threat_rook_eg  << ", // threat_rook  mg,eg\n";
     os << "};\n";
     os << "// ===== end paste =====\n";
 }

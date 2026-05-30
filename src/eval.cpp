@@ -33,29 +33,29 @@ static constexpr int PHASE_INC[6] = { 0, 1, 1, 2, 4, 0 };
 // handcrafted-term weights (Texel-tuned).
 static const EvalParams DEFAULT_EVAL = {
     // mg_value[6]
-    { 98, 381, 399, 495, 1169, 0 },
+    { 99, 401, 418, 514, 1210, 0 },
     // eg_value[6]
-    { 86, 304, 313, 540, 935, 0 },
-    26, 54, // bishop_pair mg,eg
-    47, -3, // rook_open mg,eg
-    13, 13, // rook_semiopen mg,eg
-    9, 8, // pawn_isolated mg,eg
-    8, 21, // pawn_doubled mg,eg
+    { 86, 302, 314, 546, 944, 0 },
+    30, 51, // bishop_pair mg,eg
+    46, -4, // rook_open mg,eg
+    12, 17, // rook_semiopen mg,eg
+    10, 8, // pawn_isolated mg,eg
+    11, 17, // pawn_doubled mg,eg
     // passed_mg[8]
-    { 0, -1, -7, -13, 12, 5, 12, 0 },
+    { 0, -1, -5, -13, 1, 4, -6, 0 },
     // passed_eg[8]
-    { 0, 1, 11, 36, 51, 66, 46, 0 },
+    { 0, 3, 11, 35, 51, 62, 62, 0 },
     // mob_pivot[4]
     { 4, 6, -1, 5 },
     // mob_mg[4]
-    { 4, 4, 3, 0 },
+    { 6, 5, 3, 1 },
     // mob_eg[4]
-    { -1, 2, 2, 8 },
+    { -1, 1, 2, 7 },
     // king_attack_units[6]
-    { 0, 7, 9, 13, 14, 0 },
-    10, // pawn_shield_mg
-    157, // king_safety_max
-    17, // king_safety_divisor
+    { 0, 9, 12, 13, 15, 0 },
+    11, // pawn_shield_mg
+    215, // king_safety_max
+    19, // king_safety_divisor
     // mg_psqt[6][64]
     {
         // PAWN
@@ -194,6 +194,10 @@ static const EvalParams DEFAULT_EVAL = {
              -74,  -35,  -18,  -18,  -11,   15,    4,  -17,
         },
     },
+    34, 18, // tempo mg,eg
+    79, 23, // threat_pawn  mg,eg
+    54, 17, // threat_minor mg,eg
+    86, -5, // threat_rook  mg,eg
 };
 
 // The single mutable instance read by evaluate().
@@ -407,6 +411,35 @@ static void eval_side(const Position& pos, Color c, int& mg, int& eg) {
         int shield = popcount(own_pawns & shield_files & shield_ranks);
         mg += shield * g_eval.pawn_shield_mg;
     }
+
+    // ── Threats ────────────────────────────────────────────────────────────────
+    // Reward attacking more valuable enemy pieces with cheaper attackers; a static
+    // proxy for tactical pressure the search would otherwise have to discover.
+    {
+        const Bitboard their_minor = pos.pieces(them, KNIGHT) | pos.pieces(them, BISHOP);
+        const Bitboard their_rook  = pos.pieces(them, ROOK);
+        const Bitboard their_queen = pos.pieces(them, QUEEN);
+        const Bitboard their_bigp  = their_minor | their_rook | their_queen; // non-pawn
+
+        // Pawn attacks on any enemy non-pawn piece.
+        Bitboard pawn_att = 0;
+        { Bitboard p = own_pawns; while (p) pawn_att |= pawn_attacks[c][pop_lsb(p)]; }
+        int t = popcount(pawn_att & their_bigp);
+        mg += t * g_eval.threat_pawn_mg;  eg += t * g_eval.threat_pawn_eg;
+
+        // Minor (knight/bishop) attacks on enemy rook or queen.
+        Bitboard minor_att = 0;
+        { Bitboard b = pos.pieces(c, KNIGHT); while (b) minor_att |= knight_attacks[pop_lsb(b)]; }
+        { Bitboard b = pos.pieces(c, BISHOP); while (b) minor_att |= bishop_attacks(pop_lsb(b), occ); }
+        t = popcount(minor_att & (their_rook | their_queen));
+        mg += t * g_eval.threat_minor_mg; eg += t * g_eval.threat_minor_eg;
+
+        // Rook attacks on enemy queen.
+        Bitboard rook_att = 0;
+        { Bitboard b = pos.pieces(c, ROOK); while (b) rook_att |= rook_attacks(pop_lsb(b), occ); }
+        t = popcount(rook_att & their_queen);
+        mg += t * g_eval.threat_rook_mg;  eg += t * g_eval.threat_rook_eg;
+    }
 }
 
 // ── evaluate (HCE) ───────────────────────────────────────────────────────────
@@ -441,7 +474,10 @@ int evaluate_hce(const Position& pos) {
 
     if (phase > 24) phase = 24;
     int score = (mg * phase + eg * (24 - phase)) / 24;
-    return (pos.side_to_move() == WHITE) ? score : -score;
+    int stm_score = (pos.side_to_move() == WHITE) ? score : -score;
+    // Tempo: a small (tapered) bonus for having the move.
+    int tempo = (g_eval.tempo_mg * phase + g_eval.tempo_eg * (24 - phase)) / 24;
+    return stm_score + tempo;
 }
 
 // ── evaluate (dispatcher) ────────────────────────────────────────────────────
