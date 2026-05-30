@@ -328,8 +328,7 @@ struct Searcher {
     // Principal Variation Search: the first move is searched with the full
     // window; subsequent moves use a zero-window (scout) search. Only if the
     // scout exceeds alpha AND is inside beta is a costly re-search done.
-    int negamax(Position& pos, int depth, int alpha, int beta, int ply,
-                bool nmpAllowed = true) {
+    int negamax(Position& pos, int depth, int alpha, int beta, int ply) {
         if (aborted || times_up()) { aborted = true; return 0; }
         ++nodes;
 
@@ -460,26 +459,18 @@ struct Searcher {
         // material (avoids zugzwang in pure K+P endings), and beta is finite.
         bool hasNonPawn = (pos.pieces(stm, KNIGHT) | pos.pieces(stm, BISHOP)
                          | pos.pieces(stm, ROOK)   | pos.pieces(stm, QUEEN)) != 0;
-        // NMP fires only when the position already looks good (staticEval >= beta)
-        // and never twice in a row (nmpAllowed) — the staticEval guard keeps it off
-        // in dubious positions, the no-double-null guard avoids zugzwang artefacts.
-        if (!isPV && !inCheck && nmpAllowed && depth >= 3 && hasNonPawn
-            && staticEval >= beta
+        if (!isPV && !inCheck && depth >= 3 && hasNonPawn
             && beta < MATE - MAX_PLY && beta > -(MATE - MAX_PLY)) {
-            // Reduction scales with depth and how far the eval exceeds beta.
-            int R = 3 + depth / 3 + std::min((staticEval - beta) / 200, 3);
+            int R = 3 + depth / 3;
             StateInfo nullSt;
             // Mark this ply as "no move" so the child doesn't index countermove /
             // continuation history off a stale sibling move.
             ss[ply].currentMove = 0;
             pos.do_null_move(nullSt);
-            int nullScore = -negamax(pos, std::max(0, depth - 1 - R), -beta, -beta + 1,
-                                     ply + 1, /*nmpAllowed=*/false);
+            int nullScore = -negamax(pos, std::max(0, depth - 1 - R), -beta, -beta + 1, ply + 1);
             pos.undo_null_move();
             if (aborted) return 0;
-            // Return the real fail-high score, but never trust a null-move "mate".
-            if (nullScore >= beta)
-                return is_mate_score(nullScore) ? beta : nullScore;
+            if (nullScore >= beta) return beta; // fail-high prune (return bound)
         }
 
         // ── Internal Iterative Reduction (IIR) ───────────────────────────────
