@@ -54,6 +54,7 @@ QA = 255                  # accumulator (W1,b1) quantization scale
 QB = 64                   # output weight (W2) quantization scale
 SCALE = 400               # eval scale (cp), == sigmoid divisor
 MAGIC = 0x4B4E5545        # "KNUE" big-endian spelled; stored little-endian u32
+MAGIC_V2 = 0x4B4E5532     # "KNU2" — output-bucket format (u16 OB in header)
 
 WHITE, BLACK = 0, 1
 
@@ -85,6 +86,19 @@ def feature_index(persp: int, color: int, ptype: int, sq: int) -> int:
     os = sq if persp == WHITE else (sq ^ 56)
     cr = 0 if color == persp else 1
     return cr * 384 + ptype * 64 + os
+
+
+def output_bucket(piece_count: int, nb: int) -> int:
+    """Output-bucket index from total piece count. MUST match C++ ob_index():
+    bucket = clamp((piece_count - 2) // 4, 0, nb-1). For nb==1 always 0."""
+    b = (piece_count - 2) // 4
+    return 0 if b < 0 else (nb - 1 if b > nb - 1 else b)
+
+
+def bucket_tensor(counts, nb: int):
+    """Vectorised output_bucket over a tensor of piece counts (floor div, clamped)."""
+    b = torch.div(counts - 2, 4, rounding_mode='floor')
+    return b.clamp_(0, nb - 1).long()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -186,31 +200,33 @@ def collate_fn(batch):
     if B > 1:
         np.cumsum(n[:-1], out=offsets[1:])
     off_t = torch.from_numpy(offsets)
+    counts_t = torch.from_numpy(np.ascontiguousarray(n))   # [B] piece counts
     return (torch.from_numpy(sf), off_t,
-            torch.from_numpy(nf), off_t.clone(), scores_t, results_t)
+            torch.from_numpy(nf), off_t.clone(), scores_t, results_t, counts_t)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Model — HL is a parameter; EXACT same architecture as before, just flexible.
 # ──────────────────────────────────────────────────────────────────────────────
 class NNUE(nn.Module):
-    def __init__(self, hl: int, squared: bool = False):
+    def __init__(self, hl: int, squared: bool = False, buckets: int = 1):
         super().__init__()
         self.hl = hl
         self.squared = squared  # SCReLU (clamp then square) vs CReLU
+        self.buckets = buckets  # output buckets by piece count (1 = legacy)
         # Feature transformer as a sparse EmbeddingBag (sum over active features).
         # ft.weight is [INPUT_SIZE, HL]; the equivalent dense Linear weight W1 is
         # [HL, INPUT_SIZE] == ft.weight.T (used by quantize()/export). The bias b1
         # is a separate parameter added after the bag sum.
         self.ft = nn.EmbeddingBag(INPUT_SIZE, hl, mode='sum')
         self.b1 = nn.Parameter(torch.zeros(hl))
-        # W2: [1, 2*HL]
-        self.l2 = nn.Linear(2 * hl, 1)
+        # W2: [buckets, 2*HL] — one output row per piece-count bucket.
+        self.l2 = nn.Linear(2 * hl, buckets)
         # Match the old nn.Linear default init scale so training dynamics/quant
         # ranges stay comparable.
         nn.init.kaiming_uniform_(self.ft.weight, a=5 ** 0.5)
 
-    def forward(self, s_idx, s_off, n_idx, n_off):
+    def forward(self, s_idx, s_off, n_idx, n_off, bucket):
         acc_stm = self.ft(s_idx, s_off) + self.b1
         acc_nst = self.ft(n_idx, n_off) + self.b1
         # Clipped ReLU in float domain: clamp to [0,1] (quant uses [0,QA]).
@@ -219,9 +235,11 @@ class NNUE(nn.Module):
         if self.squared:  # SCReLU: square the clamped activation
             c_stm = c_stm * c_stm
             c_nst = c_nst * c_nst
-        x = torch.cat([c_stm, c_nst], dim=1)   # stm first
-        # Output is the WIN-LOGIT y.  Float eval in cp == y * SCALE.
-        return self.l2(x).squeeze(1)            # [B]
+        x = torch.cat([c_stm, c_nst], dim=1)   # [B, 2*HL], stm first
+        out = self.l2(x)                       # [B, buckets] win-logits
+        # Select each sample's bucket. For buckets==1 this is column 0, identical
+        # to the old single-output net. Float eval in cp == y * SCALE.
+        return out.gather(1, bucket.view(-1, 1)).squeeze(1)  # [B]
 
     @torch.no_grad()
     def clip_weights(self):
@@ -241,17 +259,18 @@ class NNUE(nn.Module):
 # Quantized integer forward pass (pure numpy int math == the C++ contract).
 # ──────────────────────────────────────────────────────────────────────────────
 class QuantNet:
-    def __init__(self, W1q, b1q, W2q, b2q, hl: int, squared: bool = False):
+    def __init__(self, W1q, b1q, W2q, b2q, hl: int, squared: bool = False, buckets: int = 1):
         self.W1q = W1q.astype(np.int64)  # [HL, INPUT]
         self.b1q = b1q.astype(np.int64)  # [HL]
-        self.W2q = W2q.astype(np.int64)  # [2*HL]
-        self.b2q = int(b2q)
+        self.W2q = np.asarray(W2q).astype(np.int64).reshape(buckets, 2 * hl)  # [buckets, 2*HL]
+        self.b2q = np.asarray(b2q).astype(np.int64).reshape(buckets)          # [buckets]
         self.hl = hl
         self.squared = squared
+        self.buckets = buckets
         # SCReLU squares the [0,QA] activation, adding one factor of QA to scale.
         self.den = (QA * QA * QB) if squared else (QA * QB)
 
-    def eval_features(self, stm_feat_idx, nst_feat_idx) -> int:
+    def eval_features(self, stm_feat_idx, nst_feat_idx, bucket: int = 0) -> int:
         """Quantized eval in cp, STM POV. Mirrors the C++ integer inference."""
         acc_stm = self.b1q.copy()
         for c in stm_feat_idx:
@@ -265,8 +284,8 @@ class QuantNet:
             cr_stm = cr_stm * cr_stm
             cr_nst = cr_nst * cr_nst
         acc = np.concatenate([cr_stm, cr_nst])   # stm first
-        dot = int(np.dot(acc, self.W2q))
-        out = self.b2q + dot
+        dot = int(np.dot(acc, self.W2q[bucket]))
+        out = int(self.b2q[bucket]) + dot
         # Python floor division — matches the C++ floor-div snippet exactly.
         return int(out * SCALE // self.den)
 
@@ -277,7 +296,7 @@ class QuantNet:
         pieces = parse_fen_pieces(board)
         sf = [feature_index(stm, c, t, s) for (c, t, s) in pieces]
         nf = [feature_index(stm ^ 1, c, t, s) for (c, t, s) in pieces]
-        return self.eval_features(sf, nf)
+        return self.eval_features(sf, nf, output_bucket(len(pieces), self.buckets))
 
     def acc_range(self, stm_feat_idx, nst_feat_idx):
         """Pre-clamp accumulator range (to check int16 safety)."""
@@ -295,17 +314,18 @@ def quantize(model: NNUE):
     hl = model.hl
     # EmbeddingBag weight is [INPUT, HL]; the dense-equivalent W1 is its transpose
     # [HL, INPUT]. b1 is the separate bias parameter.
+    buckets = getattr(model, 'buckets', 1)
     W1 = model.ft.weight.detach().cpu().numpy().T   # [HL, INPUT]
     b1 = model.b1.detach().cpu().numpy()            # [HL]
-    W2 = model.l2.weight.detach().cpu().numpy()[0]  # [2*HL]
-    b2 = float(model.l2.bias.detach().cpu().numpy()[0])
+    W2 = model.l2.weight.detach().cpu().numpy()     # [buckets, 2*HL]
+    b2 = model.l2.bias.detach().cpu().numpy()       # [buckets]
 
     squared = getattr(model, 'squared', False)
     W1q = np.round(W1 * QA).astype(np.int32)
     b1q = np.round(b1 * QA).astype(np.int32)
-    W2q = np.round(W2 * QB).astype(np.int32)
+    W2q = np.round(W2 * QB).astype(np.int32)        # [buckets, 2*HL]
     # SCReLU's squared activation carries an extra QA factor into the output scale.
-    b2q = int(round(b2 * (QA * QA * QB if squared else QA * QB)))
+    b2q = np.round(b2 * (QA * QA * QB if squared else QA * QB)).astype(np.int64)  # [buckets]
 
     def chk(name, arr, lo, hi):
         amin, amax = int(arr.min()), int(arr.max())
@@ -319,7 +339,7 @@ def quantize(model: NNUE):
     W1q = np.clip(W1q, -32768, 32767).astype(np.int16)
     b1q = np.clip(b1q, -32768, 32767).astype(np.int16)
     W2q = np.clip(W2q, -32768, 32767).astype(np.int16)
-    return QuantNet(W1q, b1q, W2q, b2q, hl, squared), (W1q, b1q, W2q, b2q)
+    return QuantNet(W1q, b1q, W2q, b2q, hl, squared, buckets), (W1q, b1q, W2q, b2q)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -331,16 +351,29 @@ def quantize(model: NNUE):
 #   b2q:     int32
 # HL is written in the header — C++ reads it back at load time.
 # ──────────────────────────────────────────────────────────────────────────────
-def export_bin(path: str, hl: int, W1q, b1q, W2q, b2q):
+def export_bin(path: str, hl: int, W1q, b1q, W2q, b2q, buckets: int = 1):
+    W2a = np.ascontiguousarray(np.asarray(W2q).reshape(buckets, 2 * hl), dtype='<i2')
+    b2a = np.asarray(b2q).reshape(buckets).astype('<i4')
     with open(path, 'wb') as f:
-        f.write(struct.pack('<I', MAGIC))
-        f.write(struct.pack('<HHHH', hl, QA, QB, SCALE))
-        f.write(np.ascontiguousarray(W1q, dtype='<i2').tobytes())
-        f.write(np.ascontiguousarray(b1q, dtype='<i2').tobytes())
-        f.write(np.ascontiguousarray(W2q, dtype='<i2').tobytes())
-        f.write(struct.pack('<i', int(b2q)))
+        if buckets == 1:
+            # Legacy KNUE format — byte-identical to the original single-bucket net.
+            f.write(struct.pack('<I', MAGIC))
+            f.write(struct.pack('<HHHH', hl, QA, QB, SCALE))
+            f.write(np.ascontiguousarray(W1q, dtype='<i2').tobytes())
+            f.write(np.ascontiguousarray(b1q, dtype='<i2').tobytes())
+            f.write(W2a.tobytes())
+            f.write(struct.pack('<i', int(b2a[0])))
+            expected = 4 + 8 + hl * INPUT_SIZE * 2 + hl * 2 + 2 * hl * 2 + 4
+        else:
+            # KNU2 format — u16 OB after SCALE, W2[OB][2*HL] then b2[OB].
+            f.write(struct.pack('<I', MAGIC_V2))
+            f.write(struct.pack('<HHHHH', hl, QA, QB, SCALE, buckets))
+            f.write(np.ascontiguousarray(W1q, dtype='<i2').tobytes())
+            f.write(np.ascontiguousarray(b1q, dtype='<i2').tobytes())
+            f.write(W2a.tobytes())          # bucket-major [OB][2*HL]
+            f.write(b2a.tobytes())          # [OB] int32
+            expected = 4 + 10 + hl * INPUT_SIZE * 2 + hl * 2 + buckets * 2 * hl * 2 + buckets * 4
     size = Path(path).stat().st_size
-    expected = 4 + 8 + hl * INPUT_SIZE * 2 + hl * 2 + 2 * hl * 2 + 4
     print(f"[export] wrote {path}: {size} bytes (expected {expected})")
     assert size == expected, f"binary size mismatch: got {size}, expected {expected}"
 
@@ -485,6 +518,10 @@ def main():
     ap.add_argument('--lr', type=float, default=1e-3)
     ap.add_argument('--hl', type=int, default=512,
                     help='Hidden layer size per perspective (default 512)')
+    ap.add_argument('--buckets', type=int, default=1,
+                    help='Output buckets by piece count (default 1 = legacy single '
+                         'output, KNUE format). >1 writes the KNU2 format and needs '
+                         'the engine built with -DNNUE_OB=<n>.')
     ap.add_argument('--activation', choices=['crelu', 'screlu'], default='crelu',
                     help='Hidden activation: crelu (default) or screlu (squared). '
                          'screlu nets MUST be compiled with -DNNUE_SCRELU.')
@@ -533,12 +570,13 @@ def main():
     use_gpu = (device.type == 'cuda')
 
     squared = (args.activation == 'screlu')
-    model = NNUE(HL, squared=squared).to(device)
-    print(f"[model] activation={args.activation}")
+    model = NNUE(HL, squared=squared, buckets=args.buckets).to(device)
+    print(f"[model] activation={args.activation}  buckets={args.buckets}")
     n_params = sum(p.numel() for p in model.parameters())
-    print(f"[model] HL={HL}  params={n_params:,}  "
-          f"({n_params*4/1e6:.2f} MB float32)  "
-          f"export size={(4+8+HL*INPUT_SIZE*2+HL*2+2*HL*2+4)/1024:.1f} KB")
+    _hdr = 12 if args.buckets == 1 else 14
+    _sz = _hdr + HL*INPUT_SIZE*2 + HL*2 + args.buckets*2*HL*2 + args.buckets*4
+    print(f"[model] HL={HL}  buckets={args.buckets}  params={n_params:,}  "
+          f"({n_params*4/1e6:.2f} MB float32)  export size={_sz/1024:.1f} KB")
 
     opt = torch.optim.Adam(model.parameters(), lr=args.lr)
     sched = torch.optim.lr_scheduler.StepLR(opt, step_size=15, gamma=0.3)
@@ -568,7 +606,8 @@ def main():
                 for b in range(0, va_g.numel(), args.batch):
                     rows = va_g[b:b + args.batch]
                     si, so, ni, no = gpu_batch_inputs(sf_g, nf_g, len_g, rows, device)
-                    pred = torch.sigmoid(model(si, so, ni, no))
+                    bk = bucket_tensor(len_g[rows], args.buckets)
+                    pred = torch.sigmoid(model(si, so, ni, no, bk))
                     bs = rows.numel()
                     tot += loss_fn(pred, make_tgt(rows)).item() * bs
                     cnt += bs
@@ -584,7 +623,8 @@ def main():
             for b in range(0, order.numel(), args.batch):
                 rows = order[b:b + args.batch]
                 si, so, ni, no = gpu_batch_inputs(sf_g, nf_g, len_g, rows, device)
-                pred = torch.sigmoid(model(si, so, ni, no))
+                bk = bucket_tensor(len_g[rows], args.buckets)
+                pred = torch.sigmoid(model(si, so, ni, no, bk))
                 loss = loss_fn(pred, make_tgt(rows))
                 opt.zero_grad(); loss.backward(); opt.step()
                 model.clip_weights()
@@ -614,9 +654,10 @@ def main():
         def run_val():
             model.eval(); tot, cnt = 0.0, 0
             with torch.no_grad():
-                for si, so, ni, no, sc, rs in val_loader:
+                for si, so, ni, no, sc, rs, cnts in val_loader:
+                    bk = bucket_tensor(cnts.to(device), args.buckets)
                     pred = torch.sigmoid(model(si.to(device), so.to(device),
-                                               ni.to(device), no.to(device)))
+                                               ni.to(device), no.to(device), bk))
                     bs = sc.shape[0]
                     tot += loss_fn(pred, make_target(sc, rs)).item() * bs; cnt += bs
             model.train(); return tot / max(1, cnt)
@@ -628,9 +669,10 @@ def main():
             ep_loader = DataLoader(StreamingNNUEDataset(cache_path, ep_order),
                                    shuffle=False, **loader_kw)
             model.train(); ep_loss, ep_cnt = 0.0, 0
-            for si, so, ni, no, sc, rs in ep_loader:
+            for si, so, ni, no, sc, rs, cnts in ep_loader:
+                bk = bucket_tensor(cnts.to(device), args.buckets)
                 pred = torch.sigmoid(model(si.to(device), so.to(device),
-                                           ni.to(device), no.to(device)))
+                                           ni.to(device), no.to(device), bk))
                 loss = loss_fn(pred, make_target(sc, rs))
                 opt.zero_grad(); loss.backward(); opt.step(); model.clip_weights()
                 bs = sc.shape[0]; ep_loss += loss.item() * bs; ep_cnt += bs
@@ -650,7 +692,7 @@ def main():
     # ── Quantize + export ──
     qnet, (W1q, b1q, W2q, b2q) = quantize(model)
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
-    export_bin(args.out, HL, W1q, b1q, W2q, b2q)
+    export_bin(args.out, HL, W1q, b1q, W2q, b2q, args.buckets)
 
     # ── Float vs quant agreement on a validation subset ──
     model.eval()
@@ -660,9 +702,10 @@ def main():
     check_loader = DataLoader(check_ds, batch_size=check_n, shuffle=False,
                               collate_fn=collate_fn, num_workers=0)
     with torch.no_grad():
-        si, so, ni, no, _, _ = next(iter(check_loader))
+        si, so, ni, no, _, _, cnts = next(iter(check_loader))
+        bk = bucket_tensor(cnts.to(device), args.buckets)
         yf = model(si.to(device), so.to(device),
-                   ni.to(device), no.to(device)).cpu().numpy() * SCALE
+                   ni.to(device), no.to(device), bk).cpu().numpy() * SCALE
 
     mm = np.memmap(cache_path, dtype=RECORD_DTYPE, mode='r', shape=(total,))
     diffs = []
@@ -681,7 +724,7 @@ def main():
             sq = int(rec['squares'][j])
             sf.append(feature_index(stm, color, ptype, sq))
             nf.append(feature_index(stm ^ 1, color, ptype, sq))
-        q = qnet.eval_features(sf, nf)
+        q = qnet.eval_features(sf, nf, output_bucket(n_p, args.buckets))
         diffs.append(abs(q - float(yf[k])))
         lo, hi = qnet.acc_range(sf, nf)
         acc_lo = min(acc_lo, lo)

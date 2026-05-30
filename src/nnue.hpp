@@ -30,6 +30,25 @@ constexpr int QA    = 255;
 constexpr int QB    = 64;
 constexpr int SCALE = 400;
 
+// Output buckets (by total piece count). 1 = legacy single-bucket behaviour
+// (byte-identical to the original KNUE format). >1 selects a per-bucket output
+// layer (W2,b2) indexed by piece count — set at build time via -DNNUE_OB=<n>.
+#ifndef NNUE_OB
+constexpr int OB = 1;
+#else
+constexpr int OB = NNUE_OB;
+#endif
+
+// Output-bucket index from the total piece count (2..32, kings included).
+// MUST match the trainer EXACTLY: bucket = clamp((piece_count - 2) / 4, 0, OB-1).
+// For OB=1 this is always 0, so legacy nets are unaffected.
+inline int ob_index(int piece_count) {
+    int b = (piece_count - 2) / 4;
+    if (b < 0) b = 0;
+    if (b > OB - 1) b = OB - 1;
+    return b;
+}
+
 // Parse + validate the embedded net. Called once at startup. Idempotent.
 void init();
 
@@ -59,7 +78,8 @@ struct Accumulator {
 void refresh(Accumulator& acc, const Position& pos);
 
 // Run the output layer on a (already up-to-date) accumulator for the given stm.
-int evaluate_acc(const Accumulator& acc, Color stm);
+// piece_count (total pieces on the board, 2..32) selects the output bucket.
+int evaluate_acc(const Accumulator& acc, Color stm, int piece_count);
 
 // Add / subtract a single feature (a piece of color c, type t on square s) to
 // BOTH perspectives of the accumulator. Used by Position::put/remove_piece.

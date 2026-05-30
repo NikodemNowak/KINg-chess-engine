@@ -39,6 +39,14 @@ message(STATUS "KINg eval = ${EVAL}")
 set(NNUE_HL "512" CACHE STRING "NNUE accumulator hidden-layer size per perspective (default 512)")
 message(STATUS "KINg NNUE_HL = ${NNUE_HL}")
 
+# ── NNUE output buckets ───────────────────────────────────────────────────────
+# -DNNUE_OB=1 (default): legacy single output layer (KNUE format, byte-identical
+# to the original net). -DNNUE_OB=<n> selects a per-piece-count output layer and
+# requires a KNU2-format net trained with `--buckets <n>` (bucket =
+# clamp((piece_count-2)/4, 0, n-1)). 8 is the usual choice.
+set(NNUE_OB "1" CACHE STRING "NNUE output buckets by piece count (default 1 = legacy)")
+message(STATUS "KINg NNUE_OB = ${NNUE_OB}")
+
 # ── NNUE activation ───────────────────────────────────────────────────────────
 # -DNNUE_SCRELU=ON uses the squared clipped-ReLU activation (must match a net
 # trained with `--activation screlu`). Default ON: the committed king_nnue.bin is
@@ -70,6 +78,7 @@ set(EXTRA_SRC "")
 if(EVAL STREQUAL "NNUE")
   add_compile_definitions(EVAL_NNUE)
   add_compile_definitions(NNUE_HL=${NNUE_HL})
+  add_compile_definitions(NNUE_OB=${NNUE_OB})
   if(NNUE_SCRELU)
     add_compile_definitions(NNUE_SCRELU)
   endif()

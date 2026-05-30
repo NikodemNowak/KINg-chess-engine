@@ -41,11 +41,18 @@ namespace {
 // full retrain). All loops and array sizes below use HL, so changing the define
 // is sufficient — nothing here is hardcoded to 256.
 struct Net {
-    int16_t W1t[INPUT][HL]; // transposed: W1t[i][o] == W1q[o][i]
+    int16_t W1t[INPUT][HL];   // transposed: W1t[i][o] == W1q[o][i]
     int16_t b1[HL];
-    int16_t W2[2 * HL];     // [0..HL-1] stm perspective, [HL..2*HL-1] nonstm
-    int32_t b2;
+    int16_t W2[OB][2 * HL];   // per output bucket: [0..HL-1] stm, [HL..2*HL-1] nonstm
+    int32_t b2[OB];           // per output bucket bias
 };
+
+// Net binary magics. V1 (KNUE) is the legacy single-bucket format (12-byte
+// header). V2 (KNU2) adds a u16 OB field after SCALE (14-byte header) and stores
+// W2/b2 per output bucket. The loader accepts both; an OB=1 build only accepts V1
+// (and a V2 net with OB==1), so legacy nets remain byte-for-byte valid.
+constexpr uint32_t MAGIC_V1 = 0x4B4E5545u; // "KNUE"
+constexpr uint32_t MAGIC_V2 = 0x4B4E5532u; // "KNU2"
 
 // AVX2 loops in dot_half / acc_add / acc_sub process 16 int16s per iteration;
 // HL must be a multiple of 16 for them to be correct.
@@ -74,21 +81,34 @@ void init() {
     const unsigned char* p = king_nnue_data;
     const unsigned int   n = king_nnue_data_len;
 
-    // Header: magic(u32) HL(u16) QA(u16) QB(u16) SCALE(u16) = 12 bytes.
-    constexpr unsigned int kExpected =
-        12u + (unsigned)(HL * INPUT) * 2u + (unsigned)HL * 2u +
-        (unsigned)(2 * HL) * 2u + 4u; // 394768 at HL=256, 1573900 at HL=512
-    if (n != kExpected) std::abort();
-
+    // Header: magic(u32) HL(u16) QA(u16) QB(u16) SCALE(u16) [V2: OB(u16)].
     uint32_t magic = read_le<uint32_t>(p + 0);
     uint16_t hl    = read_le<uint16_t>(p + 4);
     uint16_t qa    = read_le<uint16_t>(p + 6);
     uint16_t qb    = read_le<uint16_t>(p + 8);
     uint16_t scale = read_le<uint16_t>(p + 10);
-    if (magic != 0x4B4E5545u) std::abort();
     if (hl != HL || qa != QA || qb != QB || scale != SCALE) std::abort();
 
-    unsigned int off = 12;
+    unsigned int off;
+    unsigned int ob;
+    if (magic == MAGIC_V1) {
+        // Legacy single-bucket format. Only valid for an OB=1 build.
+        if (OB != 1) std::abort();
+        ob  = 1;
+        off = 12;
+    } else if (magic == MAGIC_V2) {
+        ob = read_le<uint16_t>(p + 12);
+        if ((int)ob != OB) std::abort(); // header OB must match the compiled OB
+        off = 14;
+    } else {
+        std::abort();
+    }
+
+    // Validate total size for the resolved (header, OB).
+    const unsigned int expected =
+        off + (unsigned)(HL * INPUT) * 2u + (unsigned)HL * 2u +
+        (unsigned)(ob * 2 * HL) * 2u + (unsigned)ob * 4u;
+    if (n != expected) std::abort();
 
     // W1q is stored row-major [output o][input i] at flat o*INPUT + i.
     // Transpose into W1t[i][o].
@@ -99,8 +119,10 @@ void init() {
         }
 
     for (int o = 0; o < HL; ++o) { g_net.b1[o] = read_le<int16_t>(p + off); off += 2; }
-    for (int i = 0; i < 2 * HL; ++i) { g_net.W2[i] = read_le<int16_t>(p + off); off += 2; }
-    g_net.b2 = read_le<int32_t>(p + off); off += 4;
+    // W2: bucket-major [bucket][2*HL], stm-first within each bucket.
+    for (unsigned int bkt = 0; bkt < ob; ++bkt)
+        for (int i = 0; i < 2 * HL; ++i) { g_net.W2[bkt][i] = read_le<int16_t>(p + off); off += 2; }
+    for (unsigned int bkt = 0; bkt < ob; ++bkt) { g_net.b2[bkt] = read_le<int32_t>(p + off); off += 4; }
 
     g_loaded = true;
 }
@@ -234,12 +256,13 @@ static inline int64_t dot_half(const int16_t* a, const int16_t* w) {
 }
 
 // ── Output layer on an up-to-date accumulator ───────────────────────────────
-int evaluate_acc(const Accumulator& acc, Color stm) {
+int evaluate_acc(const Accumulator& acc, Color stm, int piece_count) {
     const Color nonstm = Color(!stm);
+    const int bkt = ob_index(piece_count);
     // stm perspective FIRST -> W2[0..HL-1]; nonstm -> W2[HL..2*HL-1].
-    int64_t sum = (int64_t)g_net.b2;
-    sum += dot_half(acc.v[stm],    g_net.W2);
-    sum += dot_half(acc.v[nonstm], g_net.W2 + HL);
+    int64_t sum = (int64_t)g_net.b2[bkt];
+    sum += dot_half(acc.v[stm],    g_net.W2[bkt]);
+    sum += dot_half(acc.v[nonstm], g_net.W2[bkt] + HL);
 
     // eval = floor( sum * SCALE / den ) with floor toward -inf (Python //).
     // SCReLU's squared activation carries an extra QA factor → den = QA*QA*QB.
@@ -299,7 +322,7 @@ void sub_feature(Accumulator& acc, Color c, PieceType t, Square s) {
 int evaluate_from_scratch(const Position& pos) {
     Accumulator acc;
     refresh(acc, pos);
-    return evaluate_acc(acc, pos.side_to_move());
+    return evaluate_acc(acc, pos.side_to_move(), popcount(pos.occupied()));
 }
 
 } // namespace nnue

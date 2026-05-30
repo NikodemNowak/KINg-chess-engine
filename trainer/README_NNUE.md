@@ -150,10 +150,30 @@ Expect agreement within a few centipawns (typically mean < 3 cp).
 
 ---
 
+## 3.3 Output buckets (optional, `--buckets N` / `-DNNUE_OB=N`)
+
+The output layer (`W2`, `b2`) can be specialised by **piece count**. With `N`
+buckets the net has `W2[N][2*HL]` and `b2[N]`; the bucket for a position is
+
+```
+bucket = clamp((piece_count - 2) // 4, 0, N-1)     # piece_count = total pieces (2..32)
+```
+
+computed identically in the trainer (`output_bucket`) and C++ (`ob_index`). `N=1`
+is the legacy single-output net and is byte-identical to the original format. The
+C++ inference must be built with the matching `-DNNUE_OB=N`.
+
 ## 4. Binary format — `nets/king_nnue.bin`
 
 Little-endian. `HL` is written in the header (read by the C++ loader at init).
 Default for new training runs: `HL = 512`, `INPUT = 768`.
+
+Two header variants:
+* **`KNUE`** (`0x4B4E5545`, legacy, single output) — 12-byte header
+  `magic,HL,QA,QB,SCALE`, then `W1q,b1q,W2q[2*HL],b2q(int32)`.
+* **`KNU2`** (`0x4B4E5532`, output buckets) — 14-byte header
+  `magic,HL,QA,QB,SCALE,OB`, then `W1q,b1q`, then `W2q[OB][2*HL]`
+  (bucket-major), then `b2q[OB]` (int32 each). Written when `--buckets > 1`.
 
 | Offset (bytes)        | Field      | Type            | Count       | Notes                                          |
 |-----------------------|------------|-----------------|-------------|------------------------------------------------|

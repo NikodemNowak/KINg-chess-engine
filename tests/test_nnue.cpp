@@ -34,7 +34,8 @@ static void nn_init() {
 
 // Eval read from the position's live (incremental) accumulator.
 static int incremental_eval(const Position& p) {
-    return nnue::evaluate_acc(p.accumulator(), p.side_to_move());
+    return nnue::evaluate_acc(p.accumulator(), p.side_to_move(),
+                              popcount(p.occupied()));
 }
 
 TEST_CASE("NNUE bit-exact: reproduces all sample evals") {

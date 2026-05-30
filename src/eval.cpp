@@ -486,8 +486,10 @@ int evaluate_hce(const Position& pos) {
 int evaluate(const Position& pos) {
 #ifdef EVAL_NNUE
     // Read the position's incremental accumulator (kept in sync by do/undo_move
-    // and refreshed in set_fen/copy_from). stm perspective first.
-    return nnue::evaluate_acc(pos.accumulator(), pos.side_to_move());
+    // and refreshed in set_fen/copy_from). stm perspective first; total piece
+    // count selects the NNUE output bucket.
+    return nnue::evaluate_acc(pos.accumulator(), pos.side_to_move(),
+                              popcount(pos.occupied()));
 #else
     return evaluate_hce(pos);
 #endif
