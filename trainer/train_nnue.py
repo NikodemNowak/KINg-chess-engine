@@ -55,6 +55,7 @@ QB = 64                   # output weight (W2) quantization scale
 SCALE = 400               # eval scale (cp), == sigmoid divisor
 MAGIC = 0x4B4E5545        # "KNUE" big-endian spelled; stored little-endian u32
 MAGIC_V2 = 0x4B4E5532     # "KNU2" — output-bucket format (u16 OB in header)
+MAGIC_V3 = 0x4B4E5533     # "KNU3" — king-bucket format (u16 OB, u16 KB in header)
 
 WHITE, BLACK = 0, 1
 
@@ -99,6 +100,62 @@ def bucket_tensor(counts, nb: int):
     """Vectorised output_bucket over a tensor of piece counts (floor div, clamped)."""
     b = torch.div(counts - 2, 4, rounding_mode='floor')
     return b.clamp_(0, nb - 1).long()
+
+
+def king_bucket_np(ksq, kb: int):
+    """King-square -> bucket (HalfKP-style). ksq is the ORIENTED own-king square
+    (0..63) for the perspective. Buckets primarily by king file-pair, then rank,
+    so kingside/queenside is always distinguished. MUST match the C++ side when
+    that is implemented. Supported kb: 1,4,8,16,32,64."""
+    if kb == 1:
+        return np.zeros_like(ksq)
+    if kb == 64:
+        return ksq.copy()
+    file2 = (ksq % 8) // 2          # 0..3 (file pair)
+    rank = ksq // 8                 # 0..7
+    if kb == 4:
+        return file2
+    if kb == 8:
+        return file2 + 4 * (rank // 4)
+    if kb == 16:
+        return file2 + 4 * (rank // 2)
+    if kb == 32:
+        return file2 + 4 * rank
+    raise ValueError(f"unsupported kbuckets={kb}")
+
+
+def king_bucket_scalar(oks: int, kb: int) -> int:
+    """Scalar king_bucket (matches king_bucket_np and the C++ king_bucket)."""
+    if kb == 1:
+        return 0
+    if kb == 64:
+        return oks
+    file2 = (oks % 8) // 2
+    rank = oks // 8
+    if kb == 4:
+        return file2
+    if kb == 8:
+        return file2 + 4 * (rank // 4)
+    if kb == 16:
+        return file2 + 4 * (rank // 2)
+    if kb == 32:
+        return file2 + 4 * rank
+    raise ValueError(f"unsupported kbuckets={kb}")
+
+
+def piece_features(pieces, persp: int, kb: int):
+    """King-bucketed feature indices for `pieces` (list of (color,ptype,sq)) from
+    perspective `persp`. The bucket uses persp's OWN king square. kb=1 → plain 768."""
+    king_sq = next(sq for (c, t, sq) in pieces if t == 5 and c == persp)
+    oks = king_sq if persp == WHITE else (king_sq ^ 56)
+    kbk = king_bucket_scalar(oks, kb)
+    base = kbk * INPUT_SIZE
+    out = []
+    for (c, t, sq) in pieces:
+        os = sq if persp == WHITE else (sq ^ 56)
+        cr = 0 if c == persp else 1
+        out.append(base + cr * 384 + t * 64 + os)
+    return out
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -209,16 +266,17 @@ def collate_fn(batch):
 # Model — HL is a parameter; EXACT same architecture as before, just flexible.
 # ──────────────────────────────────────────────────────────────────────────────
 class NNUE(nn.Module):
-    def __init__(self, hl: int, squared: bool = False, buckets: int = 1):
+    def __init__(self, hl: int, squared: bool = False, buckets: int = 1, kbuckets: int = 1):
         super().__init__()
         self.hl = hl
         self.squared = squared  # SCReLU (clamp then square) vs CReLU
         self.buckets = buckets  # output buckets by piece count (1 = legacy)
+        self.kbuckets = kbuckets  # king-square input buckets (1 = none / plain 768)
         # Feature transformer as a sparse EmbeddingBag (sum over active features).
-        # ft.weight is [INPUT_SIZE, HL]; the equivalent dense Linear weight W1 is
-        # [HL, INPUT_SIZE] == ft.weight.T (used by quantize()/export). The bias b1
-        # is a separate parameter added after the bag sum.
-        self.ft = nn.EmbeddingBag(INPUT_SIZE, hl, mode='sum')
+        # Input space is kbuckets*768 (king-bucketed HalfKP-style); kbuckets=1 is the
+        # plain 768. ft.weight is [kbuckets*768, HL]; dense-equivalent W1 is its
+        # transpose. b1 is a separate bias added after the bag sum.
+        self.ft = nn.EmbeddingBag(kbuckets * INPUT_SIZE, hl, mode='sum')
         self.b1 = nn.Parameter(torch.zeros(hl))
         # W2: [buckets, 2*HL] — one output row per piece-count bucket.
         self.l2 = nn.Linear(2 * hl, buckets)
@@ -259,14 +317,16 @@ class NNUE(nn.Module):
 # Quantized integer forward pass (pure numpy int math == the C++ contract).
 # ──────────────────────────────────────────────────────────────────────────────
 class QuantNet:
-    def __init__(self, W1q, b1q, W2q, b2q, hl: int, squared: bool = False, buckets: int = 1):
-        self.W1q = W1q.astype(np.int64)  # [HL, INPUT]
+    def __init__(self, W1q, b1q, W2q, b2q, hl: int, squared: bool = False,
+                 buckets: int = 1, kbuckets: int = 1):
+        self.W1q = W1q.astype(np.int64)  # [HL, kbuckets*INPUT]
         self.b1q = b1q.astype(np.int64)  # [HL]
         self.W2q = np.asarray(W2q).astype(np.int64).reshape(buckets, 2 * hl)  # [buckets, 2*HL]
         self.b2q = np.asarray(b2q).astype(np.int64).reshape(buckets)          # [buckets]
         self.hl = hl
         self.squared = squared
         self.buckets = buckets
+        self.kbuckets = kbuckets
         # SCReLU squares the [0,QA] activation, adding one factor of QA to scale.
         self.den = (QA * QA * QB) if squared else (QA * QB)
 
@@ -294,8 +354,8 @@ class QuantNet:
         board = fields[0]
         stm = WHITE if fields[1] == 'w' else BLACK
         pieces = parse_fen_pieces(board)
-        sf = [feature_index(stm, c, t, s) for (c, t, s) in pieces]
-        nf = [feature_index(stm ^ 1, c, t, s) for (c, t, s) in pieces]
+        sf = piece_features(pieces, stm, self.kbuckets)
+        nf = piece_features(pieces, stm ^ 1, self.kbuckets)
         return self.eval_features(sf, nf, output_bucket(len(pieces), self.buckets))
 
     def acc_range(self, stm_feat_idx, nst_feat_idx):
@@ -315,7 +375,8 @@ def quantize(model: NNUE):
     # EmbeddingBag weight is [INPUT, HL]; the dense-equivalent W1 is its transpose
     # [HL, INPUT]. b1 is the separate bias parameter.
     buckets = getattr(model, 'buckets', 1)
-    W1 = model.ft.weight.detach().cpu().numpy().T   # [HL, INPUT]
+    kbuckets = getattr(model, 'kbuckets', 1)
+    W1 = model.ft.weight.detach().cpu().numpy().T   # [HL, kbuckets*INPUT]
     b1 = model.b1.detach().cpu().numpy()            # [HL]
     W2 = model.l2.weight.detach().cpu().numpy()     # [buckets, 2*HL]
     b2 = model.l2.bias.detach().cpu().numpy()       # [buckets]
@@ -339,7 +400,8 @@ def quantize(model: NNUE):
     W1q = np.clip(W1q, -32768, 32767).astype(np.int16)
     b1q = np.clip(b1q, -32768, 32767).astype(np.int16)
     W2q = np.clip(W2q, -32768, 32767).astype(np.int16)
-    return QuantNet(W1q, b1q, W2q, b2q, hl, squared, buckets), (W1q, b1q, W2q, b2q)
+    return (QuantNet(W1q, b1q, W2q, b2q, hl, squared, buckets, kbuckets),
+            (W1q, b1q, W2q, b2q))
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -351,28 +413,36 @@ def quantize(model: NNUE):
 #   b2q:     int32
 # HL is written in the header — C++ reads it back at load time.
 # ──────────────────────────────────────────────────────────────────────────────
-def export_bin(path: str, hl: int, W1q, b1q, W2q, b2q, buckets: int = 1):
+def export_bin(path: str, hl: int, W1q, b1q, W2q, b2q, buckets: int = 1, kbuckets: int = 1):
+    ftin = kbuckets * INPUT_SIZE
+    W1b = np.ascontiguousarray(W1q, dtype='<i2')                            # [HL, ftin]
+    b1b = np.ascontiguousarray(b1q, dtype='<i2')                            # [HL]
     W2a = np.ascontiguousarray(np.asarray(W2q).reshape(buckets, 2 * hl), dtype='<i2')
     b2a = np.asarray(b2q).reshape(buckets).astype('<i4')
     with open(path, 'wb') as f:
-        if buckets == 1:
-            # Legacy KNUE format — byte-identical to the original single-bucket net.
-            f.write(struct.pack('<I', MAGIC))
-            f.write(struct.pack('<HHHH', hl, QA, QB, SCALE))
-            f.write(np.ascontiguousarray(W1q, dtype='<i2').tobytes())
-            f.write(np.ascontiguousarray(b1q, dtype='<i2').tobytes())
-            f.write(W2a.tobytes())
-            f.write(struct.pack('<i', int(b2a[0])))
-            expected = 4 + 8 + hl * INPUT_SIZE * 2 + hl * 2 + 2 * hl * 2 + 4
-        else:
+        if kbuckets > 1:
+            # KNU3 — u16 OB then u16 KB after SCALE; W1 is [HL, KB*768].
+            f.write(struct.pack('<I', MAGIC_V3))
+            f.write(struct.pack('<HHHHHH', hl, QA, QB, SCALE, buckets, kbuckets))
+            f.write(W1b.tobytes()); f.write(b1b.tobytes())
+            f.write(W2a.tobytes()); f.write(b2a.tobytes())
+            expected = 4 + 12 + hl * ftin * 2 + hl * 2 + buckets * 2 * hl * 2 + buckets * 4
+        elif buckets > 1:
             # KNU2 format — u16 OB after SCALE, W2[OB][2*HL] then b2[OB].
             f.write(struct.pack('<I', MAGIC_V2))
             f.write(struct.pack('<HHHHH', hl, QA, QB, SCALE, buckets))
-            f.write(np.ascontiguousarray(W1q, dtype='<i2').tobytes())
-            f.write(np.ascontiguousarray(b1q, dtype='<i2').tobytes())
+            f.write(W1b.tobytes()); f.write(b1b.tobytes())
             f.write(W2a.tobytes())          # bucket-major [OB][2*HL]
             f.write(b2a.tobytes())          # [OB] int32
             expected = 4 + 10 + hl * INPUT_SIZE * 2 + hl * 2 + buckets * 2 * hl * 2 + buckets * 4
+        else:
+            # Legacy KNUE format — byte-identical to the original single-bucket net.
+            f.write(struct.pack('<I', MAGIC))
+            f.write(struct.pack('<HHHH', hl, QA, QB, SCALE))
+            f.write(W1b.tobytes()); f.write(b1b.tobytes())
+            f.write(W2a.tobytes())
+            f.write(struct.pack('<i', int(b2a[0])))
+            expected = 4 + 8 + hl * INPUT_SIZE * 2 + hl * 2 + 2 * hl * 2 + 4
     size = Path(path).stat().st_size
     print(f"[export] wrote {path}: {size} bytes (expected {expected})")
     assert size == expected, f"binary size mismatch: got {size}, expected {expected}"
@@ -437,12 +507,13 @@ def _rss_gb() -> float:
 # ──────────────────────────────────────────────────────────────────────────────
 MAXP = 32  # max pieces per position (record layout)
 
-def build_gpu_dataset(cache_path: str, total: int, device):
+def build_gpu_dataset(cache_path: str, total: int, device, kb: int = 1):
     # Disk-cache the padded feature tensors (feature-only → reusable across ALL
     # trainings on this data cache, regardless of HL/activation/lambda). First run
     # builds + saves (~60s); later runs load (~15s) so the GPU never idles on a
-    # rebuild during a sweep.
-    npz = cache_path + ".gpures.npz"
+    # rebuild during a sweep. King-bucket runs (kb>1) cache separately since their
+    # feature indices carry the king-bucket offset.
+    npz = cache_path + (".gpures.npz" if kb == 1 else f".gpures_kb{kb}.npz")
     if Path(npz).exists() and Path(npz).stat().st_size > 0:
         print(f"[data] loading cached GPU tensors from {npz}")
         d = np.load(npz)
@@ -467,10 +538,22 @@ def build_gpu_dataset(cache_path: str, total: int, device):
         color = ((pieces >> 4) & 1).astype(np.int64)
         ptype = (pieces & 0x0F).astype(np.int64)
         os_s = np.where(stm == WHITE, squares, squares ^ 56)
-        sf_pad[lo:hi] = ((color != stm).astype(np.int64) * 384 + ptype * 64 + os_s).astype(np.int16)
+        sf = (color != stm).astype(np.int64) * 384 + ptype * 64 + os_s
         nstm = stm ^ 1
         os_n = np.where(nstm == WHITE, squares, squares ^ 56)
-        nf_pad[lo:hi] = ((color != nstm).astype(np.int64) * 384 + ptype * 64 + os_n).astype(np.int16)
+        nf = (color != nstm).astype(np.int64) * 384 + ptype * 64 + os_n
+        if kb > 1:
+            # King-bucket offset: each perspective's features shift by
+            # king_bucket(own oriented king square) * 768.
+            stm1 = rec['stm'].astype(np.int64)                            # [c]
+            wk = (squares * ((color == 0) & (ptype == 5))).sum(axis=1)    # [c] white king sq
+            bk = (squares * ((color == 1) & (ptype == 5))).sum(axis=1)    # [c] black king sq
+            ok_s = np.where(stm1 == WHITE, wk, bk ^ 56)                   # oriented own king (stm)
+            ok_n = np.where((stm1 ^ 1) == WHITE, wk, bk ^ 56)            # oriented own king (nstm)
+            sf = sf + (king_bucket_np(ok_s, kb) * INPUT_SIZE)[:, None]
+            nf = nf + (king_bucket_np(ok_n, kb) * INPUT_SIZE)[:, None]
+        sf_pad[lo:hi] = sf.astype(np.int16)
+        nf_pad[lo:hi] = nf.astype(np.int16)
         lengths[lo:hi] = rec['n'].astype(np.int64)
         scores[lo:hi]  = rec['score'].astype(np.float32)
         results[lo:hi] = rec['result'].astype(np.float32)
@@ -522,6 +605,10 @@ def main():
                     help='Output buckets by piece count (default 1 = legacy single '
                          'output, KNUE format). >1 writes the KNU2 format and needs '
                          'the engine built with -DNNUE_OB=<n>.')
+    ap.add_argument('--kbuckets', type=int, default=1,
+                    help='King-square input buckets (HalfKP-style, default 1 = plain '
+                         '768). >1 is an experiment: trains + reports val loss, but '
+                         'skips quantize/export until the C++ side supports it.')
     ap.add_argument('--activation', choices=['crelu', 'screlu'], default='crelu',
                     help='Hidden activation: crelu (default) or screlu (squared). '
                          'screlu nets MUST be compiled with -DNNUE_SCRELU.')
@@ -568,15 +655,22 @@ def main():
     print(f"[data] train={len(train_idx):,}  val={n_val:,}")
 
     use_gpu = (device.type == 'cuda')
+    if args.kbuckets > 1 and not use_gpu:
+        print("[error] king buckets (--kbuckets>1) are implemented only in the "
+              "GPU-resident path; run on CUDA (the CPU DataLoader collate does not "
+              "add the king-bucket offset).")
+        sys.exit(1)
 
     squared = (args.activation == 'screlu')
-    model = NNUE(HL, squared=squared, buckets=args.buckets).to(device)
-    print(f"[model] activation={args.activation}  buckets={args.buckets}")
+    model = NNUE(HL, squared=squared, buckets=args.buckets, kbuckets=args.kbuckets).to(device)
+    print(f"[model] activation={args.activation}  buckets={args.buckets}  kbuckets={args.kbuckets}")
     n_params = sum(p.numel() for p in model.parameters())
-    _hdr = 12 if args.buckets == 1 else 14
-    _sz = _hdr + HL*INPUT_SIZE*2 + HL*2 + args.buckets*2*HL*2 + args.buckets*4
-    print(f"[model] HL={HL}  buckets={args.buckets}  params={n_params:,}  "
-          f"({n_params*4/1e6:.2f} MB float32)  export size={_sz/1024:.1f} KB")
+    _hdr = 16 if args.kbuckets > 1 else (14 if args.buckets > 1 else 12)
+    _sz = (_hdr + HL * args.kbuckets * INPUT_SIZE * 2 + HL * 2
+           + args.buckets * 2 * HL * 2 + args.buckets * 4)
+    print(f"[model] HL={HL}  buckets={args.buckets}  kbuckets={args.kbuckets}  "
+          f"params={n_params:,}  ({n_params*4/1e6:.2f} MB float32)  "
+          f"export size={_sz/1024:.1f} KB")
 
     opt = torch.optim.Adam(model.parameters(), lr=args.lr)
     sched = torch.optim.lr_scheduler.StepLR(opt, step_size=15, gamma=0.3)
@@ -589,7 +683,7 @@ def main():
         # ── GPU-resident path: whole dataset on the GPU, no CPU dataloader ────
         print("[data] building GPU-resident dataset (one-time) ...")
         t_b = time.time()
-        sf_g, nf_g, len_g, sc_g, rs_g = build_gpu_dataset(cache_path, total, device)
+        sf_g, nf_g, len_g, sc_g, rs_g = build_gpu_dataset(cache_path, total, device, args.kbuckets)
         tr_g = torch.from_numpy(train_idx).to(device)
         va_g = torch.from_numpy(val_idx).to(device)
         gb = (sf_g.numel()*2 + nf_g.numel()*2 + len_g.numel()*8
@@ -692,7 +786,7 @@ def main():
     # ── Quantize + export ──
     qnet, (W1q, b1q, W2q, b2q) = quantize(model)
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
-    export_bin(args.out, HL, W1q, b1q, W2q, b2q, args.buckets)
+    export_bin(args.out, HL, W1q, b1q, W2q, b2q, args.buckets, args.kbuckets)
 
     # ── Float vs quant agreement on a validation subset ──
     model.eval()
@@ -716,14 +810,10 @@ def main():
         rec = mm[pi]
         stm = int(rec['stm'])
         n_p = int(rec['n'])
-        sf, nf = [], []
-        for j in range(n_p):
-            p = int(rec['pieces'][j])
-            color = (p >> 4) & 1
-            ptype = p & 0x0F
-            sq = int(rec['squares'][j])
-            sf.append(feature_index(stm, color, ptype, sq))
-            nf.append(feature_index(stm ^ 1, color, ptype, sq))
+        pcs = [((int(rec['pieces'][j]) >> 4) & 1, int(rec['pieces'][j]) & 0x0F,
+                int(rec['squares'][j])) for j in range(n_p)]
+        sf = piece_features(pcs, stm, args.kbuckets)
+        nf = piece_features(pcs, stm ^ 1, args.kbuckets)
         q = qnet.eval_features(sf, nf, output_bucket(n_p, args.buckets))
         diffs.append(abs(q - float(yf[k])))
         lo, hi = qnet.acc_range(sf, nf)

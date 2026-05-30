@@ -49,6 +49,32 @@ inline int ob_index(int piece_count) {
     return b;
 }
 
+// King-square INPUT buckets (HalfKP-style). 1 = plain 768 inputs (no king
+// dependence, byte-identical to legacy). >1 makes each perspective's features
+// depend on its OWN king square — the input space becomes KB*768. Set at build
+// time via -DNNUE_KB=<n>.
+#ifndef NNUE_KB
+constexpr int KB = 1;
+#else
+constexpr int KB = NNUE_KB;
+#endif
+constexpr int FT_IN = KB * INPUT; // feature-transformer input dimension
+
+// King-square -> bucket. `oks` is the ORIENTED own-king square (0..63) of the
+// perspective. MUST match the trainer's king_bucket_np EXACTLY. For KB=1 this is
+// always 0 (king-independent). Supported KB: 1,4,8,16,32,64.
+inline int king_bucket(int oks) {
+    if (KB == 1)  return 0;
+    if (KB == 64) return oks;
+    int file2 = (oks % 8) / 2;   // 0..3 (file pair)
+    int rank  = oks / 8;         // 0..7
+    if (KB == 4)  return file2;
+    if (KB == 8)  return file2 + 4 * (rank / 4);
+    if (KB == 16) return file2 + 4 * (rank / 2);
+    if (KB == 32) return file2 + 4 * rank;
+    return 0; // unreachable for supported KB
+}
+
 // Parse + validate the embedded net. Called once at startup. Idempotent.
 void init();
 
@@ -58,11 +84,15 @@ void init();
 // the side-to-move POV, same convention as the HCE evaluate().
 int evaluate_from_scratch(const Position& pos);
 
-// Feature index for (color c, type t, square s) from perspective P.
-inline int feature_index(Color c, PieceType t, Square s, Color P) {
-    int os = (P == WHITE) ? int(s) : (int(s) ^ 56);
-    int cr = (c == P) ? 0 : 1;
-    return cr * 384 + int(t) * 64 + os;
+// Feature index for (color c, type t, square s) from perspective P, given the
+// square of P's OWN king (kingP). For KB=1 the king term is 0 → identical to the
+// legacy index. MUST match the trainer's feature_index + king bucket exactly.
+inline int feature_index(Color c, PieceType t, Square s, Color P, Square kingP) {
+    int oks = (P == WHITE) ? int(kingP) : (int(kingP) ^ 56);
+    int kb  = king_bucket(oks);
+    int os  = (P == WHITE) ? int(s) : (int(s) ^ 56);
+    int cr  = (c == P) ? 0 : 1;
+    return kb * INPUT + cr * 384 + int(t) * 64 + os;
 }
 
 // ── Incremental accumulator ───────────────────────────────────────────────
@@ -82,9 +112,12 @@ void refresh(Accumulator& acc, const Position& pos);
 int evaluate_acc(const Accumulator& acc, Color stm, int piece_count);
 
 // Add / subtract a single feature (a piece of color c, type t on square s) to
-// BOTH perspectives of the accumulator. Used by Position::put/remove_piece.
-void add_feature(Accumulator& acc, Color c, PieceType t, Square s);
-void sub_feature(Accumulator& acc, Color c, PieceType t, Square s);
+// BOTH perspectives of the accumulator. wking/bking are the White/Black king
+// squares (the per-perspective bucket determinants). Used by Position::put/
+// remove_piece (which pass the position's tracked king squares so the call is
+// valid even mid-move; king moves trigger a full refresh afterwards).
+void add_feature(Accumulator& acc, Color c, PieceType t, Square s, Square wking, Square bking);
+void sub_feature(Accumulator& acc, Color c, PieceType t, Square s, Square wking, Square bking);
 
 } // namespace nnue
 } // namespace king

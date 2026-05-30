@@ -47,6 +47,14 @@ message(STATUS "KINg NNUE_HL = ${NNUE_HL}")
 set(NNUE_OB "1" CACHE STRING "NNUE output buckets by piece count (default 1 = legacy)")
 message(STATUS "KINg NNUE_OB = ${NNUE_OB}")
 
+# ── NNUE king-square input buckets (HalfKP-style) ─────────────────────────────
+# -DNNUE_KB=1 (default): plain 768 inputs (king-independent). -DNNUE_KB=<n>
+# makes each perspective's features depend on its own king square (input space =
+# n*768) and requires a KNU3-format net trained with `--kbuckets <n>`. King moves
+# trigger a full accumulator refresh. Supported: 1,4,8,16,32,64.
+set(NNUE_KB "1" CACHE STRING "NNUE king-square input buckets (default 1 = none)")
+message(STATUS "KINg NNUE_KB = ${NNUE_KB}")
+
 # ── NNUE activation ───────────────────────────────────────────────────────────
 # -DNNUE_SCRELU=ON uses the squared clipped-ReLU activation (must match a net
 # trained with `--activation screlu`). Default ON: the committed king_nnue.bin is
@@ -79,6 +87,7 @@ if(EVAL STREQUAL "NNUE")
   add_compile_definitions(EVAL_NNUE)
   add_compile_definitions(NNUE_HL=${NNUE_HL})
   add_compile_definitions(NNUE_OB=${NNUE_OB})
+  add_compile_definitions(NNUE_KB=${NNUE_KB})
   if(NNUE_SCRELU)
     add_compile_definitions(NNUE_SCRELU)
   endif()

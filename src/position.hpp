@@ -118,6 +118,11 @@ private:
     std::vector<uint64_t> hist_; // Zobrist key history for repetition detection
 
 #ifdef EVAL_NNUE
+    // Tracked king squares — the per-perspective NNUE bucket determinants. Kept
+    // == king_sq(c) when the board is settled; they give the incremental feature
+    // updates a valid square even mid-move (king moves do a full refresh after).
+    // Maintained in set_fen / copy_from / do_move / undo_move.
+    Square ksq_[2] = { E1, E8 };
     nnue::Accumulator acc_{}; // live accumulator (see accumulator())
 #endif
 };

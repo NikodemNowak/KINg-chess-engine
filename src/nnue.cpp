@@ -41,18 +41,19 @@ namespace {
 // full retrain). All loops and array sizes below use HL, so changing the define
 // is sufficient — nothing here is hardcoded to 256.
 struct Net {
-    int16_t W1t[INPUT][HL];   // transposed: W1t[i][o] == W1q[o][i]
+    int16_t W1t[FT_IN][HL];   // transposed: W1t[i][o] == W1q[o][i]; FT_IN = KB*768
     int16_t b1[HL];
     int16_t W2[OB][2 * HL];   // per output bucket: [0..HL-1] stm, [HL..2*HL-1] nonstm
     int32_t b2[OB];           // per output bucket bias
 };
 
-// Net binary magics. V1 (KNUE) is the legacy single-bucket format (12-byte
-// header). V2 (KNU2) adds a u16 OB field after SCALE (14-byte header) and stores
-// W2/b2 per output bucket. The loader accepts both; an OB=1 build only accepts V1
-// (and a V2 net with OB==1), so legacy nets remain byte-for-byte valid.
+// Net binary magics. V1 (KNUE) legacy single-bucket (12-byte header). V2 (KNU2)
+// adds a u16 OB after SCALE (14-byte header). V3 (KNU3) adds u16 OB then u16 KB
+// (16-byte header) for king-bucketed (HalfKP-style) inputs. The loader accepts
+// all three; a KB=1,OB=1 build still accepts the legacy V1 byte-for-byte.
 constexpr uint32_t MAGIC_V1 = 0x4B4E5545u; // "KNUE"
 constexpr uint32_t MAGIC_V2 = 0x4B4E5532u; // "KNU2"
+constexpr uint32_t MAGIC_V3 = 0x4B4E5533u; // "KNU3"
 
 // AVX2 loops in dot_half / acc_add / acc_sub process 16 int16s per iteration;
 // HL must be a multiple of 16 for them to be correct.
@@ -91,29 +92,36 @@ void init() {
 
     unsigned int off;
     unsigned int ob;
+    unsigned int kb;
     if (magic == MAGIC_V1) {
-        // Legacy single-bucket format. Only valid for an OB=1 build.
-        if (OB != 1) std::abort();
-        ob  = 1;
-        off = 12;
+        // Legacy single-bucket format. Only valid for an OB=1, KB=1 build.
+        if (OB != 1 || KB != 1) std::abort();
+        ob = 1; kb = 1; off = 12;
     } else if (magic == MAGIC_V2) {
+        if (KB != 1) std::abort();
         ob = read_le<uint16_t>(p + 12);
-        if ((int)ob != OB) std::abort(); // header OB must match the compiled OB
-        off = 14;
+        if ((int)ob != OB) std::abort();
+        kb = 1; off = 14;
+    } else if (magic == MAGIC_V3) {
+        ob = read_le<uint16_t>(p + 12);
+        kb = read_le<uint16_t>(p + 14);
+        if ((int)ob != OB || (int)kb != KB) std::abort(); // must match compiled OB/KB
+        off = 16;
     } else {
         std::abort();
     }
 
-    // Validate total size for the resolved (header, OB).
+    // Validate total size for the resolved (header, OB, KB).
+    const unsigned int ftin = kb * (unsigned)INPUT;
     const unsigned int expected =
-        off + (unsigned)(HL * INPUT) * 2u + (unsigned)HL * 2u +
+        off + (unsigned)(HL * ftin) * 2u + (unsigned)HL * 2u +
         (unsigned)(ob * 2 * HL) * 2u + (unsigned)ob * 4u;
     if (n != expected) std::abort();
 
-    // W1q is stored row-major [output o][input i] at flat o*INPUT + i.
+    // W1q is stored row-major [output o][input i] at flat o*FT_IN + i.
     // Transpose into W1t[i][o].
     for (int o = 0; o < HL; ++o)
-        for (int i = 0; i < INPUT; ++i) {
+        for (int i = 0; i < FT_IN; ++i) {
             g_net.W1t[i][o] = read_le<int16_t>(p + off);
             off += 2;
         }
@@ -281,6 +289,10 @@ int evaluate_acc(const Accumulator& acc, Color stm, int piece_count) {
 // ── Accumulator maintenance ─────────────────────────────────────────────────
 void refresh(Accumulator& acc, const Position& pos) {
     if (!g_loaded) init(); // lazy safety net: refresh is the single choke point
+    // refresh is only called on a SETTLED board, so the live king squares are
+    // valid and are the correct per-perspective bucket determinants.
+    const Square wking = pos.king_sq(WHITE);
+    const Square bking = pos.king_sq(BLACK);
     // Start both perspectives at the bias.
     for (int c = 0; c < COLOR_NB; ++c)
         std::memcpy(acc.v[c], g_net.b1, sizeof(g_net.b1));
@@ -291,7 +303,7 @@ void refresh(Accumulator& acc, const Position& pos) {
             Bitboard bb = pos.pieces((Color)c, (PieceType)pt);
             while (bb) {
                 Square s = pop_lsb(bb);
-                add_feature(acc, (Color)c, (PieceType)pt, s);
+                add_feature(acc, (Color)c, (PieceType)pt, s, wking, bking);
             }
         }
 }
@@ -304,16 +316,16 @@ static inline void acc_add(int16_t* dst, const int16_t* col) { s_acc_add(dst, co
 // dst[o] -= col[o] over HL int16s.
 static inline void acc_sub(int16_t* dst, const int16_t* col) { s_acc_sub(dst, col); }
 
-void add_feature(Accumulator& acc, Color c, PieceType t, Square s) {
-    const int iw = feature_index(c, t, s, WHITE);
-    const int ib = feature_index(c, t, s, BLACK);
+void add_feature(Accumulator& acc, Color c, PieceType t, Square s, Square wking, Square bking) {
+    const int iw = feature_index(c, t, s, WHITE, wking);
+    const int ib = feature_index(c, t, s, BLACK, bking);
     acc_add(acc.v[WHITE], g_net.W1t[iw]);
     acc_add(acc.v[BLACK], g_net.W1t[ib]);
 }
 
-void sub_feature(Accumulator& acc, Color c, PieceType t, Square s) {
-    const int iw = feature_index(c, t, s, WHITE);
-    const int ib = feature_index(c, t, s, BLACK);
+void sub_feature(Accumulator& acc, Color c, PieceType t, Square s, Square wking, Square bking) {
+    const int iw = feature_index(c, t, s, WHITE, wking);
+    const int ib = feature_index(c, t, s, BLACK, bking);
     acc_sub(acc.v[WHITE], g_net.W1t[iw]);
     acc_sub(acc.v[BLACK], g_net.W1t[ib]);
 }

@@ -41,7 +41,7 @@ void Position::put_piece(Piece p, Square s) {
     by_color_[color_of(p)]  |= square_bb(s);
     key_ ^= zobrist::psq[p][s];
 #ifdef EVAL_NNUE
-    nnue::add_feature(acc_, color_of(p), piece_type(p), s);
+    nnue::add_feature(acc_, color_of(p), piece_type(p), s, ksq_[WHITE], ksq_[BLACK]);
 #endif
 }
 
@@ -53,7 +53,7 @@ void Position::remove_piece(Square s) {
     board_[s] = NO_PIECE;
     key_ ^= zobrist::psq[p][s];
 #ifdef EVAL_NNUE
-    nnue::sub_feature(acc_, color_of(p), piece_type(p), s);
+    nnue::sub_feature(acc_, color_of(p), piece_type(p), s, ksq_[WHITE], ksq_[BLACK]);
 #endif
 }
 
@@ -98,7 +98,10 @@ void Position::copy_from(const Position& o) {
     st_ = &root_;
 
 #ifdef EVAL_NNUE
-    // Rebuild the clone's accumulator from its (now-copied) board.
+    // Rebuild the clone's accumulator from its (now-copied) board. Track the
+    // king squares first (the incremental updates after this need them).
+    ksq_[WHITE] = king_sq(WHITE);
+    ksq_[BLACK] = king_sq(BLACK);
     nnue::refresh(acc_, *this);
 #endif
 }
@@ -179,6 +182,17 @@ void Position::do_move(Move m, StateInfo& st) {
     key_ ^= zobrist::side;
     if (us == BLACK) fullmove_++;
 
+#ifdef EVAL_NNUE
+    // A king move (incl. castling — pc is the king) shifts the moving side's king
+    // bucket, so its whole perspective changes. Track the new king square; for
+    // king-bucketed nets rebuild the accumulator from scratch (the incremental
+    // updates above used the stale-but-valid king square and are overwritten).
+    if (piece_type(pc) == KING) {
+        ksq_[us] = to;
+        if (nnue::KB > 1) refresh_accumulator();
+    }
+#endif
+
     // 12. Record key in history for repetition detection.
     hist_.push_back(key_);
 }
@@ -227,8 +241,16 @@ void Position::undo_move(Move m) {
     halfmove_ = st->prev_halfmove;
     fullmove_ = st->prev_fullmove;
     key_      = st->prev_key;
-    // NNUE: the put/remove/move_piece calls above already restored acc_ by
-    // applying the exact inverse feature deltas of the original move (delta-undo).
+    // NNUE: for non-king moves the put/remove/move_piece calls above already
+    // restored acc_ via the exact inverse feature deltas (delta-undo). A king
+    // move changed the moving side's bucket, so restore its tracked king square
+    // and (for king-bucketed nets) rebuild from the now-restored board.
+#ifdef EVAL_NNUE
+    if (piece_type(piece_on(from)) == KING) {
+        ksq_[us] = from;
+        if (nnue::KB > 1) refresh_accumulator();
+    }
+#endif
     st_       = st->previous;
 }
 
@@ -358,9 +380,11 @@ void Position::set_fen(const std::string& fen) {
     hist_.push_back(key_);
 
 #ifdef EVAL_NNUE
-    // Rebuild the accumulator from scratch for the final board (the per-piece
-    // updates done by put_piece during parsing started from uninitialised state
-    // and are discarded here).
+    // Track king squares, then rebuild the accumulator from scratch for the final
+    // board (the per-piece updates done by put_piece during parsing started from
+    // uninitialised state and are discarded here).
+    ksq_[WHITE] = king_sq(WHITE);
+    ksq_[BLACK] = king_sq(BLACK);
     nnue::refresh(acc_, *this);
 #endif
 }
