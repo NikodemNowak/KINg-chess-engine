@@ -273,7 +273,7 @@ void run(std::istream& in, std::ostream& out) {
                     std::string tb_path = val_str;
                     if (tb_path == "<empty>") tb_path = "";
                     syzygy::init(tb_path);
-                } else if (opt_lower == "syzygyrobedepth") {
+                } else if (opt_lower == "syzygyprobedepth") {
                     // Accepted and silently ignored for now
                     // (probe depth threshold could be added here later)
                 }
