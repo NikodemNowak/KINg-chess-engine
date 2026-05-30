@@ -62,19 +62,20 @@ descriptions on the **Chess Programming Wiki** (https://www.chessprogramming.org
 
 Two evaluation back-ends are supported, selected at build time via `-DEVAL=`:
 
-- **HCE** (`-DEVAL=HCE`, default — "No Deep Learning" category): handcrafted
+- **NNUE** (`-DEVAL=NNUE`, default — "Open" category): a `(768→512)×2→1`
+  halfKA-style network trained with a custom PyTorch trainer (`trainer/`) on
+  ~30M self-generated self-play positions produced by the engine's built-in
+  datagen (`src/datagen.cpp`). The trained net is committed at
+  `nets/king_nnue.bin` and embedded into the binary at build time. It beats the
+  Texel-tuned HCE by ~+193 Elo at 8+0.08 (225-23-152 over 400 games).
+
+- **HCE** (`-DEVAL=HCE` — "No Deep Learning" category): handcrafted
   evaluation built on **PeSTO** piece-square tables (Ronald Friederich, Chess
   Programming Wiki). All material values and structural term weights are
   **Texel-tuned** with the in-engine coordinate-descent tuner (`src/tune.cpp`)
   on the public **Zurichess quiet-labeled.epd** dataset (~725k FEN + game-result
   positions, Alexandru Moșoi et al.), mirrored at
   <https://github.com/KierenP/ChessTrainingSets>.
-
-- **NNUE** (`-DEVAL=NNUE` — "Open" category): a `(768→256)×2→1` halfKA-style
-  network trained with a custom PyTorch trainer (`trainer/`) on self-generated
-  self-play data produced by the engine's built-in datagen (`src/datagen.cpp`).
-  The trained net is committed at `nets/king_nnue.bin` and embedded into the
-  binary at build time.
 
 ### Tools and libraries
 

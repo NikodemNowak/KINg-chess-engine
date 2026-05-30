@@ -3,7 +3,7 @@
 //
 // Perspective net (768 -> HL) x2 -> 1, clipped-ReLU, INT16/INT32 quantized.
 // HL (accumulator size per perspective) is a compile-time constant controlled
-// by -DNNUE_HL=<n> (default 256 for the committed net; 512 for the full retrain).
+// by -DNNUE_HL=<n> (default 512, matching the committed 30M-position net).
 // The net is embedded in the binary (see nnue_net_data.cpp, generated at build
 // time from nets/king_nnue.bin), so no external file is needed at runtime.
 //
@@ -19,8 +19,7 @@ namespace nnue {
 
 // Architecture constants (also validated against the embedded net header).
 // HL (accumulator size per perspective) is set at build time via -DNNUE_HL=<n>
-// (default 256 for the committed HL=256 net; override to 512 for the full
-// retrain).  All other constants are fixed.
+// (default 512, matching the committed net).  All other constants are fixed.
 constexpr int INPUT = 768;
 #ifndef NNUE_HL
 constexpr int HL    = 256;

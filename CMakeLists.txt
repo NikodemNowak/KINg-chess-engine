@@ -12,24 +12,23 @@ set(CMAKE_CXX_FLAGS_RELEASE "-O3 -mavx2 -mpopcnt -DNDEBUG")
 set(CMAKE_C_FLAGS_RELEASE   "-O3 -mavx2 -mpopcnt -DNDEBUG")
 
 # ── Evaluation selector ───────────────────────────────────────────────────────
-# -DEVAL=HCE (default): handcrafted PeSTO/structural eval ("No Deep Learning").
-# -DEVAL=NNUE          : embedded NNUE net + incremental accumulator.
+# -DEVAL=NNUE (default): embedded NNUE net + incremental accumulator ("Open").
+# -DEVAL=HCE           : handcrafted PeSTO/structural eval ("No Deep Learning").
 #
-# Default is HCE: the first NNUE net (3.5M positions, 256 HL, 45 epochs) tested
-# ~133 Elo WEAKER than the HCE at 8+0.08 (NNUE-vs-HCE 16-89-95 over 200 games),
-# so shipping NNUE as default would regress strength. The NNUE inference,
-# incremental accumulator, and net embedding are all in place and pass the
-# bit-exact gate; once the net is retrained with more data/epochs, flip the
-# default back to NNUE (or pass -DEVAL=NNUE).
-set(EVAL "HCE" CACHE STRING "Evaluation: HCE (default) or NNUE")
+# Default is NNUE: the HL=512 net retrained on ~30M self-play positions beats the
+# Texel-tuned HCE by +193 Elo at 8+0.08 (NNUE-vs-HCE 225-23-152 over 400 games,
+# 95% CI [+167, +222]). (The first net — 3.5M positions, HL=256 — had lost ~133
+# Elo, which is why HCE shipped previously.) Pass -DEVAL=HCE to build the
+# "No Deep Learning" entry.
+set(EVAL "NNUE" CACHE STRING "Evaluation: NNUE (default) or HCE")
 set_property(CACHE EVAL PROPERTY STRINGS NNUE HCE)
 message(STATUS "KINg eval = ${EVAL}")
 
 # ── NNUE hidden-layer size ────────────────────────────────────────────────────
-# -DNNUE_HL=256 (default, matches committed king_nnue.bin).
-# -DNNUE_HL=512 for building against a HL=512 net (full retrain target).
-# The value is passed as -DNNUE_HL=<n> so nnue.hpp picks it up at compile time.
-set(NNUE_HL "256" CACHE STRING "NNUE accumulator hidden-layer size per perspective (default 256)")
+# -DNNUE_HL=512 (default, matches committed king_nnue.bin — the 30M-position net).
+# Override with -DNNUE_HL=<n> to build against a different-width net; the value
+# is passed through as -DNNUE_HL=<n> so nnue.hpp picks it up at compile time.
+set(NNUE_HL "512" CACHE STRING "NNUE accumulator hidden-layer size per perspective (default 512)")
 message(STATUS "KINg NNUE_HL = ${NNUE_HL}")
 
 # ── NNUE net binary (override for validation builds) ─────────────────────────
