@@ -139,6 +139,10 @@ static constexpr int SCORE_BAD_CAPTURE = -1'000'000; // SEE<0 capture base; trie
 // the table self-normalises instead of saturating like the old `+= depth*depth`.
 static constexpr int HIST_CAP = 16384;
 
+// Sentinel stored in the TT `eval` field when no static eval is meaningful
+// (in-check nodes). Static evals never reach INT16_MIN, so it is unambiguous.
+static constexpr int16_t TT_EVAL_NONE = INT16_MIN;
+
 static inline int hist_bonus(int depth) {
     return std::min(2048, 4 * depth * depth + 120 * depth - 120);
 }
@@ -198,6 +202,24 @@ struct Searcher {
 
         if (ply >= MAX_PLY) return evaluate(pos);
 
+        const int  alphaOrig = alpha;
+        const bool isPV       = (beta - alpha) > 1;
+
+        // ── TT probe ─────────────────────────────────────────────────────────
+        // Cheap cutoff + a hash move + a cached static eval, on the largest node
+        // population in the tree. Cutoff only on non-PV nodes.
+        TTEntry tte;
+        const bool ttHit = tt.probe(pos.key(), tte);
+        const Move ttMove = ttHit ? tte.move : 0;
+        if (ttHit && !isPV) {
+            int s = fromTT(tte.score, ply);
+            Bound b = Bound(tte.genBound & 3);
+            if (b == BOUND_EXACT
+                || (b == BOUND_LOWER && s >= beta)
+                || (b == BOUND_UPPER && s <= alpha))
+                return s;
+        }
+
         const bool inCheck = pos.in_check(pos.side_to_move());
 
         int standPat = 0;
@@ -207,8 +229,12 @@ struct Searcher {
             // every legal evasion is searched (not just captures).
             best = -INF;
         } else {
-            standPat = evaluate(pos);
-            if (standPat >= beta) return standPat; // fail-high: opponent won't allow this
+            // Reuse the TT's cached static eval when present (saves an evaluate()).
+            standPat = (ttHit && tte.eval != TT_EVAL_NONE) ? (int)tte.eval : evaluate(pos);
+            if (standPat >= beta) {
+                tt.store(pos.key(), ttMove, toTT(standPat, ply), (int16_t)standPat, 0, BOUND_LOWER);
+                return standPat; // fail-high: opponent won't allow this
+            }
             if (standPat > alpha) alpha = standPat;
             best = standPat;
         }
@@ -216,12 +242,11 @@ struct Searcher {
         MoveList ml;
         generate_pseudo(pos, ml);
 
-        // Precompute MVV-LVA keys for ordering. For non-capture/non-promo moves
-        // (only relevant when in check) the key is irrelevant; we keep them
-        // last via a very small key.
+        // Precompute MVV-LVA keys for ordering; the TT move (if any) sorts first.
         int keys[256];
         for (int i = 0; i < ml.size; ++i) {
             Move m = ml.moves[i];
+            if (ttMove != 0 && m == ttMove) { keys[i] = 1 << 24; continue; }
             const bool isEp      = (type_of(m) == EN_PASSANT);
             const Piece capPiece = pos.piece_on(to_sq(m));
             const bool isCapture = isEp || (capPiece != NO_PIECE);
@@ -246,6 +271,7 @@ struct Searcher {
             if (bi != i) { std::swap(ml.moves[i], ml.moves[bi]); std::swap(keys[i], keys[bi]); }
         }
 
+        Move bestMove = 0;
         for (int i = 0; i < ml.size; ++i) {
             Move m = ml.moves[i];
             const bool isEp      = (type_of(m) == EN_PASSANT);
@@ -280,13 +306,20 @@ struct Searcher {
             int score = -qsearch(pos, -beta, -alpha, ply + 1);
             pos.undo_move(m);
             if (aborted) return 0;
-            if (score > best)  best  = score;
+            if (score > best)  { best = score; bestMove = m; }
             if (score > alpha) alpha = score;
             if (alpha >= beta) break; // beta cutoff
         }
 
         // If in check and no legal move was found, it is checkmate.
         if (inCheck && best == -INF) return -(MATE - ply);
+
+        // Store the qsearch result (depth 0) so siblings/re-visits can reuse it.
+        Bound bnd = (best >= beta)      ? BOUND_LOWER
+                  : (best > alphaOrig)  ? BOUND_EXACT
+                  :                       BOUND_UPPER;
+        tt.store(pos.key(), bestMove, toTT(best, ply),
+                 inCheck ? TT_EVAL_NONE : (int16_t)standPat, 0, bnd);
 
         return best;
     }
@@ -304,8 +337,19 @@ struct Searcher {
         // eval here is a safe emergency horizon.
         if (ply >= MAX_PLY) return evaluate(pos);
 
-        const int  alphaOrig = alpha;
-        const bool isPV       = (beta - alpha) > 1; // wide window ⇒ PV node
+        const bool isPV = (beta - alpha) > 1; // wide window ⇒ PV node
+
+        // ── Mate-distance pruning ──────────────────────────────────────────
+        // A mate from this node is at best (MATE - ply); a loss at worst
+        // -(MATE - ply). Tighten the window to those bounds — if it collapses
+        // there is nothing left to search.
+        if (ply > 0) {
+            alpha = std::max(alpha, -(MATE - ply));
+            beta  = std::min(beta,   MATE - ply - 1);
+            if (alpha >= beta) return alpha;
+        }
+
+        const int alphaOrig = alpha;
 
         // ── TT probe ───────────────────────────────────────────────────────
         Move ttMove = 0;
@@ -372,13 +416,36 @@ struct Searcher {
             }
         }
 
-        // ── Static evaluation (cached for pruning) ────────────────────────────
-        // Not meaningful while in check (king is in danger, eval is unstable).
-        const int staticEval = inCheck ? -INF : evaluate(pos);
+        // ── Static evaluation (TT-cached, TT-refined) ─────────────────────────
+        // Not meaningful while in check. Otherwise reuse the TT's cached eval
+        // (saves an evaluate()), and refine the value used for PRUNING with the
+        // TT score when its bound proves the position is better/worse than eval.
+        int staticEval, evalForPruning;
+        if (inCheck) {
+            staticEval = evalForPruning = -INF;
+        } else {
+            staticEval = (ttHit && tte.eval != TT_EVAL_NONE) ? (int)tte.eval : evaluate(pos);
+            evalForPruning = staticEval;
+            if (ttHit) {
+                int ts = fromTT(tte.score, ply);
+                Bound tb = Bound(tte.genBound & 3);
+                if (tb == BOUND_EXACT
+                    || (tb == BOUND_LOWER && ts > evalForPruning)
+                    || (tb == BOUND_UPPER && ts < evalForPruning))
+                    evalForPruning = ts;
+            }
+        }
+        ss[ply].staticEval = staticEval;
+
+        // ── "Improving" trend ─────────────────────────────────────────────────
+        // Is our static eval higher than two plies ago (our previous turn)? If so
+        // the position is improving and we can prune a touch more aggressively.
+        const bool improving = !inCheck && ply >= 2
+                             && ss[ply - 2].staticEval != -INF
+                             && staticEval > ss[ply - 2].staticEval;
 
         // ── Reverse Futility Pruning (static null move) ───────────────────────
-        // If the static eval already beats beta by a large margin (depth*75), the
-        // position is so good we can prune without searching further.
+        // If the static eval already beats beta by a large margin, prune.
         if (!isPV && !inCheck && depth <= 8
             && beta < MATE - MAX_PLY && beta > -(MATE - MAX_PLY)
             && staticEval - 75 * depth >= beta)
@@ -529,23 +596,25 @@ struct Searcher {
             // we already have a non-losing best score.  (moveCount is the
             // post-legality count so early moves always pass the threshold.)
             // Only prune at depth >= 3 to avoid hiding tactics at shallow nodes.
+            // Prune later when improving (we can afford to look at more moves),
+            // earlier when not — standard LMP "improving" modulation.
             if (!isPV && !inCheck && isQuiet
                     && depth >= 3 && depth <= 6
-                    && moveCount >= 4 + depth * depth
+                    && moveCount >= (improving ? 4 + depth * depth : 2 + depth * depth / 2)
                     && best > -(MATE - MAX_PLY)) {
                 continue;
             }
 
             // ── Futility Pruning (frontier) ───────────────────────────────
-            // At very shallow depths, if the static eval plus a margin cannot
+            // At very shallow depths, if the (refined) eval plus a margin cannot
             // reach alpha, this quiet move almost certainly can't raise alpha.
-            // Guard: only fire when the position isn't already losing (eval >=
-            // -150) to avoid pruning in sharp positions where material eval
-            // underestimates piece activity.
+            // Guard: only fire when the position isn't already losing to avoid
+            // pruning in sharp positions where material eval underestimates
+            // piece activity.
             if (!isPV && !inCheck && isQuiet && depth <= 6
                     && best > -(MATE - MAX_PLY)
-                    && staticEval >= -150
-                    && staticEval + 100 + 80 * depth <= alpha) {
+                    && evalForPruning >= -150
+                    && evalForPruning + 100 + 80 * depth <= alpha) {
                 continue;
             }
 
@@ -564,6 +633,18 @@ struct Searcher {
             // Mover piece type captured BEFORE do_move (board still unmoved),
             // for the search-stack / history indexing.
             const PieceType moverPt = piece_type(pos.piece_on(from_sq(m)));
+
+            // Combined quiet-history score for this move (butterfly + 1/2-ply
+            // continuation), used to modulate the LMR reduction below.
+            int quietHist = 0;
+            if (isQuiet) {
+                const int cp12 = make_piece(stm, moverPt);
+                quietHist = (int)history[stm][from_sq(m)][to_sq(m)];
+                if (pPiece12 >= 0) {
+                    quietHist += (int)contHist[pPiece12][pTo][cp12][to_sq(m)];
+                    if (gPiece12 >= 0) quietHist += (int)contHist[gPiece12][gTo][cp12][to_sq(m)];
+                }
+            }
 
             StateInfo st;
             pos.do_move(m, st);
@@ -606,7 +687,9 @@ struct Searcher {
                 if (depth >= 4 && moveCount >= 6 && isQuiet
                         && !inCheck && !givesCheck) {
                     r = LMR[std::min(depth, 63)][std::min(moveCount, 63)];
-                    if (isPV && r > 0) r -= 1;          // reduce less on PV
+                    if (isPV) r -= 1;                       // reduce less on PV
+                    if (!improving) r += 1;                 // reduce more when not improving
+                    r -= std::clamp(quietHist / 8192, -2, 2); // trust history
                     if (r < 0) r = 0;
                     if (r > newDepth - 1) r = newDepth - 1; // never below 1 ply
                     if (r < 0) r = 0;
@@ -686,11 +769,12 @@ struct Searcher {
         if (legal == 0)
             return inCheck ? -(MATE - ply) : 0;
 
-        // ── TT store ─────────────────────────────────────────────────────────
+        // ── TT store (cache the static eval for future probes) ────────────────
         Bound bound = (best <= alphaOrig) ? BOUND_UPPER
                     : (best >= beta)       ? BOUND_LOWER
                     :                        BOUND_EXACT;
-        tt.store(pos.key(), bestMove, toTT(best, ply), 0, (uint8_t)depth, bound);
+        tt.store(pos.key(), bestMove, toTT(best, ply),
+                 inCheck ? TT_EVAL_NONE : (int16_t)staticEval, (uint8_t)depth, bound);
 
         return best;
     }
