@@ -508,74 +508,59 @@ def _rss_gb() -> float:
 MAXP = 32  # max pieces per position (record layout)
 
 def build_gpu_dataset(cache_path: str, total: int, device, kb: int = 1):
-    # Disk-cache the padded feature tensors (feature-only → reusable across ALL
-    # trainings on this data cache, regardless of HL/activation/lambda). First run
-    # builds + saves (~60s); later runs load (~15s) so the GPU never idles on a
-    # rebuild during a sweep. King-bucket runs (kb>1) cache separately since their
-    # feature indices carry the king-bucket offset.
-    npz = cache_path + (".gpures.npz" if kb == 1 else f".gpures_kb{kb}.npz")
+    # Memory-COMPACT GPU dataset: keep the raw pieces/squares (uint8, ~75 B/pos)
+    # resident and compute the per-perspective feature indices on the fly per batch
+    # (see gpu_batch_inputs). The old path precomputed int16 sf/nf tensors (~144
+    # B/pos), which overflowed 16 GB VRAM past ~85M positions and thrashed; this
+    # fits 112M in ~8 GB and scales to ~200M. kb>1 (king buckets, an unused
+    # experiment) is not supported in the compact path.
+    if kb != 1:
+        raise NotImplementedError("compact GPU dataset supports kb=1 only")
+    npz = cache_path + ".gpures2.npz"
     if Path(npz).exists() and Path(npz).stat().st_size > 0:
-        print(f"[data] loading cached GPU tensors from {npz}")
+        print(f"[data] loading cached compact GPU tensors from {npz}")
         d = np.load(npz)
-        return (torch.from_numpy(d['sf']).to(device),
-                torch.from_numpy(d['nf']).to(device),
+        return (torch.from_numpy(d['pc']).to(device),
+                torch.from_numpy(d['sq']).to(device),
+                torch.from_numpy(d['st']).to(device),
                 torch.from_numpy(d['ln']).to(device),
                 torch.from_numpy(d['sc']).to(device),
                 torch.from_numpy(d['rs']).to(device))
     mm = np.memmap(cache_path, dtype=RECORD_DTYPE, mode='r', shape=(total,))
-    sf_pad = np.zeros((total, MAXP), dtype=np.int16)
-    nf_pad = np.zeros((total, MAXP), dtype=np.int16)
-    lengths = np.empty(total, dtype=np.int64)
-    scores  = np.empty(total, dtype=np.float32)
-    results = np.empty(total, dtype=np.float32)
-    CH = 1_000_000
-    for lo in range(0, total, CH):
-        hi = min(lo + CH, total)
-        rec = mm[lo:hi]
-        stm = rec['stm'].astype(np.int64)[:, None]      # [c,1]
-        squares = rec['squares'].astype(np.int64)        # [c,32]
-        pieces  = rec['pieces']                           # [c,32] uint8
-        color = ((pieces >> 4) & 1).astype(np.int64)
-        ptype = (pieces & 0x0F).astype(np.int64)
-        os_s = np.where(stm == WHITE, squares, squares ^ 56)
-        sf = (color != stm).astype(np.int64) * 384 + ptype * 64 + os_s
-        nstm = stm ^ 1
-        os_n = np.where(nstm == WHITE, squares, squares ^ 56)
-        nf = (color != nstm).astype(np.int64) * 384 + ptype * 64 + os_n
-        if kb > 1:
-            # King-bucket offset: each perspective's features shift by
-            # king_bucket(own oriented king square) * 768.
-            stm1 = rec['stm'].astype(np.int64)                            # [c]
-            wk = (squares * ((color == 0) & (ptype == 5))).sum(axis=1)    # [c] white king sq
-            bk = (squares * ((color == 1) & (ptype == 5))).sum(axis=1)    # [c] black king sq
-            ok_s = np.where(stm1 == WHITE, wk, bk ^ 56)                   # oriented own king (stm)
-            ok_n = np.where((stm1 ^ 1) == WHITE, wk, bk ^ 56)            # oriented own king (nstm)
-            sf = sf + (king_bucket_np(ok_s, kb) * INPUT_SIZE)[:, None]
-            nf = nf + (king_bucket_np(ok_n, kb) * INPUT_SIZE)[:, None]
-        sf_pad[lo:hi] = sf.astype(np.int16)
-        nf_pad[lo:hi] = nf.astype(np.int16)
-        lengths[lo:hi] = rec['n'].astype(np.int64)
-        scores[lo:hi]  = rec['score'].astype(np.float32)
-        results[lo:hi] = rec['result'].astype(np.float32)
+    pc = np.ascontiguousarray(mm['pieces'])                       # [N,32] uint8 (color<<4|ptype)
+    sq = np.ascontiguousarray(mm['squares'])                      # [N,32] uint8
+    st = np.ascontiguousarray(mm['stm'])                          # [N]   uint8
+    ln = np.ascontiguousarray(mm['n']).astype(np.int16)           # [N]   piece count
+    sc = np.ascontiguousarray(mm['score']).astype(np.float32)
+    rs = np.ascontiguousarray(mm['result']).astype(np.float32)
     del mm
     try:
-        np.savez(npz, sf=sf_pad, nf=nf_pad, ln=lengths, sc=scores, rs=results)
-        print(f"[data] cached GPU tensors -> {npz}")
+        np.savez(npz, pc=pc, sq=sq, st=st, ln=ln, sc=sc, rs=rs)
+        print(f"[data] cached compact GPU tensors -> {npz}")
     except Exception as e:
         print(f"[data] (cache save skipped: {e})")
-    return (torch.from_numpy(sf_pad).to(device),
-            torch.from_numpy(nf_pad).to(device),
-            torch.from_numpy(lengths).to(device),
-            torch.from_numpy(scores).to(device),
-            torch.from_numpy(results).to(device))
+    return (torch.from_numpy(pc).to(device), torch.from_numpy(sq).to(device),
+            torch.from_numpy(st).to(device), torch.from_numpy(ln).to(device),
+            torch.from_numpy(sc).to(device), torch.from_numpy(rs).to(device))
 
-def gpu_batch_inputs(sf_g, nf_g, len_g, rows, device):
-    """EmbeddingBag (flat indices + offsets) for a batch of rows — all on GPU.
-    Both perspectives share the same per-row piece counts, hence the same offsets."""
-    L = len_g[rows]                                       # [B]
-    mask = torch.arange(MAXP, device=device)[None, :] < L[:, None]
-    s_flat = sf_g[rows][mask].long()
-    n_flat = nf_g[rows][mask].long()
+def gpu_batch_inputs(pc_g, sq_g, st_g, len_g, rows, device):
+    """Compute both perspectives' EmbeddingBag (flat indices + offsets) for a batch
+    of rows ON GPU, from the compact raw pieces/squares/stm tensors. Mirrors the
+    numpy feature formula exactly: sf = (color!=stm)*384 + ptype*64 + oriented_sq."""
+    pc  = pc_g[rows].long()                                       # [B,32] color<<4|ptype
+    sq  = sq_g[rows].long()                                       # [B,32]
+    stm = st_g[rows].long().unsqueeze(1)                          # [B,1]
+    L   = len_g[rows].long()                                      # [B]
+    mask = torch.arange(MAXP, device=device)[None, :] < L[:, None]  # [B,32]
+    color = (pc >> 4) & 1
+    ptype = pc & 0x0F
+    os_s = torch.where(stm == WHITE, sq, sq ^ 56)
+    sf = (color != stm).long() * 384 + ptype * 64 + os_s         # [B,32]
+    nstm = stm ^ 1
+    os_n = torch.where(nstm == WHITE, sq, sq ^ 56)
+    nf = (color != nstm).long() * 384 + ptype * 64 + os_n
+    s_flat = sf[mask]
+    n_flat = nf[mask]
     offsets = torch.zeros(rows.numel(), device=device, dtype=torch.long)
     if rows.numel() > 1:
         offsets[1:] = torch.cumsum(L, 0)[:-1]
@@ -683,10 +668,10 @@ def main():
         # ── GPU-resident path: whole dataset on the GPU, no CPU dataloader ────
         print("[data] building GPU-resident dataset (one-time) ...")
         t_b = time.time()
-        sf_g, nf_g, len_g, sc_g, rs_g = build_gpu_dataset(cache_path, total, device, args.kbuckets)
+        pc_g, sq_g, st_g, len_g, sc_g, rs_g = build_gpu_dataset(cache_path, total, device, args.kbuckets)
         tr_g = torch.from_numpy(train_idx).to(device)
         va_g = torch.from_numpy(val_idx).to(device)
-        gb = (sf_g.numel()*2 + nf_g.numel()*2 + len_g.numel()*8
+        gb = (pc_g.numel() + sq_g.numel() + st_g.numel() + len_g.numel()*2
               + sc_g.numel()*4 + rs_g.numel()*4) / 1e9
         print(f"[data] GPU dataset ready in {time.time()-t_b:.1f}s  (~{gb:.2f} GB on device)")
 
@@ -699,7 +684,7 @@ def main():
             with torch.no_grad():
                 for b in range(0, va_g.numel(), args.batch):
                     rows = va_g[b:b + args.batch]
-                    si, so, ni, no = gpu_batch_inputs(sf_g, nf_g, len_g, rows, device)
+                    si, so, ni, no = gpu_batch_inputs(pc_g, sq_g, st_g, len_g, rows, device)
                     bk = bucket_tensor(len_g[rows], args.buckets)
                     pred = torch.sigmoid(model(si, so, ni, no, bk))
                     bs = rows.numel()
@@ -716,7 +701,7 @@ def main():
             ep_loss, ep_cnt = 0.0, 0
             for b in range(0, order.numel(), args.batch):
                 rows = order[b:b + args.batch]
-                si, so, ni, no = gpu_batch_inputs(sf_g, nf_g, len_g, rows, device)
+                si, so, ni, no = gpu_batch_inputs(pc_g, sq_g, st_g, len_g, rows, device)
                 bk = bucket_tensor(len_g[rows], args.buckets)
                 pred = torch.sigmoid(model(si, so, ni, no, bk))
                 loss = loss_fn(pred, make_tgt(rows))
