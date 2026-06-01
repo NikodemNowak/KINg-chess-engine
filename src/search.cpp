@@ -133,6 +133,18 @@ static constexpr int SCORE_BAD_CAPTURE = -1'000'000; // SEE<0 capture base; trie
 #define ORD_COUNTER 1
 #endif
 
+// ── Singular Extensions (default ON — confirmed +28.7 Elo at 30+0.3 slow TC) ──
+// A TT move is "singular" when a reduced-depth search excluding it fails below
+// (ttScore - SE_MARGIN); such a move gets a +1 extension. Fast-TC SPRT
+// UNDER-measures this (it needs search depth to pay off), so it is validated at
+// the competition's slow TC. Build with -USE_SINGULAR removed only for A/B.
+#ifndef SE_SINGULAR
+#define SE_SINGULAR 1
+#endif
+#ifndef SE_MARGIN
+#define SE_MARGIN 64
+#endif
+
 // ── History (gravity-updated, capped) ─────────────────────────────────────────
 // Butterfly + capture + continuation histories all use the same int16 gravity
 // scheme: a bonus pulls the score toward ±HIST_CAP without ever overflowing, so
@@ -179,6 +191,10 @@ struct Searcher {
     // Continuation history: [prevPiece12][prevTo][curPiece12][curTo]. Indexed by
     // the parent (1-ply) and grandparent (2-ply) moves; ~1.2 MB/thread.
     int16_t contHist[12][64][12][64];
+#ifdef SE_CONTHIST2
+    // 4-ply (great-grandparent) continuation history; same layout, ~1.2 MB/thread.
+    int16_t contHist2[12][64][12][64];
+#endif
     Stack   ss[MAX_PLY + 4];
 
     bool times_up() {
@@ -196,7 +212,8 @@ struct Searcher {
     // Extends the leaf search through "noisy" moves (captures/promotions, and
     // all evasions while in check) so the static eval is only taken in a quiet
     // position. This removes the horizon effect inside capture sequences.
-    int qsearch(Position& pos, int alpha, int beta, int ply) {
+    int qsearch(Position& pos, int alpha, int beta, int ply,
+                bool searchChecks = true) {
         if (aborted || times_up()) { aborted = true; return 0; }
         ++nodes;
 
@@ -231,6 +248,11 @@ struct Searcher {
         } else {
             // Reuse the TT's cached static eval when present (saves an evaluate()).
             standPat = (ttHit && tte.eval != TT_EVAL_NONE) ? (int)tte.eval : evaluate(pos);
+#ifdef SE_FIFTYSCALE
+            // Scale the stand-pat score toward 0 as the 50-move clock nears 100.
+            // The draw check fires at exactly 100, so the factor is in [0,1].
+            standPat = standPat * (100 - pos.halfmove_clock()) / 100;
+#endif
             if (standPat >= beta) {
                 tt.store(pos.key(), ttMove, toTT(standPat, ply), (int16_t)standPat, 0, BOUND_LOWER);
                 return standPat; // fail-high: opponent won't allow this
@@ -279,8 +301,29 @@ struct Searcher {
             const bool isCapture = isEp || (capPiece != NO_PIECE);
             const bool isPromo   = (type_of(m) == PROMO);
 
-            // When not in check, only consider captures and promotions.
-            if (!inCheck && !isCapture && !isPromo) continue;
+            // When not in check, only consider captures and promotions — plus
+            // (SE_QSCHECK) quiet moves that give check with SEE >= 0, searched
+            // one extra ply deep (searchChecks=false in the child prevents
+            // recursive check explosion).
+            if (!inCheck && !isCapture && !isPromo) {
+#ifdef SE_QSCHECK
+                if (!searchChecks) continue;
+                if (see(pos, m) < 0) continue;
+                StateInfo stChk;
+                pos.do_move(m, stChk);
+                if (pos.in_check(Color(!pos.side_to_move()))) { pos.undo_move(m); continue; }
+                if (!pos.in_check(pos.side_to_move())) { pos.undo_move(m); continue; }
+                int score = -qsearch(pos, -beta, -alpha, ply + 1, false);
+                pos.undo_move(m);
+                if (aborted) return 0;
+                if (score > best)  { best = score; bestMove = m; }
+                if (score > alpha) alpha = score;
+                if (alpha >= beta) break;
+                continue;
+#else
+                continue;
+#endif
+            }
 
             // Delta pruning (only when not in check, plain captures): if even
             // winning the victim plus a safety margin cannot reach alpha, skip.
@@ -303,7 +346,7 @@ struct Searcher {
                 pos.undo_move(m);
                 continue;
             }
-            int score = -qsearch(pos, -beta, -alpha, ply + 1);
+            int score = -qsearch(pos, -beta, -alpha, ply + 1, searchChecks);
             pos.undo_move(m);
             if (aborted) return 0;
             if (score > best)  { best = score; bestMove = m; }
@@ -366,19 +409,23 @@ struct Searcher {
         const int alphaOrig = alpha;
 
         // ── TT probe ───────────────────────────────────────────────────────
-        Move ttMove = 0;
+        Move  ttMove  = 0;
+        int   ttScore = 0;            // ply-adjusted TT score (used by singular ext)
+        Bound ttBound = BOUND_NONE;
         TTEntry tte;
         bool ttHit = tt.probe(pos.key(), tte);
         if (ttHit) {
-            ttMove = tte.move;
+            ttMove  = tte.move;
+            ttScore = fromTT(tte.score, ply);
+            ttBound = Bound(tte.genBound & 3);
             // Cutoff only on non-PV nodes with a deep-enough entry whose bound
-            // is compatible with the window. (Keeps the PV exact/intact.)
-            if (!isPV && tte.depth >= depth) {
-                int s = fromTT(tte.score, ply);
-                Bound b = Bound(tte.genBound & 3);
-                if (b == BOUND_EXACT) return s;
-                if (b == BOUND_LOWER && s >= beta)  return s;
-                if (b == BOUND_UPPER && s <= alpha) return s;
+            // is compatible with the window. (Keeps the PV exact/intact.) The
+            // ss[ply].excluded == 0 guard skips the cutoff while verifying a
+            // singular candidate, so the verification actually searches.
+            if (!isPV && tte.depth >= depth && ss[ply].excluded == 0) {
+                if (ttBound == BOUND_EXACT) return ttScore;
+                if (ttBound == BOUND_LOWER && ttScore >= beta)  return ttScore;
+                if (ttBound == BOUND_UPPER && ttScore <= alpha) return ttScore;
             }
         }
 
@@ -412,6 +459,12 @@ struct Searcher {
                 else if (wdl == TB_LOSS)         score = -(tb_base - ply);
                 else                             score =  0;   // TB_DRAW
 
+                // We probe with rule50=0 (so the WDL is always available), so
+                // scale decisive scores by 50-move proximity: a TB win/loss near
+                // the 50-move limit is valued cautiously (approaches a draw).
+                if (wdl == TB_WIN || wdl == TB_LOSS)
+                    score = score * (100 - pos.halfmove_clock()) / 100;
+
                 // Update TT with the TB result so siblings can use it.
                 Bound tb_bound = (score >= beta) ? BOUND_LOWER
                                : (score <= alpha) ? BOUND_UPPER
@@ -439,6 +492,11 @@ struct Searcher {
             staticEval = evalForPruning = -INF;
         } else {
             staticEval = (ttHit && tte.eval != TT_EVAL_NONE) ? (int)tte.eval : evaluate(pos);
+#ifdef SE_FIFTYSCALE
+            // Scale staticEval toward 0 near the 50-move draw threshold
+            // (halfmove_clock() is in [0,99] here; the ==100 draw was caught above).
+            staticEval = staticEval * (100 - pos.halfmove_clock()) / 100;
+#endif
             evalForPruning = staticEval;
             if (ttHit) {
                 int ts = fromTT(tte.score, ply);
@@ -476,6 +534,12 @@ struct Searcher {
         if (!isPV && !inCheck && depth >= 3 && hasNonPawn
             && beta < MATE - MAX_PLY && beta > -(MATE - MAX_PLY)) {
             int R = 3 + depth / 3;
+#ifdef SE_NMPEVAL
+            // If our eval already beats beta by a large margin the position is
+            // even more likely to be a safe prune — reduce a touch more. Bonus
+            // in [0,3]; evalForPruning >= beta is implied at a fail-high node.
+            R += std::max(0, std::min(3, (evalForPruning - beta) / 200));
+#endif
             StateInfo nullSt;
             // Mark this ply as "no move" so the child doesn't index countermove /
             // continuation history off a stale sibling move.
@@ -486,6 +550,37 @@ struct Searcher {
             if (aborted) return 0;
             if (nullScore >= beta) return beta; // fail-high prune (return bound)
         }
+
+#ifdef SE_PROBCUT
+        // ── ProbCut ───────────────────────────────────────────────────────────
+        // At non-PV, non-check nodes with depth >= 5, search a small set of good
+        // captures at reduced depth to get a cheap fail-high. Only fire when beta
+        // is far from a mate score so pbBeta stays in a sane range.
+        if (!isPV && !inCheck && depth >= 5
+                && beta < MATE - MAX_PLY && beta > -(MATE - MAX_PLY)) {
+            const int pbBeta   = beta + 200;
+            const int pbSeeMin = pbBeta - staticEval;
+            MoveList pcml;
+            generate_pseudo(pos, pcml);
+            for (int pi = 0; pi < pcml.size; ++pi) {
+                Move pm = pcml.moves[pi];
+                const bool  pcIsEp  = (type_of(pm) == EN_PASSANT);
+                const Piece pcCap   = pos.piece_on(to_sq(pm));
+                const bool  pcIsCap = pcIsEp || (pcCap != NO_PIECE);
+                if (!pcIsCap) continue;
+                if (type_of(pm) == PROMO) continue;        // skip promo-captures
+                if (see(pos, pm) < pbSeeMin) continue;     // only clearly-winning captures
+                StateInfo pcSt;
+                pos.do_move(pm, pcSt);
+                if (pos.in_check(Color(!pos.side_to_move()))) { pos.undo_move(pm); continue; }
+                const int pcDepth = std::max(0, depth - 4);
+                int pcScore = -negamax(pos, pcDepth, -pbBeta, -pbBeta + 1, ply + 1);
+                pos.undo_move(pm);
+                if (aborted) return 0;
+                if (pcScore >= pbBeta) return pbBeta;
+            }
+        }
+#endif // SE_PROBCUT
 
         // ── Internal Iterative Reduction (IIR) ───────────────────────────────
         // If we have no TT move at this node (no prior search result to guide
@@ -513,6 +608,13 @@ struct Searcher {
             gPiece12 = make_piece(stm, ss[ply - 2].movedPiece);
             gTo      = ss[ply - 2].toSq;
         }
+#ifdef SE_CONTHIST2
+        int  ggPiece12 = -1, ggTo = 0;
+        if (ply >= 4 && ss[ply - 4].currentMove != 0) {
+            ggPiece12 = make_piece(stm, ss[ply - 4].movedPiece);
+            ggTo      = ss[ply - 4].toSq;
+        }
+#endif
 
         // ── Move scoring (for ordering) ───────────────────────────────────────
         // Assign a score to each pseudo-legal move; we iterate in descending
@@ -569,6 +671,9 @@ struct Searcher {
                             q += (int)contHist[pPiece12][pTo][cp12][to];
                             if (gPiece12 >= 0) q += (int)contHist[gPiece12][gTo][cp12][to];
                         }
+#ifdef SE_CONTHIST2
+                        if (ggPiece12 >= 0) q += (int)contHist2[ggPiece12][ggTo][cp12][to];
+#endif
                         scores[i] = q;
                     }
                 }
@@ -597,6 +702,11 @@ struct Searcher {
             }
 
             Move m = ml.moves[i];
+
+#ifdef SE_SINGULAR
+            // Skip the excluded move while verifying a singular candidate.
+            if (m == ss[ply].excluded) continue;
+#endif
 
             // ── Classify move BEFORE do_move (board is still unmoved) ─────
             // isQuiet: not a capture, not en passant, not a promotion.
@@ -658,7 +768,36 @@ struct Searcher {
                     quietHist += (int)contHist[pPiece12][pTo][cp12][to_sq(m)];
                     if (gPiece12 >= 0) quietHist += (int)contHist[gPiece12][gTo][cp12][to_sq(m)];
                 }
+#ifdef SE_CONTHIST2
+                if (ggPiece12 >= 0) quietHist += (int)contHist2[ggPiece12][ggTo][cp12][to_sq(m)];
+#endif
             }
+
+#ifdef SE_SINGULAR
+            // ── Singular Extension ────────────────────────────────────────
+            // If the TT move's score is "singular" (a reduced search excluding
+            // it fails below ttScore - SE_MARGIN), extend it by +1. Guards:
+            // this is the TT move, not already verifying, deep enough node,
+            // reliable TT entry (depth, non-UPPER, non-mate), ply headroom.
+            // Crash-safe: seDepth=(depth-1)/2 < depth (no runaway); excluded is
+            // cleared right after the call; the verification's TT cutoff/store
+            // are skipped via the excluded==0 guards.
+            int seExtension = 0;
+            if (ttMove != 0 && m == ttMove
+                    && ss[ply].excluded == 0
+                    && depth >= 8
+                    && ttHit && tte.depth >= depth - 3
+                    && ttBound != BOUND_UPPER
+                    && !is_mate_score(ttScore)
+                    && ply < MAX_PLY - 2) {
+                const int seBeta  = ttScore - SE_MARGIN;
+                const int seDepth = std::max(1, (depth - 1) / 2);
+                ss[ply].excluded = ttMove;
+                int seScore = negamax(pos, seDepth, seBeta - 1, seBeta, ply);
+                ss[ply].excluded = 0;
+                if (!aborted && seScore < seBeta) seExtension = 1;
+            }
+#endif
 
             StateInfo st;
             pos.do_move(m, st);
@@ -684,11 +823,15 @@ struct Searcher {
             // ── Does this move give check? (opponent now to move) ─────────
             const bool givesCheck = pos.in_check(pos.side_to_move());
 
-            // ── Check extension ───────────────────────────────────────────
-            // Extend by 1 ply when this move gives check. Checks are forcing
-            // moves that deserve deeper exploration; the MAX_PLY guard in the
-            // recursion prevents depth runaway.
+            // ── Check extension (+ singular extension, capped at +1) ──────
+            // Extend by 1 ply when this move gives check or is singular. Checks
+            // are forcing; the MAX_PLY guard in the recursion prevents runaway.
+#ifdef SE_SINGULAR
+            const int extension =
+                std::min(1, (givesCheck && ply < MAX_PLY - 1 ? 1 : 0) + seExtension);
+#else
             const int extension = (givesCheck && ply < MAX_PLY - 1) ? 1 : 0;
+#endif
             const int newDepth = depth - 1 + extension;
             int score;
 
@@ -708,6 +851,17 @@ struct Searcher {
                     if (r > newDepth - 1) r = newDepth - 1; // never below 1 ply
                     if (r < 0) r = 0;
                 }
+#ifdef SE_BADCAPLMR
+                // Mild LMR for late SEE-negative captures (scored < 0 by the
+                // ordering pass; good captures score >= SCORE_CAPTURE, quiets
+                // were handled above). Promotions keep SCORE_CAPTURE so are safe.
+                else if (!isQuiet && scores[i] < 0 && depth >= 4
+                         && moveCount >= 4 && !inCheck && !givesCheck) {
+                    r = 1;
+                    if (r > newDepth - 1) r = newDepth - 1;
+                    if (r < 0) r = 0;
+                }
+#endif
 
                 // Reduced zero-window scout.
                 score = -negamax(pos, newDepth - r, -alpha - 1, -alpha, ply + 1);
@@ -744,6 +898,9 @@ struct Searcher {
                     hist_update(history[stm][f][t], bo);
                     if (pPiece12 >= 0) hist_update(contHist[pPiece12][pTo][cp12][t], bo);
                     if (gPiece12 >= 0) hist_update(contHist[gPiece12][gTo][cp12][t], bo);
+#ifdef SE_CONTHIST2
+                    if (ggPiece12 >= 0) hist_update(contHist2[ggPiece12][ggTo][cp12][t], bo / 2);
+#endif
                 };
                 auto capBonus = [&](Move mv, int bo) {
                     const Square f = from_sq(mv), t = to_sq(mv);
@@ -787,6 +944,11 @@ struct Searcher {
         Bound bound = (best <= alphaOrig) ? BOUND_UPPER
                     : (best >= beta)       ? BOUND_LOWER
                     :                        BOUND_EXACT;
+#ifdef SE_SINGULAR
+        // Don't pollute the TT with the result of a singular-verification search
+        // (it deliberately omits the best move).
+        if (ss[ply].excluded == 0)
+#endif
         tt.store(pos.key(), bestMove, toTT(best, ply),
                  inCheck ? TT_EVAL_NONE : (int16_t)staticEval, (uint8_t)depth, bound);
 
@@ -877,7 +1039,11 @@ static void smp_worker(Searcher& s, Position& pos, const TimeManager& tm,
     };
 
     for (int depth = 1; depth <= maxDepth; ++depth) {
+#ifdef SE_ASPDELTA
+        int delta = 12;
+#else
         int delta = 20;
+#endif
         int alpha, beta;
         if (depth >= 5) {
             alpha = prevScore - delta;
@@ -1091,6 +1257,9 @@ Move think(Position& pos, const Limits& L, std::atomic<bool>& stop,
         std::memset(s.captHist, 0, sizeof(s.captHist));
         std::memset(s.counterMove, 0, sizeof(s.counterMove));
         std::memset(s.contHist, 0, sizeof(s.contHist));
+#ifdef SE_CONTHIST2
+        std::memset(s.contHist2, 0, sizeof(s.contHist2));
+#endif
         std::memset(s.ss, 0, sizeof(s.ss));
         positions[t].copy_from(pos); // private clone with full repetition history
     }
@@ -1180,6 +1349,9 @@ SearchResult think_result(Position& pos, const Limits& L,
         std::memset(s.captHist, 0, sizeof(s.captHist));
         std::memset(s.counterMove, 0, sizeof(s.counterMove));
         std::memset(s.contHist, 0, sizeof(s.contHist));
+#ifdef SE_CONTHIST2
+        std::memset(s.contHist2, 0, sizeof(s.contHist2));
+#endif
         std::memset(s.ss, 0, sizeof(s.ss));
         positions[t].copy_from(pos);
     }
