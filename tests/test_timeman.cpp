@@ -37,6 +37,20 @@ TEST_CASE("never pathological on tiny clock") {
   CHECK(tm.hard_ms >= 1);
   CHECK(tm.soft_ms >= 1);
 }
+TEST_CASE("low clock must not collapse to instant move") {
+  // Regression: with the default 200ms overhead, a 1-9s clock used to make the
+  // soft limit collapse to ~1ms (subtracting the full overhead from a tiny soft
+  // budget), so the engine played instant, losing moves. The soft target must
+  // stay sensible while the hard limit remains flag-safe (< 45% of the clock).
+  int clocks[] = {1000, 2000, 5000, 8000};
+  for (int t : clocks) {
+    Limits L; L.time[WHITE]=t;
+    TimeManager tm; tm.init(L, WHITE, 200);
+    CHECK(tm.soft_ms >= 20);
+    CHECK(tm.hard_ms >= tm.soft_ms);
+    CHECK(tm.hard_ms < (int64_t)(t * 0.45));
+  }
+}
 TEST_CASE("infinite") {
   Limits L; L.infinite=true;
   TimeManager tm; tm.init(L, WHITE, 300);

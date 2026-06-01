@@ -31,8 +31,15 @@ void TimeManager::init(const Limits& L, Color us, int overhead) {
     int64_t base = (int64_t)t / mtg + inc;
     int64_t soft = std::min<int64_t>(base, (int64_t)(t * 0.10));
     int64_t hard = std::min<int64_t>(soft * 4, (int64_t)(t * 0.40));
-    soft -= overhead;
-    hard -= overhead;
+    // Reserve the communication overhead from the hard deadline only, and never
+    // reserve more than half of it. Subtracting the full overhead from `soft`
+    // (as before) made a low-but-not-panic clock (~1-9s, or even an 8s game
+    // start when overhead is the 200ms default) collapse to ~1ms, so the engine
+    // played instant, losing moves. Bounding `soft` by the overhead-adjusted
+    // `hard` keeps sensible pacing while preserving flag-safety (hard <= 40% t).
+    int64_t reserve = std::min<int64_t>(overhead, hard / 2);
+    hard = std::max<int64_t>(1, hard - reserve);
+    soft = std::min<int64_t>(soft, hard);
     soft_ms = std::max<int64_t>(1, soft);
     hard_ms = std::max<int64_t>(soft_ms, hard);  // hard always >= soft
 }
