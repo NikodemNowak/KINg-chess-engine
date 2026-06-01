@@ -331,7 +331,7 @@ void Position::set_fen(const std::string& fen) {
                 B_PAWN, B_KNIGHT, B_BISHOP, B_ROOK, B_QUEEN, B_KING
             };
             size_t idx = piece_chars.find(ch);
-            if (idx != std::string::npos) {
+            if (idx != std::string::npos && file < 8 && rank >= 0) {
                 Square s = make_square(File(file), Rank(rank));
                 put_piece(pieces_from_char[idx], s);
                 ++file;
@@ -363,10 +363,12 @@ void Position::set_fen(const std::string& fen) {
     ss >> token;
     ep_ = NO_SQ;
     if (token != "-" && token.size() >= 2) {
-        File f = File(token[0] - 'a');
-        Rank r = Rank(token[1] - '1');
-        ep_ = make_square(f, r);
-        key_ ^= zobrist::enpassant[file_of(ep_)];
+        int f = token[0] - 'a';
+        int r = token[1] - '1';
+        if (f >= 0 && f < 8 && r >= 0 && r < 8) {   // guard against a malformed FEN ep token
+            ep_ = make_square(File(f), Rank(r));
+            key_ ^= zobrist::enpassant[file_of(ep_)];
+        }
     }
 
     // 5. Halfmove clock

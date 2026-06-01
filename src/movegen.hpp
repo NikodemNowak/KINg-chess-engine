@@ -10,7 +10,7 @@ namespace king {
 struct MoveList {
     Move moves[256];
     int  size = 0;
-    void add(Move m) { assert(size < 256); moves[size++] = m; }
+    void add(Move m) { assert(size < 256); if (size < 256) moves[size++] = m; }
 };
 
 // Pseudo-legal generation: king-safety is NOT filtered, EXCEPT castling, which is

@@ -35,6 +35,11 @@ void install_handlers() {
     std::signal(SIGSEGV, on_fatal);
     std::signal(SIGABRT, on_fatal);
     std::signal(SIGFPE,  on_fatal);
+    std::signal(SIGILL,  on_fatal);   // illegal instruction (e.g. AVX2 on an unexpected CPU)
+    std::signal(SIGTERM, on_fatal);   // arbiter/OS kill: still emit our pre-armed best move
+#ifdef SIGPIPE
+    std::signal(SIGPIPE, SIG_IGN);    // broken stdout pipe must not kill us before flush
+#endif
 }
 
 } // namespace crash
