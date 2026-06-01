@@ -145,6 +145,12 @@ static constexpr int SCORE_BAD_CAPTURE = -1'000'000; // SEE<0 capture base; trie
 #define SE_MARGIN 64
 #endif
 
+// ── ProbCut (default ON — confirmed +12.2 Elo at 30+0.3 slow TC) ─────────────
+// Also depth-dependent: neutral at fast TC, positive at the competition TC.
+#ifndef SE_PROBCUT
+#define SE_PROBCUT 1
+#endif
+
 // ── History (gravity-updated, capped) ─────────────────────────────────────────
 // Butterfly + capture + continuation histories all use the same int16 gravity
 // scheme: a bonus pulls the score toward ±HIST_CAP without ever overflowing, so
