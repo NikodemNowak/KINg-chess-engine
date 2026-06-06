@@ -67,12 +67,16 @@ unsigned probe_wdl(const Position& pos) {
     const uint64_t knights = pos.pieces(KNIGHT);
     const uint64_t pawns   = pos.pieces(PAWN);
 
-    const unsigned rule50 = static_cast<unsigned>(pos.halfmove_clock());
     const unsigned ep     = fathom_ep(pos.ep_square());
     const bool     turn   = (pos.side_to_move() == WHITE);
 
+    // Probe with rule50=0: Fathom's tb_probe_wdl returns FAILED whenever rule50
+    // != 0, which would suppress the TB signal for almost every mid-game
+    // position. Passing 0 always yields the (50-move-unaware) WDL; the search
+    // applies a (100 - halfmove_clock)/100 scale to decisive scores so a win
+    // near the 50-move limit is valued cautiously.
     return tb_probe_wdl(white, black, kings, queens, rooks, bishops, knights,
-                        pawns, rule50, /*castling=*/0, ep, turn);
+                        pawns, /*rule50=*/0u, /*castling=*/0, ep, turn);
 }
 
 // ── probe_root ────────────────────────────────────────────────────────────────

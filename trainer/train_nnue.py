@@ -34,6 +34,7 @@ Run with --help for all options.
 from __future__ import annotations
 
 import argparse
+import functools
 import os
 import struct
 import sys
@@ -143,6 +144,27 @@ def king_bucket_scalar(oks: int, kb: int) -> int:
     raise ValueError(f"unsupported kbuckets={kb}")
 
 
+def king_bucket_torch(oks, kb: int):
+    """Vectorised king_bucket over a long tensor of ORIENTED own-king squares.
+    MUST match king_bucket_np / king_bucket_scalar / the C++ king_bucket EXACTLY.
+    Supported kb: 1,4,8,16,32,64. Inputs are non-negative so // is floor div."""
+    if kb == 1:
+        return torch.zeros_like(oks)
+    if kb == 64:
+        return oks
+    file2 = torch.div(oks % 8, 2, rounding_mode='floor')   # 0..3 (file pair)
+    rank = torch.div(oks, 8, rounding_mode='floor')        # 0..7
+    if kb == 4:
+        return file2
+    if kb == 8:
+        return file2 + 4 * torch.div(rank, 4, rounding_mode='floor')
+    if kb == 16:
+        return file2 + 4 * torch.div(rank, 2, rounding_mode='floor')
+    if kb == 32:
+        return file2 + 4 * rank
+    raise ValueError(f"unsupported kbuckets={kb}")
+
+
 def piece_features(pieces, persp: int, kb: int):
     """King-bucketed feature indices for `pieces` (list of (color,ptype,sq)) from
     perspective `persp`. The bucket uses persp's OWN king square. kb=1 → plain 768."""
@@ -215,14 +237,15 @@ class StreamingNNUEDataset(Dataset):
         return self._mm[self.indices[i]]
 
 
-def collate_fn(batch):
+def collate_fn(batch, kb: int = 1):
     """Vectorised collate: a list of raw records -> EmbeddingBag inputs.
 
     Computes every active feature index for the whole batch with numpy array ops
     (no Python per-piece loop), then packs them into a flat index tensor + offsets
     for nn.EmbeddingBag(mode='sum'). Both perspectives share the SAME piece order,
     so they share offsets. The feature_index math here MUST match feature_index()
-    and the C++ inference EXACTLY (bit-exact contract).
+    and the C++ inference EXACTLY (bit-exact contract). kb>1 adds the per-perspective
+    king-bucket offset (kb*768), matching gpu_batch_inputs / piece_features.
     """
     recs = np.asarray(batch)                       # structured array [B]
     B = len(recs)
@@ -253,6 +276,21 @@ def collate_fn(batch):
     cr_n = (color != nstm).astype(np.int64)
     nf = cr_n * 384 + ptype * 64 + os_n
 
+    if kb > 1:
+        # Per-sample own-king square per perspective (king whose colour == persp;
+        # exactly one per row). Bucket the oriented square and shift by kb*768.
+        col_all = ((pieces >> 4) & 1).astype(np.int64)    # [B,32]
+        pt_all  = (pieces & 0x0F).astype(np.int64)        # [B,32]
+        sq_all  = squares.astype(np.int64)                # [B,32]
+        isk = (pt_all == 5) & valid                       # [B,32]
+        ks_stm = (sq_all * (isk & (col_all == stm[:, None]))).sum(axis=1)   # [B]
+        oks_stm = np.where(stm == WHITE, ks_stm, ks_stm ^ 56)
+        sf = sf + king_bucket_np(oks_stm, kb)[rows] * INPUT_SIZE
+        nstm_b = stm ^ 1
+        ks_nst = (sq_all * (isk & (col_all == nstm_b[:, None]))).sum(axis=1)
+        oks_nst = np.where(nstm_b == WHITE, ks_nst, ks_nst ^ 56)
+        nf = nf + king_bucket_np(oks_nst, kb)[rows] * INPUT_SIZE
+
     offsets = np.zeros(B, dtype=np.int64)
     if B > 1:
         np.cumsum(n[:-1], out=offsets[1:])
@@ -266,12 +304,20 @@ def collate_fn(batch):
 # Model — HL is a parameter; EXACT same architecture as before, just flexible.
 # ──────────────────────────────────────────────────────────────────────────────
 class NNUE(nn.Module):
-    def __init__(self, hl: int, squared: bool = False, buckets: int = 1, kbuckets: int = 1):
+    def __init__(self, hl: int, squared: bool = False, buckets: int = 1, kbuckets: int = 1,
+                 factorizer: bool = False):
         super().__init__()
         self.hl = hl
         self.squared = squared  # SCReLU (clamp then square) vs CReLU
         self.buckets = buckets  # output buckets by piece count (1 = legacy)
         self.kbuckets = kbuckets  # king-square input buckets (1 = none / plain 768)
+        # Factorizer (virtual features): a king-INDEPENDENT parallel FT (plain 768->HL)
+        # summed into the real bucketed FT during TRAINING ONLY. It learns the pattern
+        # shared across all king buckets (gets KB* more gradient), so rarely-visited
+        # buckets inherit a sensible baseline -> fixes the undertraining that made plain
+        # KB regress (-88 Elo). Folded into every real bucket at quantize time, so the
+        # exported binary + C++ inference are BYTE-IDENTICAL to a plain KB net.
+        self.factorizer = bool(factorizer) and kbuckets > 1
         # Feature transformer as a sparse EmbeddingBag (sum over active features).
         # Input space is kbuckets*768 (king-bucketed HalfKP-style); kbuckets=1 is the
         # plain 768. ft.weight is [kbuckets*768, HL]; dense-equivalent W1 is its
@@ -283,10 +329,20 @@ class NNUE(nn.Module):
         # Match the old nn.Linear default init scale so training dynamics/quant
         # ranges stay comparable.
         nn.init.kaiming_uniform_(self.ft.weight, a=5 ** 0.5)
+        if self.factorizer:
+            # King-independent virtual FT: plain 768 inputs (no king-bucket offset).
+            self.ft_virtual = nn.EmbeddingBag(INPUT_SIZE, hl, mode='sum')
+            nn.init.kaiming_uniform_(self.ft_virtual.weight, a=5 ** 0.5)
 
     def forward(self, s_idx, s_off, n_idx, n_off, bucket):
         acc_stm = self.ft(s_idx, s_off) + self.b1
         acc_nst = self.ft(n_idx, n_off) + self.b1
+        if self.factorizer:
+            # Virtual feature index = real index stripped of the king-bucket offset
+            # (the offset is a multiple of 768, so % INPUT_SIZE recovers it). Same
+            # offsets (piece order is identical). Summed into the bucketed accumulator.
+            acc_stm = acc_stm + self.ft_virtual(s_idx % INPUT_SIZE, s_off)
+            acc_nst = acc_nst + self.ft_virtual(n_idx % INPUT_SIZE, n_off)
         # Clipped ReLU in float domain: clamp to [0,1] (quant uses [0,QA]).
         c_stm = torch.clamp(acc_stm, 0.0, 1.0)
         c_nst = torch.clamp(acc_nst, 0.0, 1.0)
@@ -309,6 +365,11 @@ class NNUE(nn.Module):
         binds. L2: |w|<=64 keeps W2q in int16 (64*QB=4096) while never binding on
         real values (which peak ~4.75) — pure divergence insurance."""
         self.ft.weight.clamp_(-1.98, 1.98)
+        if self.factorizer:
+            # Folded (real+virtual) weight must stay int16-safe; clamp the virtual
+            # table tighter so |real|+|virtual| <= ~1.98 after the fold.
+            self.ft_virtual.weight.clamp_(-0.99, 0.99)
+            self.ft.weight.clamp_(-0.99, 0.99)
         self.b1.clamp_(-1.98, 1.98)
         self.l2.weight.clamp_(-64.0, 64.0)
 
@@ -376,7 +437,15 @@ def quantize(model: NNUE):
     # [HL, INPUT]. b1 is the separate bias parameter.
     buckets = getattr(model, 'buckets', 1)
     kbuckets = getattr(model, 'kbuckets', 1)
-    W1 = model.ft.weight.detach().cpu().numpy().T   # [HL, kbuckets*INPUT]
+    W1 = model.ft.weight.detach().cpu().numpy().T.copy()   # [HL, kbuckets*INPUT]
+    if getattr(model, 'factorizer', False):
+        # Fold the king-independent virtual table into EVERY real bucket. After this
+        # the exported W1 (and thus the binary + C++ inference) is byte-identical to a
+        # plain KB net — the factorizer existed only during training.
+        Wv = model.ft_virtual.weight.detach().cpu().numpy().T   # [HL, INPUT]
+        for b in range(kbuckets):
+            W1[:, b * INPUT_SIZE:(b + 1) * INPUT_SIZE] += Wv
+        print(f"[quant] folded virtual factorizer into {kbuckets} king buckets")
     b1 = model.b1.detach().cpu().numpy()            # [HL]
     W2 = model.l2.weight.detach().cpu().numpy()     # [buckets, 2*HL]
     b2 = model.l2.bias.detach().cpu().numpy()       # [buckets]
@@ -512,10 +581,9 @@ def build_gpu_dataset(cache_path: str, total: int, device, kb: int = 1):
     # resident and compute the per-perspective feature indices on the fly per batch
     # (see gpu_batch_inputs). The old path precomputed int16 sf/nf tensors (~144
     # B/pos), which overflowed 16 GB VRAM past ~85M positions and thrashed; this
-    # fits 112M in ~8 GB and scales to ~200M. kb>1 (king buckets, an unused
-    # experiment) is not supported in the compact path.
-    if kb != 1:
-        raise NotImplementedError("compact GPU dataset supports kb=1 only")
+    # fits 112M in ~8 GB and scales to ~200M. The raw tensors are king-INDEPENDENT,
+    # so the SAME cache serves any kb — the king-bucket offset is applied per batch
+    # in gpu_batch_inputs (kb is accepted here only for signature symmetry).
     npz = cache_path + ".gpures2.npz"
     if Path(npz).exists() and Path(npz).stat().st_size > 0:
         print(f"[data] loading cached compact GPU tensors from {npz}")
@@ -543,10 +611,11 @@ def build_gpu_dataset(cache_path: str, total: int, device, kb: int = 1):
             torch.from_numpy(st).to(device), torch.from_numpy(ln).to(device),
             torch.from_numpy(sc).to(device), torch.from_numpy(rs).to(device))
 
-def gpu_batch_inputs(pc_g, sq_g, st_g, len_g, rows, device):
+def gpu_batch_inputs(pc_g, sq_g, st_g, len_g, rows, device, kb: int = 1):
     """Compute both perspectives' EmbeddingBag (flat indices + offsets) for a batch
     of rows ON GPU, from the compact raw pieces/squares/stm tensors. Mirrors the
-    numpy feature formula exactly: sf = (color!=stm)*384 + ptype*64 + oriented_sq."""
+    numpy feature formula exactly: sf = kb_base + (color!=stm)*384 + ptype*64 +
+    oriented_sq, where kb_base = king_bucket(oriented own-king sq)*768 (kb=1 -> 0)."""
     pc  = pc_g[rows].long()                                       # [B,32] color<<4|ptype
     sq  = sq_g[rows].long()                                       # [B,32]
     stm = st_g[rows].long().unsqueeze(1)                          # [B,1]
@@ -559,6 +628,17 @@ def gpu_batch_inputs(pc_g, sq_g, st_g, len_g, rows, device):
     nstm = stm ^ 1
     os_n = torch.where(nstm == WHITE, sq, sq ^ 56)
     nf = (color != nstm).long() * 384 + ptype * 64 + os_n
+    if kb > 1:
+        # King-bucket offset: per perspective, find the OWN king square (the king
+        # whose colour == perspective; exactly one per row, padding slots are pawns
+        # so contribute 0), orient it, bucket it, shift the feature block by kb*768.
+        is_king = (ptype == 5)                                   # [B,32]
+        ks_stm = (sq * (is_king & (color == stm)).long()).sum(dim=1)   # [B] own-king sq
+        oks_stm = torch.where(stm.squeeze(1) == WHITE, ks_stm, ks_stm ^ 56)
+        sf = sf + (king_bucket_torch(oks_stm, kb) * INPUT_SIZE).unsqueeze(1)
+        ks_nst = (sq * (is_king & (color == nstm)).long()).sum(dim=1)
+        oks_nst = torch.where(nstm.squeeze(1) == WHITE, ks_nst, ks_nst ^ 56)
+        nf = nf + (king_bucket_torch(oks_nst, kb) * INPUT_SIZE).unsqueeze(1)
     s_flat = sf[mask]
     n_flat = nf[mask]
     offsets = torch.zeros(rows.numel(), device=device, dtype=torch.long)
@@ -594,6 +674,10 @@ def main():
                     help='King-square input buckets (HalfKP-style, default 1 = plain '
                          '768). >1 is an experiment: trains + reports val loss, but '
                          'skips quantize/export until the C++ side supports it.')
+    ap.add_argument('--factorizer', action='store_true',
+                    help='With kbuckets>1: add a king-independent virtual feature table '
+                         'during training (folded into every bucket at export). Fixes '
+                         'undertrained king buckets; binary + inference are unchanged.')
     ap.add_argument('--activation', choices=['crelu', 'screlu'], default='crelu',
                     help='Hidden activation: crelu (default) or screlu (squared). '
                          'screlu nets MUST be compiled with -DNNUE_SCRELU.')
@@ -640,15 +724,12 @@ def main():
     print(f"[data] train={len(train_idx):,}  val={n_val:,}")
 
     use_gpu = (device.type == 'cuda')
-    if args.kbuckets > 1 and not use_gpu:
-        print("[error] king buckets (--kbuckets>1) are implemented only in the "
-              "GPU-resident path; run on CUDA (the CPU DataLoader collate does not "
-              "add the king-bucket offset).")
-        sys.exit(1)
 
     squared = (args.activation == 'screlu')
-    model = NNUE(HL, squared=squared, buckets=args.buckets, kbuckets=args.kbuckets).to(device)
-    print(f"[model] activation={args.activation}  buckets={args.buckets}  kbuckets={args.kbuckets}")
+    model = NNUE(HL, squared=squared, buckets=args.buckets, kbuckets=args.kbuckets,
+                 factorizer=args.factorizer).to(device)
+    print(f"[model] activation={args.activation}  buckets={args.buckets}  kbuckets={args.kbuckets}"
+          f"  factorizer={getattr(model, 'factorizer', False)}")
     n_params = sum(p.numel() for p in model.parameters())
     _hdr = 16 if args.kbuckets > 1 else (14 if args.buckets > 1 else 12)
     _sz = (_hdr + HL * args.kbuckets * INPUT_SIZE * 2 + HL * 2
@@ -684,7 +765,7 @@ def main():
             with torch.no_grad():
                 for b in range(0, va_g.numel(), args.batch):
                     rows = va_g[b:b + args.batch]
-                    si, so, ni, no = gpu_batch_inputs(pc_g, sq_g, st_g, len_g, rows, device)
+                    si, so, ni, no = gpu_batch_inputs(pc_g, sq_g, st_g, len_g, rows, device, args.kbuckets)
                     bk = bucket_tensor(len_g[rows], args.buckets)
                     pred = torch.sigmoid(model(si, so, ni, no, bk))
                     bs = rows.numel()
@@ -701,7 +782,7 @@ def main():
             ep_loss, ep_cnt = 0.0, 0
             for b in range(0, order.numel(), args.batch):
                 rows = order[b:b + args.batch]
-                si, so, ni, no = gpu_batch_inputs(pc_g, sq_g, st_g, len_g, rows, device)
+                si, so, ni, no = gpu_batch_inputs(pc_g, sq_g, st_g, len_g, rows, device, args.kbuckets)
                 bk = bucket_tensor(len_g[rows], args.buckets)
                 pred = torch.sigmoid(model(si, so, ni, no, bk))
                 loss = loss_fn(pred, make_tgt(rows))
@@ -720,7 +801,8 @@ def main():
     else:
         # ── CPU fallback: streaming DataLoader path ──────────────────────────
         num_workers = args.workers
-        loader_kw = dict(batch_size=args.batch, collate_fn=collate_fn,
+        loader_kw = dict(batch_size=args.batch,
+                         collate_fn=functools.partial(collate_fn, kb=args.kbuckets),
                          num_workers=num_workers, pin_memory=False,
                          persistent_workers=(num_workers > 0),
                          prefetch_factor=(2 if num_workers > 0 else None))
@@ -779,7 +861,8 @@ def main():
     check_idx = val_idx[:check_n]
     check_ds = StreamingNNUEDataset(cache_path, check_idx)
     check_loader = DataLoader(check_ds, batch_size=check_n, shuffle=False,
-                              collate_fn=collate_fn, num_workers=0)
+                              collate_fn=functools.partial(collate_fn, kb=args.kbuckets),
+                              num_workers=0)
     with torch.no_grad():
         si, so, ni, no, _, _, cnts = next(iter(check_loader))
         bk = bucket_tensor(cnts.to(device), args.buckets)

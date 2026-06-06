@@ -79,7 +79,7 @@ def preprocess(data_path: str, out_path: str, limit: int | None = None,
     truncate at the end.  The pre-allocation is ``limit`` (or 35_000_000 for
     the full dataset) records.
     """
-    n_alloc = limit if (limit and limit < 35_000_000) else 35_000_000
+    n_alloc = limit if (limit and limit < 200_000_000) else 200_000_000
     out = Path(out_path)
     out.parent.mkdir(parents=True, exist_ok=True)
 
@@ -136,7 +136,7 @@ def preprocess(data_path: str, out_path: str, limit: int | None = None,
             stm = WHITE if fen_fields[1] == 'w' else BLACK
 
             pieces = parse_fen_pieces(board)
-            if not pieces:
+            if not pieces or len(pieces) > 32:
                 bad += 1
                 continue
 

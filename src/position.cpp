@@ -40,6 +40,7 @@ void Position::put_piece(Piece p, Square s) {
     by_type_[piece_type(p)] |= square_bb(s);
     by_color_[color_of(p)]  |= square_bb(s);
     key_ ^= zobrist::psq[p][s];
+    if (piece_type(p) == PAWN || piece_type(p) == KING) pawn_key_ ^= zobrist::psq[p][s];
 #ifdef EVAL_NNUE
     nnue::add_feature(acc_, color_of(p), piece_type(p), s, ksq_[WHITE], ksq_[BLACK]);
 #endif
@@ -52,6 +53,7 @@ void Position::remove_piece(Square s) {
     by_color_[color_of(p)]  &= ~square_bb(s);
     board_[s] = NO_PIECE;
     key_ ^= zobrist::psq[p][s];
+    if (piece_type(p) == PAWN || piece_type(p) == KING) pawn_key_ ^= zobrist::psq[p][s];
 #ifdef EVAL_NNUE
     nnue::sub_feature(acc_, color_of(p), piece_type(p), s, ksq_[WHITE], ksq_[BLACK]);
 #endif
@@ -79,6 +81,7 @@ void Position::copy_from(const Position& o) {
     halfmove_ = o.halfmove_;
     fullmove_ = o.fullmove_;
     key_      = o.key_;
+    pawn_key_ = o.pawn_key_;
 
     // 3. Copy the repetition history verbatim (so the clone detects draws by
     //    repetition exactly like the source).
@@ -309,6 +312,7 @@ void Position::set_fen(const std::string& fen) {
     halfmove_  = 0;
     fullmove_  = 1;
     key_       = 0;
+    pawn_key_  = 0;
     st_        = &root_;
     root_.previous = nullptr;
 

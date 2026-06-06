@@ -9,6 +9,7 @@
 #include "tt.hpp"
 #include "types.hpp"
 #include "syzygy.hpp"
+#include "sparams.hpp"
 
 #include <iostream>
 #include <sstream>
@@ -189,6 +190,15 @@ void run(std::istream& in, std::ostream& out) {
     int threads      = std::max(1, std::min(256, available_cores()));
     int moveOverhead = 200;
 
+    // Auto-load Syzygy tablebases from the in-image default path so they work
+    // even when the operator never sends `setoption SyzygyPath` (the contest
+    // harness may not). A real SyzygyPath setoption still overrides this, and an
+    // absent directory is a safe no-op (tb_init fails -> enabled() stays false).
+#ifndef SYZYGY_DEFAULT_PATH
+#define SYZYGY_DEFAULT_PATH "/usr/local/share/syzygy"
+#endif
+    syzygy::init(SYZYGY_DEFAULT_PATH);
+
     auto join_worker = [&]() {
         if (worker.joinable()) worker.join();
     };
@@ -218,6 +228,11 @@ void run(std::istream& in, std::ostream& out) {
                 out << "option name Ponder type check default false\n";
                 out << "option name SyzygyPath type string default <empty>\n";
                 out << "option name SyzygyProbeDepth type spin default 1 min 0 max 100\n";
+#ifdef TUNE
+                for (auto& e : king::sp::registry())
+                    out << "option name " << e.name << " type spin default " << e.def
+                        << " min " << e.lo << " max " << e.hi << "\n";
+#endif
                 out << "uciok\n";
                 out.flush();
             }
@@ -277,6 +292,9 @@ void run(std::istream& in, std::ostream& out) {
                     // Accepted and silently ignored for now
                     // (probe depth threshold could be added here later)
                 }
+#ifdef TUNE
+                else { try { king::sp::set(opt_lower, std::stoi(val_str)); } catch (...) {} }
+#endif
                 // Unknown options silently ignored
             }
 
@@ -328,23 +346,40 @@ void run(std::istream& in, std::ostream& out) {
             else if (cmd == "go") {
                 Limits lim;
 
+                // Saturating parse: never throws, clamps to [0, INT_MAX]. A bare
+                // std::stoi throws on a clock value > INT_MAX, which (caught and
+                // ignored) left the field at 0 — and timeman treats time==0 &&
+                // inc==0 as INFINITE → unbounded search → TIME FORFEIT. (crash=loss)
+                auto sat_int = [](const std::string& s) -> int {
+                    long long v = strtoll(s.c_str(), nullptr, 10);
+                    if (v < 0) v = 0;
+                    if (v > INT_MAX) v = INT_MAX;
+                    return (int)v;
+                };
                 for (int i = 1; i < (int)toks.size(); ++i) {
                     const std::string& k = toks[i];
                     if (k == "infinite") {
                         lim.infinite = true;
                     } else if (i + 1 < (int)toks.size()) {
                         const std::string& v = toks[i + 1];
-                        try {
-                            if      (k == "wtime")     { lim.time[WHITE]  = std::stoi(v); ++i; }
-                            else if (k == "btime")     { lim.time[BLACK]  = std::stoi(v); ++i; }
-                            else if (k == "winc")      { lim.inc[WHITE]   = std::stoi(v); ++i; }
-                            else if (k == "binc")      { lim.inc[BLACK]   = std::stoi(v); ++i; }
-                            else if (k == "movestogo") { lim.movestogo    = std::stoi(v); ++i; }
-                            else if (k == "movetime")  { lim.movetime     = std::stoi(v); ++i; }
-                            else if (k == "depth")     { lim.depth        = std::stoi(v); ++i; }
-                        } catch (...) {}
+                        if      (k == "wtime")     { lim.time[WHITE]  = sat_int(v); ++i; }
+                        else if (k == "btime")     { lim.time[BLACK]  = sat_int(v); ++i; }
+                        else if (k == "winc")      { lim.inc[WHITE]   = sat_int(v); ++i; }
+                        else if (k == "binc")      { lim.inc[BLACK]   = sat_int(v); ++i; }
+                        else if (k == "movestogo") { lim.movestogo    = sat_int(v); ++i; }
+                        else if (k == "movetime")  { lim.movetime     = sat_int(v); ++i; }
+                        else if (k == "depth")     { lim.depth        = sat_int(v); ++i; }
+                        else if (k == "nodes")     { ++i; } // consumed; hang-guard below bounds it
                     }
                 }
+                // Hang-guard: a non-infinite `go` that set NO stop condition (e.g.
+                // `go nodes`, `go mate`, or a malformed command) would otherwise be
+                // treated as infinite and never return → forfeit. Bound it. (Bare
+                // `go`/`go infinite` analysis is preserved via lim.infinite.)
+                if (!lim.infinite && lim.time[WHITE] == 0 && lim.time[BLACK] == 0
+                        && lim.inc[WHITE] == 0 && lim.inc[BLACK] == 0
+                        && lim.movetime == 0 && lim.depth == 0)
+                    lim.movetime = 10000;
 
                 // Stop any previous search and join its thread
                 stop_and_join();

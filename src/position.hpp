@@ -65,6 +65,7 @@ public:
     Square   ep_square()       const { return ep_; }
     int      halfmove_clock()  const { return halfmove_; }
     uint64_t key()             const { return key_; }
+    uint64_t pawn_key()        const { return pawn_key_; }  // pawns+kings hash (correction history)
     uint64_t compute_key()     const;
 
     // Draw detection
@@ -113,6 +114,7 @@ private:
     int      halfmove_;
     int      fullmove_;
     uint64_t key_;
+    uint64_t pawn_key_ = 0;   // Zobrist of pawns + kings only (correction-history key)
 
     StateInfo  root_;          // root state (previous == nullptr)
     StateInfo* st_ = &root_;   // current state node

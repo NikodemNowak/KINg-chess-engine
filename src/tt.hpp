@@ -5,6 +5,16 @@
 #include <vector>
 #include "types.hpp"
 
+// Transposition-table associativity. TT_WAYS slots share one bucket (probed
+// together); a store evicts the least-valuable slot in the bucket (depth-/age-
+// preferred) instead of always clobbering the single direct-mapped slot — fewer
+// useful entries lost to collisions → higher hit rate → effective NPS. Default 1
+// = the original direct-mapped table (bit-identical behaviour); -DTT_WAYS=4 makes
+// it 4-way (one 64-byte cache line per bucket, so a bucket probe is one miss).
+#ifndef TT_WAYS
+#define TT_WAYS 1
+#endif
+
 namespace king {
 
 // Bound type of a stored score relative to the search window at store time.
@@ -59,6 +69,19 @@ public:
     void store(uint64_t key, Move m, int16_t score, int16_t eval,
                uint8_t depth, Bound b);
 
+    // Prefetch the cache line of `key`'s slot into cache. Called right after a
+    // do_move (once the child's zobrist key is known) so the ~100-cycle DRAM
+    // latency of the child's TT probe overlaps the rest of the move-loop / eval
+    // work instead of stalling the recursive probe. Harmless before resize
+    // (data() is valid; prefetch never dereferences). Guarded for GCC/Clang.
+    void prefetch(uint64_t key) const {
+#if defined(__GNUC__) || defined(__clang__)
+        __builtin_prefetch(table_.data() + (key & mask_));
+#else
+        (void)key;
+#endif
+    }
+
     // Approximate fill level in permille (0..1000), sampled over the first
     // 1000 slots. For UCI `info hashfull`.
     int hashfull() const;
@@ -81,8 +104,14 @@ private:
         std::atomic<uint64_t> data{0};
     };
 
-    std::vector<TTSlot> table_;
-    size_t  mask_       = 0; // (number of entries - 1); index = key & mask_
+    // A bucket = TT_WAYS slots probed together. Aligned to a cache line when the
+    // bucket fills one (TT_WAYS=4 → 64 bytes) so a bucket probe is a single miss.
+    struct alignas(TT_WAYS * sizeof(TTSlot) >= 64 ? 64 : alignof(TTSlot)) TTBucket {
+        TTSlot slot[TT_WAYS];
+    };
+
+    std::vector<TTBucket> table_;
+    size_t  mask_       = 0; // (number of buckets - 1); bucket index = key & mask_
     uint8_t generation_ = 0;
 };
 
