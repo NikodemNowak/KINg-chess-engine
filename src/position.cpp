@@ -31,19 +31,23 @@ Position::Position() : stm_(WHITE), castling_(NO_CASTLING), ep_(NO_SQ),
                        halfmove_(0), fullmove_(1), key_(0)
 {
     for (int i = 0; i < 64; ++i) board_[i] = NO_PIECE;
+#ifdef EVAL_NNUE
+    acc_stack_.resize(ACC_SIZE); // copy-make ring (heap-backed)
+#endif
 }
 
 // ── Incremental helpers ───────────────────────────────────────────────────────
 
+// NOTE: put/remove/move_piece update ONLY board state (bitboards, mailbox, keys).
+// The NNUE accumulator is maintained separately by do_move's copy-make update
+// (and rebuilt from scratch in set_fen / copy_from), decoupled from the board so
+// a move is one fused accumulator pass instead of per-piece add/sub calls.
 void Position::put_piece(Piece p, Square s) {
     board_[s]       = p;
     by_type_[piece_type(p)] |= square_bb(s);
     by_color_[color_of(p)]  |= square_bb(s);
     key_ ^= zobrist::psq[p][s];
     if (piece_type(p) == PAWN || piece_type(p) == KING) pawn_key_ ^= zobrist::psq[p][s];
-#ifdef EVAL_NNUE
-    nnue::add_feature(acc_, color_of(p), piece_type(p), s, ksq_[WHITE], ksq_[BLACK]);
-#endif
 }
 
 void Position::remove_piece(Square s) {
@@ -54,9 +58,6 @@ void Position::remove_piece(Square s) {
     board_[s] = NO_PIECE;
     key_ ^= zobrist::psq[p][s];
     if (piece_type(p) == PAWN || piece_type(p) == KING) pawn_key_ ^= zobrist::psq[p][s];
-#ifdef EVAL_NNUE
-    nnue::sub_feature(acc_, color_of(p), piece_type(p), s, ksq_[WHITE], ksq_[BLACK]);
-#endif
 }
 
 void Position::move_piece(Square from, Square to) {
@@ -101,11 +102,12 @@ void Position::copy_from(const Position& o) {
     st_ = &root_;
 
 #ifdef EVAL_NNUE
-    // Rebuild the clone's accumulator from its (now-copied) board. Track the
-    // king squares first (the incremental updates after this need them).
+    // Rebuild the clone's accumulator from its (now-copied) board, resetting the
+    // copy-make ring to ply 0. Track the king squares first.
     ksq_[WHITE] = king_sq(WHITE);
     ksq_[BLACK] = king_sq(BLACK);
-    nnue::refresh(acc_, *this);
+    acc_ply_ = 0;
+    nnue::refresh(acc_stack_[0], *this);
 #endif
 }
 
@@ -120,9 +122,8 @@ void Position::do_move(Move m, StateInfo& st) {
     st.prev_fullmove = fullmove_;
     st.prev_key      = key_;
     st_              = &st;
-    // NNUE: no accumulator snapshot. The put/remove/move_piece calls below update
-    // acc_ incrementally (both perspectives); undo_move re-applies the exact
-    // inverse of those calls, restoring acc_ without any per-ply copy.
+    // NNUE: the accumulator is updated by copy-make AFTER the board is settled (see
+    // the EVAL_NNUE block near the end of do_move), not by put/remove_piece.
 
     // 2. Remove the old en-passant file from the key (if any).
     if (ep_ != NO_SQ) key_ ^= zobrist::enpassant[file_of(ep_)];
@@ -186,13 +187,49 @@ void Position::do_move(Move m, StateInfo& st) {
     if (us == BLACK) fullmove_++;
 
 #ifdef EVAL_NNUE
-    // A king move (incl. castling — pc is the king) shifts the moving side's king
-    // bucket, so its whole perspective changes. Track the new king square; for
-    // king-bucketed nets rebuild the accumulator from scratch (the incremental
-    // updates above used the stale-but-valid king square and are overwritten).
-    if (piece_type(pc) == KING) {
-        ksq_[us] = to;
-        if (nnue::KB > 1) refresh_accumulator(us); // only the moving side's bucket changed
+    // Copy-make accumulator update: compute the child slot from the parent in ONE
+    // fused pass per perspective (the parent slot is left intact → free unmake).
+    // For KB>1 a king move (incl. castling) changes the moving side's whole bucket,
+    // so rebuild the child from scratch (board is already in its post-move state).
+    {
+        nnue::Accumulator&       dst = acc_stack_[(acc_ply_ + 1) & ACC_MASK];
+        const nnue::Accumulator& src = acc_stack_[acc_ply_ & ACC_MASK];
+        if (nnue::KB > 1 && piece_type(pc) == KING) {
+            ksq_[us] = to;
+            nnue::refresh(dst, *this);
+        } else {
+            nnue::Feat adds[2], subs[2];
+            int na = 0, ns = 0;
+            if (fl == PROMO) {
+                subs[ns++] = { us, PAWN, from };
+                adds[na++] = { us, promo_pt(m), to };
+                if (st.captured != NO_PIECE) subs[ns++] = { them, piece_type(st.captured), to };
+            } else if (fl == EN_PASSANT) {
+                subs[ns++] = { us, PAWN, from };
+                adds[na++] = { us, PAWN, to };
+                subs[ns++] = { them, PAWN, Square(us == WHITE ? to - 8 : to + 8) };
+            } else if (fl == CASTLING) {
+                Square rfrom, rto;
+                switch (to) {
+                    case G1: rfrom = H1; rto = F1; break;
+                    case C1: rfrom = A1; rto = D1; break;
+                    case G8: rfrom = H8; rto = F8; break;
+                    case C8: rfrom = A8; rto = D8; break;
+                    default: rfrom = to; rto = to; break; // unreachable
+                }
+                subs[ns++] = { us, KING, from };
+                adds[na++] = { us, KING, to };
+                subs[ns++] = { us, ROOK, rfrom };
+                adds[na++] = { us, ROOK, rto };
+            } else { // NORMAL (incl. a KB==1 king move)
+                subs[ns++] = { us, piece_type(pc), from };
+                adds[na++] = { us, piece_type(pc), to };
+                if (st.captured != NO_PIECE) subs[ns++] = { them, piece_type(st.captured), to };
+            }
+            nnue::update_accumulator(dst, src, adds, na, subs, ns, ksq_[WHITE], ksq_[BLACK]);
+            if (piece_type(pc) == KING) ksq_[us] = to; // keep tracked (KB>1 enemy perspective)
+        }
+        ++acc_ply_;
     }
 #endif
 
@@ -244,15 +281,12 @@ void Position::undo_move(Move m) {
     halfmove_ = st->prev_halfmove;
     fullmove_ = st->prev_fullmove;
     key_      = st->prev_key;
-    // NNUE: for non-king moves the put/remove/move_piece calls above already
-    // restored acc_ via the exact inverse feature deltas (delta-undo). A king
-    // move changed the moving side's bucket, so restore its tracked king square
-    // and (for king-bucketed nets) rebuild from the now-restored board.
+    // NNUE copy-make: unmake is FREE — just step the ring index back to the parent
+    // slot (left intact by do_move). Restore the tracked king square for a king
+    // move (only load-bearing for KB>1; the king is back on `from` by now).
 #ifdef EVAL_NNUE
-    if (piece_type(piece_on(from)) == KING) {
-        ksq_[us] = from;
-        if (nnue::KB > 1) refresh_accumulator(us); // only the moving side's bucket changed
-    }
+    if (piece_type(piece_on(from)) == KING) ksq_[us] = from;
+    --acc_ply_;
 #endif
     st_       = st->previous;
 }
@@ -386,12 +420,13 @@ void Position::set_fen(const std::string& fen) {
     hist_.push_back(key_);
 
 #ifdef EVAL_NNUE
-    // Track king squares, then rebuild the accumulator from scratch for the final
-    // board (the per-piece updates done by put_piece during parsing started from
-    // uninitialised state and are discarded here).
+    // Track king squares, then rebuild the accumulator from scratch into ring slot
+    // 0 (acc_ply_ reset to 0). put_piece no longer touches the accumulator, so this
+    // from-scratch refresh is the single source of truth for the root board.
     ksq_[WHITE] = king_sq(WHITE);
     ksq_[BLACK] = king_sq(BLACK);
-    nnue::refresh(acc_, *this);
+    acc_ply_ = 0;
+    nnue::refresh(acc_stack_[0], *this);
 #endif
 }
 

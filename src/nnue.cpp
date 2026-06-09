@@ -170,6 +170,23 @@ static void acc_sub_scalar(int16_t* dst, const int16_t* col) {
     for (int o = 0; o < HL; ++o) dst[o] -= col[o];
 }
 
+// ── Fused copy-make kernels: write dst (child) from src (parent) in one pass ──
+// dst[o] = src[o] + Σ adds − Σ subs, wrapping mod 2^16 exactly like the scalar
+// += / −= the int16 accumulator contract relies on (modular add is associative,
+// so any grouping/order gives the identical int16).
+static void acc_addsub_scalar(int16_t* d, const int16_t* s,
+                              const int16_t* a, const int16_t* b) {
+    for (int o = 0; o < HL; ++o) d[o] = int16_t(s[o] + a[o] - b[o]);
+}
+static void acc_addsubsub_scalar(int16_t* d, const int16_t* s, const int16_t* a,
+                                 const int16_t* b, const int16_t* c) {
+    for (int o = 0; o < HL; ++o) d[o] = int16_t(s[o] + a[o] - b[o] - c[o]);
+}
+static void acc_add2sub2_scalar(int16_t* d, const int16_t* s, const int16_t* a1,
+                                const int16_t* a2, const int16_t* b1, const int16_t* b2) {
+    for (int o = 0; o < HL; ++o) d[o] = int16_t(s[o] + a1[o] + a2[o] - b1[o] - b2[o]);
+}
+
 #if defined(KING_X86) && defined(__GNUC__)
 // AVX2 forms — compiled with an AVX2 target attribute so the intrinsics are
 // legal even though the rest of the TU targets the portable baseline. These are
@@ -236,6 +253,42 @@ static void acc_sub_avx2(int16_t* dst, const int16_t* col) {
         _mm256_storeu_si256((__m256i*)(dst + o), _mm256_sub_epi16(d, c));
     }
 }
+
+// Fused AVX2 copy-make kernels (16 int16/iter). Bit-exact with the scalar forms
+// (same modular int16 add/sub, same set of operands).
+__attribute__((target("avx2")))
+static void acc_addsub_avx2(int16_t* d, const int16_t* s,
+                            const int16_t* a, const int16_t* b) {
+    for (int o = 0; o < HL; o += 16) {
+        __m256i v = _mm256_loadu_si256((const __m256i*)(s + o));
+        v = _mm256_add_epi16(v, _mm256_loadu_si256((const __m256i*)(a + o)));
+        v = _mm256_sub_epi16(v, _mm256_loadu_si256((const __m256i*)(b + o)));
+        _mm256_storeu_si256((__m256i*)(d + o), v);
+    }
+}
+__attribute__((target("avx2")))
+static void acc_addsubsub_avx2(int16_t* d, const int16_t* s, const int16_t* a,
+                               const int16_t* b, const int16_t* c) {
+    for (int o = 0; o < HL; o += 16) {
+        __m256i v = _mm256_loadu_si256((const __m256i*)(s + o));
+        v = _mm256_add_epi16(v, _mm256_loadu_si256((const __m256i*)(a + o)));
+        v = _mm256_sub_epi16(v, _mm256_loadu_si256((const __m256i*)(b + o)));
+        v = _mm256_sub_epi16(v, _mm256_loadu_si256((const __m256i*)(c + o)));
+        _mm256_storeu_si256((__m256i*)(d + o), v);
+    }
+}
+__attribute__((target("avx2")))
+static void acc_add2sub2_avx2(int16_t* d, const int16_t* s, const int16_t* a1,
+                              const int16_t* a2, const int16_t* b1, const int16_t* b2) {
+    for (int o = 0; o < HL; o += 16) {
+        __m256i v = _mm256_loadu_si256((const __m256i*)(s + o));
+        v = _mm256_add_epi16(v, _mm256_loadu_si256((const __m256i*)(a1 + o)));
+        v = _mm256_add_epi16(v, _mm256_loadu_si256((const __m256i*)(a2 + o)));
+        v = _mm256_sub_epi16(v, _mm256_loadu_si256((const __m256i*)(b1 + o)));
+        v = _mm256_sub_epi16(v, _mm256_loadu_si256((const __m256i*)(b2 + o)));
+        _mm256_storeu_si256((__m256i*)(d + o), v);
+    }
+}
 #endif // KING_X86 && __GNUC__
 
 // Dispatch pointers — default to the universally-safe scalar kernels; init()
@@ -243,6 +296,12 @@ static void acc_sub_avx2(int16_t* dst, const int16_t* col) {
 static int64_t (*s_dot_half)(const int16_t*, const int16_t*) = dot_half_scalar;
 static void    (*s_acc_add )(int16_t*, const int16_t*)       = acc_add_scalar;
 static void    (*s_acc_sub )(int16_t*, const int16_t*)       = acc_sub_scalar;
+static void    (*s_acc_addsub)(int16_t*, const int16_t*, const int16_t*, const int16_t*)
+                   = acc_addsub_scalar;
+static void    (*s_acc_addsubsub)(int16_t*, const int16_t*, const int16_t*, const int16_t*, const int16_t*)
+                   = acc_addsubsub_scalar;
+static void    (*s_acc_add2sub2)(int16_t*, const int16_t*, const int16_t*, const int16_t*, const int16_t*, const int16_t*)
+                   = acc_add2sub2_scalar;
 
 static void init_simd_dispatch() {
 #if defined(KING_X86) && defined(__GNUC__)
@@ -255,6 +314,9 @@ static void init_simd_dispatch() {
         s_dot_half = dot_half_avx2;
         s_acc_add  = acc_add_avx2;
         s_acc_sub  = acc_sub_avx2;
+        s_acc_addsub    = acc_addsub_avx2;
+        s_acc_addsubsub = acc_addsubsub_avx2;
+        s_acc_add2sub2  = acc_add2sub2_avx2;
     }
 #endif
 }
@@ -328,6 +390,38 @@ void sub_feature(Accumulator& acc, Color c, PieceType t, Square s, Square wking,
     const int ib = feature_index(c, t, s, BLACK, bking);
     acc_sub(acc.v[WHITE], g_net.W1t[iw]);
     acc_sub(acc.v[BLACK], g_net.W1t[ib]);
+}
+
+// Copy-make fused update: child `dst` = parent `src` + adds − subs, one pass per
+// perspective via the fused kernels. (na,ns) for legal chess moves is (1,1)
+// quiet/promo, (1,2) capture/EP/promo-capture, (2,2) castling; the general loop
+// is a defensive fallback.
+void update_accumulator(Accumulator& dst, const Accumulator& src,
+                        const Feat* adds, int n_add,
+                        const Feat* subs, int n_sub,
+                        Square wking, Square bking) {
+    for (int p = 0; p < COLOR_NB; ++p) {
+        const Color  P  = (Color)p;
+        const Square kP = (P == WHITE) ? wking : bking;
+        const int16_t* A0 = g_net.W1t[feature_index(adds[0].c, adds[0].t, adds[0].s, P, kP)];
+        const int16_t* B0 = g_net.W1t[feature_index(subs[0].c, subs[0].t, subs[0].s, P, kP)];
+        if (n_add == 1 && n_sub == 1) {
+            s_acc_addsub(dst.v[p], src.v[p], A0, B0);
+        } else if (n_add == 1 && n_sub == 2) {
+            const int16_t* B1 = g_net.W1t[feature_index(subs[1].c, subs[1].t, subs[1].s, P, kP)];
+            s_acc_addsubsub(dst.v[p], src.v[p], A0, B0, B1);
+        } else if (n_add == 2 && n_sub == 2) {
+            const int16_t* A1 = g_net.W1t[feature_index(adds[1].c, adds[1].t, adds[1].s, P, kP)];
+            const int16_t* B1 = g_net.W1t[feature_index(subs[1].c, subs[1].t, subs[1].s, P, kP)];
+            s_acc_add2sub2(dst.v[p], src.v[p], A0, A1, B0, B1);
+        } else {
+            std::memcpy(dst.v[p], src.v[p], sizeof(dst.v[p]));
+            for (int i = 0; i < n_add; ++i)
+                acc_add(dst.v[p], g_net.W1t[feature_index(adds[i].c, adds[i].t, adds[i].s, P, kP)]);
+            for (int i = 0; i < n_sub; ++i)
+                acc_sub(dst.v[p], g_net.W1t[feature_index(subs[i].c, subs[i].t, subs[i].s, P, kP)]);
+        }
+    }
 }
 
 // Rebuild a single perspective from scratch (king bucket of `persp` changed).

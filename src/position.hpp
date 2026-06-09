@@ -29,12 +29,10 @@ struct StateInfo {
     int        prev_fullmove;
     uint64_t   prev_key;
     StateInfo* previous;
-    // NOTE: no NNUE accumulator snapshot here. undo_move physically restores the
-    // board with the exact inverse put/remove/move operations, and each of those
-    // updates the live accumulator incrementally (add/sub the same feature
-    // columns). Re-applying that inverse set returns acc_ to its prior bits
-    // (int16 column add/sub is commutative/associative), so a per-ply 1 KB
-    // snapshot+copy is unnecessary — this is the "delta-undo" accumulator.
+    // NOTE: no NNUE accumulator snapshot here. The accumulator uses COPY-MAKE: a
+    // per-ply ring in Position (acc_stack_) where do_move computes the child slot
+    // from the parent and undo_move just steps the ring index back — so the parent
+    // accumulator is never overwritten and needs no per-StateInfo snapshot/copy.
 };
 
 class Position {
@@ -95,13 +93,14 @@ public:
     void move_piece(Square from, Square to);
 
 #ifdef EVAL_NNUE
-    // Live NNUE accumulator (both perspectives), kept in sync by put/remove_piece
-    // and snapshot/restored across do_move/undo_move. Refreshed in set_fen and
-    // copy_from. Read by nnue::evaluate via evaluate_acc(acc, stm).
-    const nnue::Accumulator& accumulator() const { return acc_; }
-    void refresh_accumulator() { nnue::refresh(acc_, *this); }
+    // Live NNUE accumulator = the top of a per-ply COPY-MAKE ring (acc_stack_).
+    // do_move computes the child slot from the parent in one fused pass and steps
+    // acc_ply_ forward; undo_move just steps it back (the parent slot is left
+    // intact, so unmake is free). Refreshed from scratch in set_fen / copy_from.
+    const nnue::Accumulator& accumulator() const { return acc_stack_[acc_ply_ & ACC_MASK]; }
+    void refresh_accumulator() { nnue::refresh(acc_stack_[acc_ply_ & ACC_MASK], *this); }
     // Rebuild only one perspective (after a king move of that side).
-    void refresh_accumulator(Color persp) { nnue::refresh_perspective(acc_, *this, persp); }
+    void refresh_accumulator(Color persp) { nnue::refresh_perspective(acc_stack_[acc_ply_ & ACC_MASK], *this, persp); }
 #endif
 
 private:
@@ -122,12 +121,20 @@ private:
     std::vector<uint64_t> hist_; // Zobrist key history for repetition detection
 
 #ifdef EVAL_NNUE
-    // Tracked king squares — the per-perspective NNUE bucket determinants. Kept
-    // == king_sq(c) when the board is settled; they give the incremental feature
-    // updates a valid square even mid-move (king moves do a full refresh after).
-    // Maintained in set_fen / copy_from / do_move / undo_move.
+    // Tracked king squares — the per-perspective NNUE bucket determinants. Only
+    // load-bearing for KB>1 (king-bucketed nets); cheap to keep for the KB=1
+    // production net. Maintained in set_fen / copy_from / do_move / undo_move.
     Square ksq_[2] = { E1, E8 };
-    nnue::Accumulator acc_{}; // live accumulator (see accumulator())
+    // Copy-make accumulator ring, indexed by (acc_ply_ & ACC_MASK). do_move writes
+    // the next slot from the current one then ++acc_ply_; undo_move just --acc_ply_
+    // (the parent slot is untouched → free unmake). ACC_SIZE only needs to exceed
+    // the deepest do/undo NESTING (search ≤ MAX_PLY); the power-of-two ring lets
+    // forward game replay (uci `position … moves`) grow acc_ply_ unboundedly with
+    // zero overflow risk. Heap-backed so a Position stays small for vector<Position>.
+    static constexpr int ACC_SIZE = 256;
+    static constexpr int ACC_MASK = ACC_SIZE - 1;
+    std::vector<nnue::Accumulator> acc_stack_;
+    int acc_ply_ = 0;
 #endif
 };
 

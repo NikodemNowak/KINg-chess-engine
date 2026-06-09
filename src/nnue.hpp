@@ -125,5 +125,22 @@ int evaluate_acc(const Accumulator& acc, Color stm, int piece_count);
 void add_feature(Accumulator& acc, Color c, PieceType t, Square s, Square wking, Square bking);
 void sub_feature(Accumulator& acc, Color c, PieceType t, Square s, Square wking, Square bking);
 
+// ── Copy-make fused update ──────────────────────────────────────────────────
+// One piece placement (color c, type t, square s) that became active (added) or
+// inactive (removed) as the result of a move.
+struct Feat { Color c; PieceType t; Square s; };
+
+// Compute the CHILD accumulator `dst` from the PARENT `src` by applying up to two
+// added and two removed features, fused into ONE pass per perspective. This is
+// the copy-make update: `src` (the parent) is only read and left intact, so undo
+// is free (the search just steps the ply index back). n_add ∈ [1,2], n_sub ∈
+// [1,2]. wking/bking are the per-perspective OWN king squares (consulted only for
+// KB>1; ignored for the KB=1 production net). Bit-identical to
+// memcpy(dst,src) followed by n_add add_feature + n_sub sub_feature calls.
+void update_accumulator(Accumulator& dst, const Accumulator& src,
+                        const Feat* adds, int n_add,
+                        const Feat* subs, int n_sub,
+                        Square wking, Square bking);
+
 } // namespace nnue
 } // namespace king

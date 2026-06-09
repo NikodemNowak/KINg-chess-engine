@@ -153,4 +153,39 @@ TEST_CASE("NNUE: null move keeps accumulator consistent (stm swap only)") {
     CHECK(incremental_eval(p) == before);
 }
 
+// Copy-make specific: a null move pushes NO accumulator slot, so a real move made
+// AFTER a null must compute its child from the pre-null slot. Interleave real and
+// null moves and verify incremental==scratch at every step and after every undo.
+TEST_CASE("NNUE copy-make: real/null move interleaving") {
+    nn_init();
+    auto first_legal = [](Position& pos) -> Move {
+        MoveList ml; generate_legal(pos, ml); return ml.size ? ml.moves[0] : Move(0);
+    };
+    Position p;
+    p.set_fen("r1bqkbnr/pppp1ppp/2n5/4p3/4P3/5N2/PPPP1PPP/RNBQKB1R w KQkq - 0 1");
+    int root = incremental_eval(p);
+    CHECK(root == nnue::evaluate_from_scratch(p));
+
+    std::vector<StateInfo> st(8);
+    Move m1 = first_legal(p);
+    p.do_move(m1, st[0]);
+    CHECK(incremental_eval(p) == nnue::evaluate_from_scratch(p));
+    p.do_null_move(st[1]);
+    CHECK(incremental_eval(p) == nnue::evaluate_from_scratch(p));
+    Move m2 = first_legal(p);          // a real move directly after a null move
+    p.do_move(m2, st[2]);
+    CHECK(incremental_eval(p) == nnue::evaluate_from_scratch(p));
+    p.do_null_move(st[3]);
+    CHECK(incremental_eval(p) == nnue::evaluate_from_scratch(p));
+    Move m3 = first_legal(p);
+    p.do_move(m3, st[4]);
+    CHECK(incremental_eval(p) == nnue::evaluate_from_scratch(p));
+    // Unwind in exact reverse order; every parent must be restored bit-exactly.
+    p.undo_move(m3);    CHECK(incremental_eval(p) == nnue::evaluate_from_scratch(p));
+    p.undo_null_move(); CHECK(incremental_eval(p) == nnue::evaluate_from_scratch(p));
+    p.undo_move(m2);    CHECK(incremental_eval(p) == nnue::evaluate_from_scratch(p));
+    p.undo_null_move(); CHECK(incremental_eval(p) == nnue::evaluate_from_scratch(p));
+    p.undo_move(m1);    CHECK(incremental_eval(p) == root);
+}
+
 #endif // EVAL_NNUE
