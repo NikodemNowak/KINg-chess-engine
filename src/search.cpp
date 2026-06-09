@@ -754,8 +754,11 @@ struct Searcher {
         //   Quiet:           butterfly + continuation history
         //   Bad captures:   -1,000,000 + MVV-LVA + capture-history
         int scores[256];
+        int seeVal[256];                       // SEE cached at ordering, reused by the prune
+        constexpr int SEE_NONE = -2000000000;  // sentinel: SEE not computed for this move
         for (int i = 0; i < ml.size; ++i) {
             Move m = ml.moves[i];
+            seeVal[i] = SEE_NONE;
             if (ttMove != 0 && m == ttMove) {
                 scores[i] = SCORE_TT_MOVE;
             } else {
@@ -778,10 +781,16 @@ struct Searcher {
                     // band; captures that lose material (SEE<0) drop below all
                     // quiets/history so they are tried last.  Promotions are
                     // always treated as good (kept high).
-                    if (!isPromo && isCapture && see(pos, m) < 0)
-                        scores[i] = SCORE_BAD_CAPTURE + mvvlva + ch;
-                    else
+                    if (!isPromo && isCapture) {
+                        // Compute SEE ONCE here (for the good/bad split) and cache
+                        // it; the shallow-SEE prune below reuses it (same position),
+                        // so a searched capture pays SEE once instead of twice.
+                        int sv = see(pos, m);
+                        seeVal[i] = sv;
+                        scores[i] = (sv < 0 ? SCORE_BAD_CAPTURE : SCORE_CAPTURE) + mvvlva + ch;
+                    } else {
                         scores[i] = SCORE_CAPTURE + mvvlva + ch;
+                    }
                 } else {
                     // Quiet move: killers, then countermove, then histories.
                     if (ply < MAX_PLY && m == killers[ply][0]) {
@@ -825,6 +834,7 @@ struct Searcher {
             if (bi != i) {
                 std::swap(ml.moves[i], ml.moves[bi]);
                 std::swap(scores[i],   scores[bi]);
+                std::swap(seeVal[i],   seeVal[bi]); // keep the SEE cache aligned with moves
             }
 
             Move m = ml.moves[i];
@@ -907,9 +917,11 @@ struct Searcher {
             // we prune more conservatively as depth rises.  Guarded by
             // best > mate-loss so the first move (best == -INF) is never pruned.
             if (!isPV && !inCheck && depth <= 6
-                    && best > -(MATE - MAX_PLY)
-                    && see(pos, m) < -sp::see_margin * depth * depth) {
-                continue;
+                    && best > -(MATE - MAX_PLY)) {
+                // Reuse the SEE computed during move ordering (board unchanged
+                // between scoring and here); compute on demand for non-captures.
+                int sv = (seeVal[i] != SEE_NONE) ? seeVal[i] : see(pos, m);
+                if (sv < -sp::see_margin * depth * depth) continue;
             }
 
 #if HIST_PRUNE
