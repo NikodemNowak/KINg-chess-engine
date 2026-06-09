@@ -182,7 +182,7 @@ static constexpr int SCORE_BAD_CAPTURE = -1'000'000; // SEE<0 capture base; trie
 // NPS-neutral (one bool threaded). Enable -DCUTNODE=1. The bool is always plumbed
 // (so the tree shape is unchanged when OFF); only the `r += cutNode` is gated.
 #ifndef CUTNODE
-#define CUTNODE 0
+#define CUTNODE 2   // default ON (=2): +11.6 Elo stacked with CORRHIST (LOS 98.3%)
 #endif
 
 // ── Aggressive reduced-depth pruning (OFF until SPRT) ─────────────────────────
@@ -216,11 +216,28 @@ static constexpr int SCORE_BAD_CAPTURE = -1'000'000; // SEE<0 capture base; trie
 #define SMP_DIV 1    // default ON: validated (helper depth diversity, with SMP_VOTE)
 #endif
 
+// ── SMP helper aspiration widening (OFF until SPRT) ───────────────────────────
+// Helper threads use a 2x-wider aspiration window so they do NOT fail high/low in
+// lockstep with the main thread → more varied re-searches → richer shared TT →
+// main thread deepens. Bit-identical at Threads=1. -DSMP_ASPWIDE=1.
+#ifndef SMP_ASPWIDE
+#define SMP_ASPWIDE 0
+#endif
+
 // ── History pruning (OFF until SPRT) ──────────────────────────────────────────
 // Skip a late quiet whose combined history is very negative at shallow reduced
 // depth — a SOTA pruning term KINg lacks. Gated lmrDepth∈[1,3]. -DHIST_PRUNE=1.
 #ifndef HIST_PRUNE
 #define HIST_PRUNE 1 // default ON: validated +24.9 Elo (biggest single search lever)
+#endif
+
+// ── Multicut on singular fail-high (OFF until SPRT) ───────────────────────────
+// If the singular VERIFICATION search (which excludes the TT move) ALSO beats
+// beta, then 2+ distinct moves beat beta → this is a cut node → return the proven
+// bound (a multicut). Crash-safe: !aborted guard, returns a real lower bound that
+// is >= beta. -DSE_MULTICUT=1.
+#ifndef SE_MULTICUT
+#define SE_MULTICUT 0
 #endif
 
 // ── Cross-type history malus (OFF until SPRT) ─────────────────────────────────
@@ -237,7 +254,7 @@ static constexpr int SCORE_BAD_CAPTURE = -1'000'000; // SEE<0 capture base; trie
 // → sharper RFP / NMP / futility / LMR decisions. NPS-neutral (one table lookup),
 // grows at slow TC. Bounded ±64cp so it can never destabilise. Enable -DCORRHIST=1.
 #ifndef CORRHIST
-#define CORRHIST 0
+#define CORRHIST 1  // default ON: +11.6 Elo stacked with CUTNODE=2 (LOS 98.3%)
 #endif
 #define CORR_SIZE  16384   // entries per side (mask = CORR_SIZE-1)
 #define CORR_GRAIN 256     // entry stored as correction_cp * GRAIN
@@ -958,6 +975,11 @@ struct Searcher {
                 ss[ply].excluded = ttMove;
                 int seScore = negamax(pos, seDepth, seBeta - 1, seBeta, ply, cutNode);
                 ss[ply].excluded = 0;
+#if SE_MULTICUT
+                // Multicut: the TT-move-excluded search ALSO beat beta → 2+ moves
+                // beat beta → cut node → return the proven bound (>= beta).
+                if (!aborted && seBeta >= beta && seScore >= beta) return seBeta;
+#endif
                 if (!aborted && seScore < seBeta) {
                     seExtension = 1;
 #if SE_DSE
@@ -1302,7 +1324,11 @@ static void smp_worker(Searcher& s, Position& pos, const TimeManager& tm,
             if (((depth + sPhase[i]) / sSize[i]) % 2) continue;
         }
 #endif
+#if SMP_ASPWIDE
+        int delta = sp::asp_delta * (s.id > 0 ? 2 : 1); // helpers: wider window, varied re-searches
+#else
         int delta = sp::asp_delta;
+#endif
         int alpha, beta;
         if (depth >= 5) {
             alpha = prevScore - delta;
