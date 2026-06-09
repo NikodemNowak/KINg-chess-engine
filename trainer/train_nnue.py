@@ -664,6 +664,9 @@ def main():
     ap.add_argument('--epochs', type=int, default=45)
     ap.add_argument('--batch', type=int, default=16384)
     ap.add_argument('--lr', type=float, default=1e-3)
+    ap.add_argument('--step', type=int, default=15,
+                    help='StepLR step size in epochs (LR *= gamma every --step epochs). '
+                         'Scale with --epochs so the high-LR phase grows proportionally.')
     ap.add_argument('--hl', type=int, default=512,
                     help='Hidden layer size per perspective (default 512)')
     ap.add_argument('--buckets', type=int, default=1,
@@ -739,7 +742,7 @@ def main():
           f"export size={_sz/1024:.1f} KB")
 
     opt = torch.optim.Adam(model.parameters(), lr=args.lr)
-    sched = torch.optim.lr_scheduler.StepLR(opt, step_size=15, gamma=0.3)
+    sched = torch.optim.lr_scheduler.StepLR(opt, step_size=args.step, gamma=0.3)
     loss_fn = nn.MSELoss()
 
     first_train, first_val, last_train, last_val = None, None, 0.0, 0.0

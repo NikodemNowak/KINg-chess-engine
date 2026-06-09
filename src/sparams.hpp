@@ -82,6 +82,7 @@ inline std::vector<SpEntry>& registry() {
         {"SeeMargin",  &see_margin,    20,   5,  60},
         {"SeMargin",   &se_margin,     64,  20, 160},
         {"AspDelta",   &asp_delta,     20,   6,  60},
+        {"HpMult",     &hp_mult,      512, 128,2048},
         {"HistQuad",   &hist_quad,      4,   1,  12},
         {"HistLin",    &hist_lin,     120,  20, 300},
         {"HistMax",    &hist_max,     2048,512,8192},

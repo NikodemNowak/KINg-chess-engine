@@ -42,6 +42,7 @@ PARAMS = {
     "SeeMargin":  [20,   5,   60,  4],
     "SeMargin":   [64,   20, 160,  8],
     "AspDelta":   [20,   6,   60,  4],
+    "HpMult":     [512, 128, 2048, 60],   # history-pruning threshold (previously untuned)
 }
 
 def log(msg):
