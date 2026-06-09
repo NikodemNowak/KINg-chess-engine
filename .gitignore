@@ -47,3 +47,9 @@ trainer/tmp_*.txt
 nets/smoke_nnue.bin
 # build-nnue/ is a local validation build dir, not a standard out-of-tree build.
 build-nnue/
+
+# Production OB=8 net + its C++ bit-exact contract samples — these ARE the shipped
+# default (CMakeLists NNUE_OB=8 / NNUE_NET default), so they MUST be committed
+# despite the broad nets/*.bin and *.txt ignores above.
+!nets/king_ob8_174m.bin
+!trainer/s_ob8_174m.txt

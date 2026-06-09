@@ -171,7 +171,7 @@ static constexpr int SCORE_BAD_CAPTURE = -1'000'000; // SEE<0 capture base; trie
 // quiets EARLIER (depth>=3, moveCount>=4 vs 4/6) and by ONE more ply → narrower
 // tree → deeper search. Validate vs Tucano at slow TC (gauntlet), then SPSA-refine.
 #ifndef AGGR_LMR
-#define AGGR_LMR 0
+#define AGGR_LMR 1   // default ON: part of the validated baseline (ship with this on)
 #endif
 
 // ── cutNode LMR (OFF until SPRT) ──────────────────────────────────────────────
@@ -203,7 +203,7 @@ static constexpr int SCORE_BAD_CAPTURE = -1'000'000; // SEE<0 capture base; trie
 // score) — the data (bestDepths/bestScores) is already collected. ONLY affects
 // Threads>1 (identical at Threads=1). Test at Threads=4/8. -DSMP_VOTE=1.
 #ifndef SMP_VOTE
-#define SMP_VOTE 0
+#define SMP_VOTE 1   // default ON: validated +5.8 @4thr (best-thread voting)
 #endif
 
 // ── Lazy SMP thread diversity (OFF until SPRT) ────────────────────────────────
@@ -213,14 +213,14 @@ static constexpr int SCORE_BAD_CAPTURE = -1'000'000; // SEE<0 capture base; trie
 // thread → richer shared TT → main searches deeper. Only useful WITH SMP_VOTE
 // (so a helper's better result is actually picked). -DSMP_DIV=1 (implies VOTE).
 #ifndef SMP_DIV
-#define SMP_DIV 0
+#define SMP_DIV 1    // default ON: validated (helper depth diversity, with SMP_VOTE)
 #endif
 
 // ── History pruning (OFF until SPRT) ──────────────────────────────────────────
 // Skip a late quiet whose combined history is very negative at shallow reduced
 // depth — a SOTA pruning term KINg lacks. Gated lmrDepth∈[1,3]. -DHIST_PRUNE=1.
 #ifndef HIST_PRUNE
-#define HIST_PRUNE 0
+#define HIST_PRUNE 1 // default ON: validated +24.9 Elo (biggest single search lever)
 #endif
 
 // ── Cross-type history malus (OFF until SPRT) ─────────────────────────────────

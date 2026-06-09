@@ -44,7 +44,7 @@ message(STATUS "KINg NNUE_HL = ${NNUE_HL}")
 # to the original net). -DNNUE_OB=<n> selects a per-piece-count output layer and
 # requires a KNU2-format net trained with `--buckets <n>` (bucket =
 # clamp((piece_count-2)/4, 0, n-1)). 8 is the usual choice.
-set(NNUE_OB "1" CACHE STRING "NNUE output buckets by piece count (default 1 = legacy)")
+set(NNUE_OB "8" CACHE STRING "NNUE output buckets by piece count (default 8 = production net)")
 message(STATUS "KINg NNUE_OB = ${NNUE_OB}")
 
 # ── NNUE king-square input buckets (HalfKP-style) ─────────────────────────────
@@ -96,7 +96,7 @@ if(EVAL STREQUAL "NNUE")
   # nets/king_nnue.bin (or the override) at build time.
   find_package(Python3 COMPONENTS Interpreter REQUIRED)
   if(NNUE_NET STREQUAL "")
-    set(NET_BIN ${CMAKE_SOURCE_DIR}/nets/king_nnue.bin)
+    set(NET_BIN ${CMAKE_SOURCE_DIR}/nets/king_ob8_174m.bin)
   else()
     set(NET_BIN ${NNUE_NET})
   endif()
@@ -117,6 +117,20 @@ endif()
 
 add_executable(engine ${ENGINE_SRC} ${EXTRA_SRC} ${FATHOM_SRC})
 
+# ── LTO / Interprocedural optimization (default-ON for the shipped engine) ─────
+# Cross-TU inlining (see.cpp ↔ attacks.cpp ↔ bitboard/movegen) is worth a few %
+# NPS. Default-on so EVERY build path (Dockerfile, ship scripts, dev) gets it
+# without remembering -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON. AVX2 stays runtime-
+# dispatched, so no SIGILL risk. unit_tests is left non-IPO for fast test builds.
+include(CheckIPOSupported)
+check_ipo_supported(RESULT _king_ipo_ok OUTPUT _king_ipo_msg)
+if(_king_ipo_ok AND CMAKE_BUILD_TYPE STREQUAL "Release")
+  set_property(TARGET engine PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
+  message(STATUS "KINg LTO/IPO = ON (engine)")
+else()
+  message(STATUS "KINg LTO/IPO = OFF (${_king_ipo_msg})")
+endif()
+
 set(ENGINE_SRC_NO_MAIN ${ENGINE_SRC})
 list(FILTER ENGINE_SRC_NO_MAIN EXCLUDE REGEX "main\\.cpp$")
 add_executable(unit_tests ${TEST_SRC} ${ENGINE_SRC_NO_MAIN} ${EXTRA_SRC} ${FATHOM_SRC})
@@ -127,7 +141,7 @@ if(EVAL STREQUAL "NNUE")
   # Override with -DNNUE_SAMPLES=<path> when validating a temp net.
   set(NNUE_SAMPLES "" CACHE FILEPATH "Override NNUE samples file for bit-exact gate test")
   if(NNUE_SAMPLES STREQUAL "")
-    set(_samples_path "${CMAKE_SOURCE_DIR}/trainer/nnue_samples.txt")
+    set(_samples_path "${CMAKE_SOURCE_DIR}/trainer/s_ob8_174m.txt")
   else()
     set(_samples_path "${NNUE_SAMPLES}")
   endif()
