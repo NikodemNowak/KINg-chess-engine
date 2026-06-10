@@ -17,6 +17,13 @@ struct MoveList {
 // fully legality-checked here (squares empty + not moving through/into check).
 void generate_pseudo(const Position& pos, MoveList& list);
 
+// Pseudo-legal NOISY-only generation: captures (incl. capture-promotions), quiet
+// promotions, and en passant — i.e. exactly the move set quiescence searches when
+// NOT in check. Emitted in the SAME relative order as generate_pseudo's noisy
+// subset, so qsearch ordering/tie-breaking is unchanged. Skips quiet non-promotion
+// pushes, quiet piece moves, and castling. (No king-safety filtering, like pseudo.)
+void generate_captures(const Position& pos, MoveList& list);
+
 // Legality test via make/unmake: after do_move the mover is the non-side-to-move;
 // the move is legal iff that mover's king is not in check.
 bool is_legal(Position& pos, Move m);

@@ -148,6 +148,69 @@ void generate_pseudo(const Position& pos, MoveList& list) {
     }
 }
 
+void generate_captures(const Position& pos, MoveList& list) {
+    const Color    us    = pos.side_to_move();
+    const Color    them  = Color(!us);
+    const Bitboard occ   = pos.occupied();
+    const Bitboard empty = ~occ;
+    const Bitboard enemy = pos.pieces(them);
+
+    // ── Pawns: quiet promotions, captures (incl. capture-promos), en passant ──
+    const Square ep        = pos.ep_square();
+    const Rank   promoRank = (us == WHITE) ? RANK_8 : RANK_1;
+    const int    forward   = (us == WHITE) ? 8 : -8;
+
+    Bitboard pawns = pos.pieces(us, PAWN);
+    while (pawns) {
+        Square from = pop_lsb(pawns);
+        // Quiet promotion push (noisy) — only when the push lands on the last rank.
+        Square push1 = Square(int(from) + forward);
+        if ((empty & square_bb(push1)) && rank_of(push1) == promoRank)
+            add_pawn_move(list, from, push1, true, NORMAL);
+        // Captures (including capture-promotions), in the same bit order as pseudo.
+        Bitboard caps = pawn_attacks[us][from] & enemy;
+        while (caps) {
+            Square to    = pop_lsb(caps);
+            bool   promo = (rank_of(to) == promoRank);
+            add_pawn_move(list, from, to, promo, NORMAL);
+        }
+        // En passant.
+        if (ep != NO_SQ && (pawn_attacks[us][from] & square_bb(ep)))
+            list.add(make_move(from, ep, EN_PASSANT));
+    }
+
+    // ── Pieces: captures only (targets ∩ enemy), same square order as pseudo ──
+    Bitboard knights = pos.pieces(us, KNIGHT);
+    while (knights) {
+        Square from = pop_lsb(knights);
+        Bitboard t = knight_attacks[from] & enemy;
+        while (t) list.add(make_move(from, pop_lsb(t)));
+    }
+    Bitboard bishops = pos.pieces(us, BISHOP);
+    while (bishops) {
+        Square from = pop_lsb(bishops);
+        Bitboard t = bishop_attacks(from, occ) & enemy;
+        while (t) list.add(make_move(from, pop_lsb(t)));
+    }
+    Bitboard rooks = pos.pieces(us, ROOK);
+    while (rooks) {
+        Square from = pop_lsb(rooks);
+        Bitboard t = rook_attacks(from, occ) & enemy;
+        while (t) list.add(make_move(from, pop_lsb(t)));
+    }
+    Bitboard queens = pos.pieces(us, QUEEN);
+    while (queens) {
+        Square from = pop_lsb(queens);
+        Bitboard t = queen_attacks(from, occ) & enemy;
+        while (t) list.add(make_move(from, pop_lsb(t)));
+    }
+    Square ksq = pos.king_sq(us);
+    if (ksq != NO_SQ) {
+        Bitboard t = king_attacks[ksq] & enemy;
+        while (t) list.add(make_move(ksq, pop_lsb(t)));
+    }
+}
+
 bool is_legal(Position& pos, Move m) {
     StateInfo st;
     pos.do_move(m, st);

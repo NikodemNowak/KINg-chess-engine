@@ -397,7 +397,36 @@ struct Searcher {
         }
 
         MoveList ml;
+        // Not in check, qsearch only searches captures/promotions (quiets are
+        // skipped below), so generate just the NOISY moves — this avoids producing
+        // the whole quiet list and shrinks the O(n^2) ordering sort from ~all moves
+        // to ~the few captures (big win in open/endgame positions). In check we need
+        // every evasion; with SE_QSCHECK we also need quiets for quiet-check search.
+#if defined(SE_QSCHECK)
         generate_pseudo(pos, ml);
+#else
+        if (inCheck) generate_pseudo(pos, ml);
+        else         generate_captures(pos, ml);
+#endif
+
+#if defined(QS_VERIFY) && !defined(SE_QSCHECK)
+        // Correctness gate: generate_captures MUST equal the noisy subset of
+        // generate_pseudo, in the same order (so qsearch ordering is unchanged).
+        if (!inCheck) {
+            MoveList full; generate_pseudo(pos, full);
+            MoveList noisy;
+            for (int i = 0; i < full.size; ++i) {
+                Move mm = full.moves[i];
+                bool ep    = type_of(mm) == EN_PASSANT;
+                bool cap   = ep || pos.piece_on(to_sq(mm)) != NO_PIECE;
+                bool promo = type_of(mm) == PROMO;
+                if (cap || promo) noisy.add(mm);
+            }
+            if (noisy.size != ml.size) std::abort();
+            for (int i = 0; i < ml.size; ++i)
+                if (ml.moves[i] != noisy.moves[i]) std::abort();
+        }
+#endif
 
         // Precompute MVV-LVA keys for ordering; the TT move (if any) sorts first.
         int keys[256];
