@@ -325,11 +325,15 @@ struct Searcher {
     Stack   ss[MAX_PLY + 4];
 
     bool times_up() {
-        // Check the clock every 1024 nodes (was 2047). Halves the worst-case
-        // wall-time overshoot between checks — important on a busy/contended host
-        // where a node window can stall; crash/TIMEOUT = a lost game. The extra
-        // clock reads are a negligible fraction of NPS.
-        if ((nodes & 1023) == 0) {
+        // Poll the clock every 1024 nodes normally, but every 256 once the budget
+        // is small (low-clock panic, hard_ms can fall to ~50 ms). At very low time
+        // on a busy/contended host a single node window can stall, so polling 4x
+        // more often bounds the worst-case wall-time overshoot — crash/TIMEOUT = a
+        // lost game. The extra clock reads are a negligible fraction of NPS, and at
+        // fixed depth (hard_ms effectively infinite) the mask stays 1023, so a
+        // depth-limited search is node-identical to before.
+        const uint64_t mask = (hard_ms < 200) ? 255u : 1023u;
+        if ((nodes & mask) == 0) {
             if (stop->load()) return true;
             auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                           std::chrono::steady_clock::now() - start)
