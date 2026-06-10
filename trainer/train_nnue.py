@@ -305,12 +305,13 @@ def collate_fn(batch, kb: int = 1):
 # ──────────────────────────────────────────────────────────────────────────────
 class NNUE(nn.Module):
     def __init__(self, hl: int, squared: bool = False, buckets: int = 1, kbuckets: int = 1,
-                 factorizer: bool = False):
+                 factorizer: bool = False, l2clamp: float = 64.0):
         super().__init__()
         self.hl = hl
         self.squared = squared  # SCReLU (clamp then square) vs CReLU
         self.buckets = buckets  # output buckets by piece count (1 = legacy)
         self.kbuckets = kbuckets  # king-square input buckets (1 = none / plain 768)
+        self.l2clamp = float(l2clamp)  # output-weight clamp; 1.98 -> |W2q|<=127 (fast kernel)
         # Factorizer (virtual features): a king-INDEPENDENT parallel FT (plain 768->HL)
         # summed into the real bucketed FT during TRAINING ONLY. It learns the pattern
         # shared across all king buckets (gets KB* more gradient), so rarely-visited
@@ -371,7 +372,7 @@ class NNUE(nn.Module):
             self.ft_virtual.weight.clamp_(-0.99, 0.99)
             self.ft.weight.clamp_(-0.99, 0.99)
         self.b1.clamp_(-1.98, 1.98)
-        self.l2.weight.clamp_(-64.0, 64.0)
+        self.l2.weight.clamp_(-self.l2clamp, self.l2clamp)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -664,6 +665,9 @@ def main():
     ap.add_argument('--epochs', type=int, default=45)
     ap.add_argument('--batch', type=int, default=16384)
     ap.add_argument('--lr', type=float, default=1e-3)
+    ap.add_argument('--l2clamp', type=float, default=64.0,
+                    help='clamp |output-layer weight|; 1.98 keeps |W2q|<=127 so the '
+                         'fast 16-wide int16 madd inference kernel is bit-exact')
     ap.add_argument('--step', type=int, default=15,
                     help='StepLR step size in epochs (LR *= gamma every --step epochs). '
                          'Scale with --epochs so the high-LR phase grows proportionally.')
@@ -730,7 +734,7 @@ def main():
 
     squared = (args.activation == 'screlu')
     model = NNUE(HL, squared=squared, buckets=args.buckets, kbuckets=args.kbuckets,
-                 factorizer=args.factorizer).to(device)
+                 factorizer=args.factorizer, l2clamp=args.l2clamp).to(device)
     print(f"[model] activation={args.activation}  buckets={args.buckets}  kbuckets={args.kbuckets}"
           f"  factorizer={getattr(model, 'factorizer', False)}")
     n_params = sum(p.numel() for p in model.parameters())

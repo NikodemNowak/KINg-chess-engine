@@ -71,7 +71,8 @@ T read_le(const unsigned char* p) {
 
 } // namespace
 
-static void init_simd_dispatch(); // defined below (after the SIMD kernels)
+static void init_simd_dispatch();     // defined below (after the SIMD kernels)
+static void maybe_upgrade_fastdot();  // defined below; picks the 16-wide SCReLU kernel
 
 void init() {
     if (g_loaded) return;
@@ -133,6 +134,7 @@ void init() {
     for (unsigned int bkt = 0; bkt < ob; ++bkt) { g_net.b2[bkt] = read_le<int32_t>(p + off); off += 4; }
 
     g_loaded = true;
+    maybe_upgrade_fastdot(); // pick the 16-wide SCReLU kernel if this net's |W2| allows
 }
 
 // ── crelu ─────────────────────────────────────────────────────────────────
@@ -210,6 +212,33 @@ static int64_t dot_half_avx2(const int16_t* a, const int16_t* w) {
         acc = _mm256_add_epi64(acc, _mm256_cvtepi32_epi64(_mm256_castsi256_si128(ssw)));
         acc = _mm256_add_epi64(acc, _mm256_cvtepi32_epi64(_mm256_extracti128_si256(ssw, 1)));
     }
+    int64_t lanes[4];
+    _mm256_storeu_si256((__m256i*)lanes, acc);
+    return lanes[0] + lanes[1] + lanes[2] + lanes[3];
+}
+
+// Fast 16-wide SCReLU kernel — VALID ONLY when every |w| <= 128, so c*w (c in [0,QA],
+// QA=255) stays within int16 and mullo_epi16 is exact. Half the multiply-class work
+// and twice the lane width of dot_half_avx2: one vpmaddwd (16-wide) instead of two
+// vpmulld (8-wide), no int16->int32 widen of the inputs. Selected at load time by
+// maybe_upgrade_fastdot() ONLY for a net that satisfies the bound; bit-exact with
+// dot_half_scalar for such a net (c*(c*w) = c^2*w, summed pairwise then int64).
+__attribute__((target("avx2")))
+static int64_t dot_half_avx2_fast(const int16_t* a, const int16_t* w) {
+    const __m256i zero = _mm256_setzero_si256();
+    const __m256i qa   = _mm256_set1_epi16((short)QA);
+    __m256i acc0 = _mm256_setzero_si256(); // int64 x4
+    __m256i acc1 = _mm256_setzero_si256(); // int64 x4
+    for (int i = 0; i < HL; i += 16) {
+        __m256i av = _mm256_loadu_si256((const __m256i*)(a + i));
+        __m256i wv = _mm256_loadu_si256((const __m256i*)(w + i));
+        __m256i c  = _mm256_min_epi16(_mm256_max_epi16(av, zero), qa); // clamp [0,QA]
+        __m256i cw = _mm256_mullo_epi16(c, wv);                        // c*w  (fits int16)
+        __m256i pr = _mm256_madd_epi16(c, cw);                         // Σ pairs c*(c*w)=c^2*w
+        acc0 = _mm256_add_epi64(acc0, _mm256_cvtepi32_epi64(_mm256_castsi256_si128(pr)));
+        acc1 = _mm256_add_epi64(acc1, _mm256_cvtepi32_epi64(_mm256_extracti128_si256(pr, 1)));
+    }
+    __m256i acc = _mm256_add_epi64(acc0, acc1);
     int64_t lanes[4];
     _mm256_storeu_si256((__m256i*)lanes, acc);
     return lanes[0] + lanes[1] + lanes[2] + lanes[3];
@@ -318,6 +347,25 @@ static void init_simd_dispatch() {
         s_acc_addsubsub = acc_addsubsub_avx2;
         s_acc_add2sub2  = acc_add2sub2_avx2;
     }
+#endif
+}
+
+// Upgrade the SCReLU dot kernel to the 2x-faster 16-wide form when (a) AVX2 was
+// selected and (b) every output weight satisfies |W2q| <= 128 (so c*w fits int16,
+// making dot_half_avx2_fast bit-exact with the scalar reference). Called once after
+// the net loads. KING_NO_FASTDOT=1 forces the safe int32 kernel (for node-identity A/B).
+static void maybe_upgrade_fastdot() {
+#if defined(KING_X86) && defined(__GNUC__) && defined(NNUE_SCRELU)
+    if (s_dot_half != dot_half_avx2) return; // AVX2 not selected (scalar) -> leave as-is
+    if (const char* e = std::getenv("KING_NO_FASTDOT"); e && e[0] == '1') return;
+    int maxw = 0;
+    for (int b = 0; b < OB; ++b)
+        for (int i = 0; i < 2 * HL; ++i) {
+            int a = g_net.W2[b][i];
+            if (a < 0) a = -a;
+            if (a > maxw) maxw = a;
+        }
+    if (maxw <= 128) s_dot_half = dot_half_avx2_fast;
 #endif
 }
 

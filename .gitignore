@@ -53,3 +53,7 @@ build-nnue/
 # despite the broad nets/*.bin and *.txt ignores above.
 !nets/king_ob8_174m.bin
 !trainer/s_ob8_174m.txt
+# Promoted production net: int8-constrained (|W2q|<=127) so the fast 16-wide SCReLU
+# kernel is bit-exact; eval-equivalent to the OB8 net, +35 Elo from the NPS/depth.
+!nets/king_int8_174m.bin
+!trainer/s_int8_174m.txt
