@@ -678,7 +678,7 @@ struct Searcher {
                 Bound tb_bound = (score >= beta) ? BOUND_LOWER
                                : (score <= alpha) ? BOUND_UPPER
                                : BOUND_EXACT;
-                tt.store(pos.key(), 0, toTT(score, ply), 0, (uint8_t)depth, tb_bound);
+                tt.store(pos.key(), 0, toTT(score, ply), TT_EVAL_NONE, (uint8_t)depth, tb_bound);
 
                 // Cutoff (or return exact) based on window.
                 if (tb_bound == BOUND_EXACT
@@ -752,6 +752,7 @@ struct Searcher {
         bool hasNonPawn = (pos.pieces(stm, KNIGHT) | pos.pieces(stm, BISHOP)
                          | pos.pieces(stm, ROOK)   | pos.pieces(stm, QUEEN)) != 0;
         if (!isPV && !inCheck && depth >= 3 && hasNonPawn
+            && evalForPruning >= beta   // only when the static eval already beats beta
             && beta < MATE - MAX_PLY && beta > -(MATE - MAX_PLY)) {
             int R = sp::nmp_base + depth / sp::nmp_div;
 #ifdef SE_NMPEVAL
@@ -768,7 +769,10 @@ struct Searcher {
             int nullScore = -negamax(pos, std::max(0, depth - 1 - R), -beta, -beta + 1, ply + 1, !cutNode);
             pos.undo_null_move();
             if (aborted) return 0;
-            if (nullScore >= beta) return beta; // fail-high prune (return bound)
+            if (nullScore >= beta) {
+                if (nullScore >= MATE - MAX_PLY) nullScore = beta; // don't trust an unproven mate
+                return nullScore;                                  // fail-soft
+            }
         }
 
 #ifdef SE_PROBCUT
@@ -1453,7 +1457,7 @@ static void smp_worker(Searcher& s, Position& pos, const TimeManager& tm,
 
         // Store the completed root result (EXACT — full window, full search).
         // Shared TT: lockless XOR scheme makes concurrent stores safe.
-        tt.store(pos.key(), best, toTT(scoreThisDepth, 0), 0, (uint8_t)depth, BOUND_EXACT);
+        tt.store(pos.key(), best, toTT(scoreThisDepth, 0), TT_EVAL_NONE, (uint8_t)depth, BOUND_EXACT);
 
         if (isMain) {
             if (arm_crash) crash::arm_fallback(to_uci(best).c_str());
