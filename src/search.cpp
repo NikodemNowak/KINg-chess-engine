@@ -298,6 +298,32 @@ struct Stack {
     int       doubleExt   = 0;   // consecutive double singular extensions on this line (DSE cap)
 };
 
+// ── Eval cache (persistent per-thread, lockless) ─────────────────────────────
+// A dedicated position->eval memo: a hit skips the NNUE forward pass. Distinct
+// from the TT `eval` field (which qsearch leaves / re-searches constantly evict).
+// The cached value is the RAW pre-correction static eval — a pure function of the
+// position key — so entries stay valid forever and never need clearing (a
+// different position simply fails the full 64-bit key check). Behaviour-preserving:
+// the returned eval equals a recompute, so the search tree is unchanged.
+#ifndef EVAL_CACHE
+#define EVAL_CACHE 1
+#endif
+#if EVAL_CACHE
+struct EvCacheEntry { uint64_t key; int32_t eval; };
+static constexpr int EVCACHE_BITS = 16;            // 64K entries ≈ 1 MB/thread
+static constexpr int EVCACHE_SIZE = 1 << EVCACHE_BITS;
+static constexpr int EVCACHE_MASK = EVCACHE_SIZE - 1;
+// One cache per Lazy-SMP thread index, allocated ONCE and reused across searches
+// (warm). think()/think_result() rebuild the Searcher vector every call, so the
+// caches live here (handed to each Searcher by pointer), not inside the Searcher.
+static std::vector<std::vector<EvCacheEntry>> g_evalCaches;
+static void ensure_eval_caches(int n) {
+    if ((int)g_evalCaches.size() < n) g_evalCaches.resize(n);
+    for (auto& c : g_evalCaches)
+        if (c.empty()) c.assign(EVCACHE_SIZE, EvCacheEntry{0, 0});
+}
+#endif
+
 // ── Searcher ──────────────────────────────────────────────────────────────────
 struct Searcher {
     std::atomic<bool>* stop;
@@ -306,6 +332,9 @@ struct Searcher {
     uint64_t           nodes;
     bool               aborted;
     int                id = 0;   // Lazy SMP thread index (0 = main); drives diversity
+#if EVAL_CACHE
+    EvCacheEntry*      evCache = nullptr;   // -> g_evalCaches[id].data(), set in setup
+#endif
 
     // ── Move-ordering tables ───────────────────────────────────────────────
     Move    killers[MAX_PLY][2];          // 2 killer (quiet) moves per ply
@@ -341,6 +370,21 @@ struct Searcher {
             if (ms >= hard_ms) return true;
         }
         return false;
+    }
+
+    // Static eval via the per-thread cache: a hit skips the NNUE forward pass.
+    // Returns the RAW (pre-correction) static eval, bit-identical to evaluate(pos).
+    int eval_cached(Position& pos) {
+#if EVAL_CACHE
+        const uint64_t k = pos.key();
+        EvCacheEntry& e = evCache[k & EVCACHE_MASK];
+        if (e.key == k) return e.eval;
+        const int v = evaluate(pos);
+        e.key = k; e.eval = (int32_t)v;
+        return v;
+#else
+        return evaluate(pos);
+#endif
     }
 
     // ── Quiescence search ──────────────────────────────────────────────────
@@ -382,7 +426,7 @@ struct Searcher {
             best = -INF;
         } else {
             // Reuse the TT's cached static eval when present (saves an evaluate()).
-            standPat = (ttHit && tte.eval != TT_EVAL_NONE) ? (int)tte.eval : evaluate(pos);
+            standPat = (ttHit && tte.eval != TT_EVAL_NONE) ? (int)tte.eval : eval_cached(pos);
 #ifdef SE_FIFTYSCALE
             // Scale the stand-pat score toward 0 as the 50-move clock nears 100.
             // The draw check fires at exactly 100, so the factor is in [0,1].
@@ -657,7 +701,7 @@ struct Searcher {
         if (inCheck) {
             staticEval = evalForPruning = -INF;
         } else {
-            staticEval = (ttHit && tte.eval != TT_EVAL_NONE) ? (int)tte.eval : evaluate(pos);
+            staticEval = (ttHit && tte.eval != TT_EVAL_NONE) ? (int)tte.eval : eval_cached(pos);
 #if CORRHIST
             rawEval = staticEval;
             staticEval += pawnCorr[pos.side_to_move()][pos.pawn_key() & (CORR_SIZE - 1)] / CORR_GRAIN;
@@ -1569,6 +1613,9 @@ Move think(Position& pos, const Limits& L, std::atomic<bool>& stop,
     // Position clone. Thread 0 uses index 0. Position clones must outlive the
     // worker threads, hence the vectors live here on the stack of think().
     std::vector<Searcher> searchers(nThreads);
+#if EVAL_CACHE
+    ensure_eval_caches(nThreads);
+#endif
     std::vector<Position> positions(nThreads);
     std::vector<Move>     bestMoves(nThreads, startBest);
     std::vector<int>      bestScores(nThreads, 0);
@@ -1594,6 +1641,9 @@ Move think(Position& pos, const Limits& L, std::atomic<bool>& stop,
         std::memset(s.contHist2, 0, sizeof(s.contHist2));
 #endif
         std::memset(s.ss, 0, sizeof(s.ss));
+#if EVAL_CACHE
+        s.evCache = g_evalCaches[t].data();
+#endif
         positions[t].copy_from(pos); // private clone with full repetition history
     }
 
@@ -1676,6 +1726,9 @@ SearchResult think_result(Position& pos, const Limits& L,
     const auto startTime = std::chrono::steady_clock::now();
 
     std::vector<Searcher> searchers(nThreads);
+#if EVAL_CACHE
+    ensure_eval_caches(nThreads);
+#endif
     std::vector<Position> positions(nThreads);
     std::vector<Move>     bestMoves(nThreads, startBest);
     std::vector<int>      bestScores(nThreads, 0);
@@ -1706,6 +1759,9 @@ SearchResult think_result(Position& pos, const Limits& L,
         std::memset(s.contHist2, 0, sizeof(s.contHist2));
 #endif
         std::memset(s.ss, 0, sizeof(s.ss));
+#if EVAL_CACHE
+        s.evCache = g_evalCaches[t].data();
+#endif
         positions[t].copy_from(pos);
     }
 
