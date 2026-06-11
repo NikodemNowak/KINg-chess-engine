@@ -612,13 +612,20 @@ def build_gpu_dataset(cache_path: str, total: int, device, kb: int = 1):
             torch.from_numpy(st).to(device), torch.from_numpy(ln).to(device),
             torch.from_numpy(sc).to(device), torch.from_numpy(rs).to(device))
 
-def gpu_batch_inputs(pc_g, sq_g, st_g, len_g, rows, device, kb: int = 1):
+def gpu_batch_inputs(pc_g, sq_g, st_g, len_g, rows, device, kb: int = 1, mirror: bool = False):
     """Compute both perspectives' EmbeddingBag (flat indices + offsets) for a batch
     of rows ON GPU, from the compact raw pieces/squares/stm tensors. Mirrors the
     numpy feature formula exactly: sf = kb_base + (color!=stm)*384 + ptype*64 +
     oriented_sq, where kb_base = king_bucket(oriented own-king sq)*768 (kb=1 -> 0)."""
     pc  = pc_g[rows].long()                                       # [B,32] color<<4|ptype
     sq  = sq_g[rows].long()                                       # [B,32]
+    if mirror:
+        # Horizontal-mirror augmentation: flip the FILE (sq ^ 7) for ~half the rows,
+        # consistently per row. Eval-symmetric for the KB=1 (king-independent, no
+        # castling features) net -> free 2x effective data. Padding slots are masked
+        # out below, so flipping them is harmless.
+        flip = (torch.rand(rows.numel(), 1, device=device) < 0.5)
+        sq = torch.where(flip, sq ^ 7, sq)
     stm = st_g[rows].long().unsqueeze(1)                          # [B,1]
     L   = len_g[rows].long()                                      # [B]
     mask = torch.arange(MAXP, device=device)[None, :] < L[:, None]  # [B,32]
@@ -668,6 +675,9 @@ def main():
     ap.add_argument('--l2clamp', type=float, default=64.0,
                     help='clamp |output-layer weight|; 1.98 keeps |W2q|<=127 so the '
                          'fast 16-wide int16 madd inference kernel is bit-exact')
+    ap.add_argument('--mirror', action='store_true',
+                    help='horizontal-mirror (file-flip) data augmentation: free 2x '
+                         'effective data, valid only for KB=1 (king-independent) nets')
     ap.add_argument('--step', type=int, default=15,
                     help='StepLR step size in epochs (LR *= gamma every --step epochs). '
                          'Scale with --epochs so the high-LR phase grows proportionally.')
@@ -789,7 +799,7 @@ def main():
             ep_loss, ep_cnt = 0.0, 0
             for b in range(0, order.numel(), args.batch):
                 rows = order[b:b + args.batch]
-                si, so, ni, no = gpu_batch_inputs(pc_g, sq_g, st_g, len_g, rows, device, args.kbuckets)
+                si, so, ni, no = gpu_batch_inputs(pc_g, sq_g, st_g, len_g, rows, device, args.kbuckets, mirror=args.mirror)
                 bk = bucket_tensor(len_g[rows], args.buckets)
                 pred = torch.sigmoid(model(si, so, ni, no, bk))
                 loss = loss_fn(pred, make_tgt(rows))
