@@ -156,13 +156,13 @@ static constexpr int SCORE_BAD_CAPTURE = -1'000'000; // SEE<0 capture base; trie
 // line so a pathological position can't explode the tree (time-loss safety).
 // Depth-dependent → validate at slow TC (like singular). Enable with -DSE_DSE=1.
 #ifndef SE_DSE
-#define SE_DSE 0
+#define SE_DSE 1   // double + negative singular extensions (depth-scaled margin): +19.7 Elo @60+0.6, LOS 99%
 #endif
 #ifndef DSE_MARGIN
-#define DSE_MARGIN 20
+#define DSE_MARGIN 16   // per-DEPTH coeff: double-ext only if seScore < seBeta - 16*depth (was flat 20 = far too eager)
 #endif
 #ifndef DSE_CAP
-#define DSE_CAP 6
+#define DSE_CAP 4       // tighter consecutive-double cap (was 6) to bound tree inflation
 #endif
 
 // ── Aggressive LMR (OFF until validated vs Tucano at slow TC) ─────────────────
@@ -222,6 +222,16 @@ static constexpr int SCORE_BAD_CAPTURE = -1'000'000; // SEE<0 capture base; trie
 // main thread deepens. Bit-identical at Threads=1. -DSMP_ASPWIDE=1.
 #ifndef SMP_ASPWIDE
 #define SMP_ASPWIDE 0
+#endif
+
+// ── Lazy SMP per-thread LMR jitter ────────────────────────────────────────────
+// SMP_DIV desyncs WHICH iterative-deepening depth a helper is on, but every thread
+// searches a given subtree with IDENTICAL LMR → identical subtrees → redundant TT
+// stores ("8 threads ~ 1"). With SMP_LMRJIT, helpers nudge LMR by +-1 ply (by id
+// parity) so they expand a DIFFERENT late-move frontier than the main thread →
+// genuinely different trees → non-redundant TT. Bit-identical at Threads=1.
+#ifndef SMP_LMRJIT
+#define SMP_LMRJIT 0
 #endif
 
 // ── History pruning (OFF until SPRT) ──────────────────────────────────────────
@@ -1085,7 +1095,7 @@ struct Searcher {
                     // Double extension: the TT move is dramatically better than
                     // every alternative (excluded search fails well below seBeta).
                     // Capped per line (DSE_CAP) so it can never explode the tree.
-                    if (!isPV && seScore < seBeta - DSE_MARGIN
+                    if (!isPV && seScore < seBeta - DSE_MARGIN * depth
                             && ss[ply].doubleExt < DSE_CAP)
                         seExtension = 2;
 #endif
@@ -1184,6 +1194,12 @@ struct Searcher {
                     if (cutNode) r += 1;                    // expected cut node: reduce one extra ply
 #elif CUTNODE == 2
                     if (cutNode && !ttMove) r += 1;         // only the poorly-ordered cut nodes (no TT move)
+#endif
+#if SMP_LMRJIT
+                    // Lazy-SMP tree-shape diversity: odd-id helpers reduce 1 ply LESS,
+                    // even-id 1 ply MORE → different late-move frontier than main. The
+                    // clamps below bound it; main (id 0) is untouched → Thr=1 identical.
+                    if (id > 0) r += (id & 1) ? -1 : +1;
 #endif
                     if (r < 0) r = 0;
                     if (r > newDepth - 1) r = newDepth - 1; // never below 1 ply
