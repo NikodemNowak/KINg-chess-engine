@@ -308,20 +308,17 @@ struct Stack {
 #ifndef EVAL_CACHE
 #define EVAL_CACHE 1
 #endif
+#ifndef TM_INSTAB
+#define TM_INSTAB 1   // two-sided instability TM: extend when the best move is unsettled
+#endif
 #if EVAL_CACHE
 struct EvCacheEntry { uint64_t key; int32_t eval; };
 static constexpr int EVCACHE_BITS = 16;            // 64K entries ≈ 1 MB/thread
 static constexpr int EVCACHE_SIZE = 1 << EVCACHE_BITS;
 static constexpr int EVCACHE_MASK = EVCACHE_SIZE - 1;
-// One cache per Lazy-SMP thread index, allocated ONCE and reused across searches
-// (warm). think()/think_result() rebuild the Searcher vector every call, so the
-// caches live here (handed to each Searcher by pointer), not inside the Searcher.
-static std::vector<std::vector<EvCacheEntry>> g_evalCaches;
-static void ensure_eval_caches(int n) {
-    if ((int)g_evalCaches.size() < n) g_evalCaches.resize(n);
-    for (auto& c : g_evalCaches)
-        if (c.empty()) c.assign(EVCACHE_SIZE, EvCacheEntry{0, 0});
-}
+// The cache itself is thread_local (declared inside eval_cached) — correct for both
+// the per-search Lazy-SMP threads and concurrent datagen workers, with no shared
+// global state and therefore no resize/torn-read data race.
 #endif
 
 // ── Searcher ──────────────────────────────────────────────────────────────────
@@ -332,9 +329,6 @@ struct Searcher {
     uint64_t           nodes;
     bool               aborted;
     int                id = 0;   // Lazy SMP thread index (0 = main); drives diversity
-#if EVAL_CACHE
-    EvCacheEntry*      evCache = nullptr;   // -> g_evalCaches[id].data(), set in setup
-#endif
 
     // ── Move-ordering tables ───────────────────────────────────────────────
     Move    killers[MAX_PLY][2];          // 2 killer (quiet) moves per ply
@@ -376,8 +370,13 @@ struct Searcher {
     // Returns the RAW (pre-correction) static eval, bit-identical to evaluate(pos).
     int eval_cached(Position& pos) {
 #if EVAL_CACHE
+        // thread_local: each OS thread (Lazy-SMP worker OR concurrent datagen worker)
+        // owns its cache — no shared global, so no resize/torn-read race. Allocated
+        // (zeroed) on first use per thread; the full-key check makes stale hits safe.
+        static thread_local std::vector<EvCacheEntry> tl;
+        if (tl.empty()) tl.assign(EVCACHE_SIZE, EvCacheEntry{0, 0});
         const uint64_t k = pos.key();
-        EvCacheEntry& e = evCache[k & EVCACHE_MASK];
+        EvCacheEntry& e = tl[k & EVCACHE_MASK];
         if (e.key == k) return e.eval;
         const int v = evaluate(pos);
         e.key = k; e.eval = (int32_t)v;
@@ -1485,9 +1484,20 @@ static void smp_worker(Searcher& s, Position& pos, const TimeManager& tm,
             // (we're confident — bank the time), spend longer when the score just
             // dropped (fail-low panic — resolve it). Never exceed the hard limit.
             double factor = 1.0;
+#if TM_INSTAB
+            // Two-sided instability TM: bank time when the best move is settled, and
+            // EXTEND when it's unsettled (best move just changed, or eval fell) so
+            // critical positions get the depth they need instead of stopping at ~soft.
+            // The hard limit below is the flag-safety backstop, so extending is safe.
+            if (depth >= 6 && stableCnt >= 3) factor *= 0.60;   // very stable: bank time
+            if (depth >= 6 && stableCnt == 0) factor *= 1.7;    // best move just changed
+            if (scoreDrop >= 30)              factor *= 1.6;    // eval fell (fail-low panic)
+            factor = std::clamp(factor, 0.5, 4.0);              // raised ceiling (was 2.5)
+#else
             if (depth >= 6 && stableCnt >= 3) factor *= 0.65;
             if (scoreDrop >= 30) factor *= 1.6;
             factor = std::clamp(factor, 0.5, 2.5);
+#endif
             int64_t softLimit = (int64_t)(tm.soft_ms * factor);
             if (softLimit > tm.hard_ms) softLimit = tm.hard_ms;
             if (ms >= softLimit) { stop.store(true); break; }
@@ -1617,9 +1627,6 @@ Move think(Position& pos, const Limits& L, std::atomic<bool>& stop,
     // Position clone. Thread 0 uses index 0. Position clones must outlive the
     // worker threads, hence the vectors live here on the stack of think().
     std::vector<Searcher> searchers(nThreads);
-#if EVAL_CACHE
-    ensure_eval_caches(nThreads);
-#endif
     std::vector<Position> positions(nThreads);
     std::vector<Move>     bestMoves(nThreads, startBest);
     std::vector<int>      bestScores(nThreads, 0);
@@ -1645,9 +1652,6 @@ Move think(Position& pos, const Limits& L, std::atomic<bool>& stop,
         std::memset(s.contHist2, 0, sizeof(s.contHist2));
 #endif
         std::memset(s.ss, 0, sizeof(s.ss));
-#if EVAL_CACHE
-        s.evCache = g_evalCaches[t].data();
-#endif
         positions[t].copy_from(pos); // private clone with full repetition history
     }
 
@@ -1730,9 +1734,6 @@ SearchResult think_result(Position& pos, const Limits& L,
     const auto startTime = std::chrono::steady_clock::now();
 
     std::vector<Searcher> searchers(nThreads);
-#if EVAL_CACHE
-    ensure_eval_caches(nThreads);
-#endif
     std::vector<Position> positions(nThreads);
     std::vector<Move>     bestMoves(nThreads, startBest);
     std::vector<int>      bestScores(nThreads, 0);
@@ -1763,9 +1764,6 @@ SearchResult think_result(Position& pos, const Limits& L,
         std::memset(s.contHist2, 0, sizeof(s.contHist2));
 #endif
         std::memset(s.ss, 0, sizeof(s.ss));
-#if EVAL_CACHE
-        s.evCache = g_evalCaches[t].data();
-#endif
         positions[t].copy_from(pos);
     }
 
