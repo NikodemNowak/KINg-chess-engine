@@ -48,6 +48,10 @@ void Position::put_piece(Piece p, Square s) {
     by_color_[color_of(p)]  |= square_bb(s);
     key_ ^= zobrist::psq[p][s];
     if (piece_type(p) == PAWN || piece_type(p) == KING) pawn_key_ ^= zobrist::psq[p][s];
+#if MULTICORR
+    if (piece_type(p) == KNIGHT || piece_type(p) == BISHOP) minor_key_ ^= zobrist::psq[p][s];
+    if (piece_type(p) == ROOK   || piece_type(p) == QUEEN)  major_key_ ^= zobrist::psq[p][s];
+#endif
 }
 
 void Position::remove_piece(Square s) {
@@ -58,6 +62,10 @@ void Position::remove_piece(Square s) {
     board_[s] = NO_PIECE;
     key_ ^= zobrist::psq[p][s];
     if (piece_type(p) == PAWN || piece_type(p) == KING) pawn_key_ ^= zobrist::psq[p][s];
+#if MULTICORR
+    if (piece_type(p) == KNIGHT || piece_type(p) == BISHOP) minor_key_ ^= zobrist::psq[p][s];
+    if (piece_type(p) == ROOK   || piece_type(p) == QUEEN)  major_key_ ^= zobrist::psq[p][s];
+#endif
 }
 
 void Position::move_piece(Square from, Square to) {
@@ -83,6 +91,10 @@ void Position::copy_from(const Position& o) {
     fullmove_ = o.fullmove_;
     key_      = o.key_;
     pawn_key_ = o.pawn_key_;
+#if MULTICORR
+    minor_key_ = o.minor_key_;
+    major_key_ = o.major_key_;
+#endif
 
     // 3. Copy the repetition history verbatim (so the clone detects draws by
     //    repetition exactly like the source).
@@ -347,6 +359,10 @@ void Position::set_fen(const std::string& fen) {
     fullmove_  = 1;
     key_       = 0;
     pawn_key_  = 0;
+#if MULTICORR
+    minor_key_ = 0;
+    major_key_ = 0;
+#endif
     st_        = &root_;
     root_.previous = nullptr;
 

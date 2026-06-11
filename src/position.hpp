@@ -9,6 +9,13 @@
 #include "nnue.hpp"
 #endif
 
+// Multi-table correction history (minor=N+B, major=R+Q, stacked on pawn corrhist).
+// Defined here (not search.cpp) because it gates the key updates in position.cpp AND
+// the tables/read/write in search.cpp — both translation units must agree on it.
+#ifndef MULTICORR
+#define MULTICORR 0
+#endif
+
 namespace king {
 
 enum CastlingRight {
@@ -64,6 +71,8 @@ public:
     int      halfmove_clock()  const { return halfmove_; }
     uint64_t key()             const { return key_; }
     uint64_t pawn_key()        const { return pawn_key_; }  // pawns+kings hash (correction history)
+    uint64_t minor_key()       const { return minor_key_; } // knights+bishops hash (correction history)
+    uint64_t major_key()       const { return major_key_; } // rooks+queens hash   (correction history)
     uint64_t compute_key()     const;
 
     // Draw detection
@@ -114,6 +123,8 @@ private:
     int      fullmove_;
     uint64_t key_;
     uint64_t pawn_key_ = 0;   // Zobrist of pawns + kings only (correction-history key)
+    uint64_t minor_key_ = 0;  // Zobrist of knights + bishops only (correction-history key)
+    uint64_t major_key_ = 0;  // Zobrist of rooks + queens only    (correction-history key)
 
     StateInfo  root_;          // root state (previous == nullptr)
     StateInfo* st_ = &root_;   // current state node

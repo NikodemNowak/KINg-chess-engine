@@ -260,6 +260,7 @@ static constexpr int SCORE_BAD_CAPTURE = -1'000'000; // SEE<0 capture base; trie
 #define CORR_GRAIN 256     // entry stored as correction_cp * GRAIN
 #define CORR_SCALE 256     // EMA denominator (update step = weight/CORR_SCALE)
 #define CORR_MAX   (CORR_GRAIN * 64)  // clamp: ±64cp max correction
+#define CORR_TOTAL_MAX 96             // clamp on SUMMED multi-table correction (cp): guards over-correction
 
 // ── ProbCut (default ON — confirmed +12.2 Elo at 30+0.3 slow TC) ─────────────
 // Also depth-dependent: neutral at fast TC, positive at the competition TC.
@@ -311,6 +312,9 @@ struct Stack {
 #ifndef TM_INSTAB
 #define TM_INSTAB 1   // two-sided instability TM: extend when the best move is unsettled
 #endif
+#ifndef CHECK_SEE
+#define CHECK_SEE 1   // SEE-gate the check extension: skip extending material-losing checks (+12.7 Elo @60+0.6)
+#endif
 #if EVAL_CACHE
 struct EvCacheEntry { uint64_t key; int32_t eval; };
 static constexpr int EVCACHE_BITS = 16;            // 64K entries ≈ 1 MB/thread
@@ -344,6 +348,10 @@ struct Searcher {
 #endif
 #if CORRHIST
     int16_t pawnCorr[2][CORR_SIZE];  // [stm][pawn_key & (CORR_SIZE-1)] static-eval correction
+#if MULTICORR
+    int16_t minorCorr[2][CORR_SIZE]; // [stm][minor_key & (CORR_SIZE-1)] knight+bishop correction
+    int16_t majorCorr[2][CORR_SIZE]; // [stm][major_key & (CORR_SIZE-1)] rook+queen   correction
+#endif
 #endif
     Stack   ss[MAX_PLY + 4];
 
@@ -703,7 +711,18 @@ struct Searcher {
             staticEval = (ttHit && tte.eval != TT_EVAL_NONE) ? (int)tte.eval : eval_cached(pos);
 #if CORRHIST
             rawEval = staticEval;
+#if MULTICORR
+            {
+                const int cstm = pos.side_to_move();
+                int corr = pawnCorr [cstm][pos.pawn_key()  & (CORR_SIZE - 1)]
+                         + minorCorr[cstm][pos.minor_key() & (CORR_SIZE - 1)]
+                         + majorCorr[cstm][pos.major_key() & (CORR_SIZE - 1)];
+                corr /= CORR_GRAIN;                       // three same-grain ±64cp terms
+                staticEval += std::clamp(corr, -CORR_TOTAL_MAX, CORR_TOTAL_MAX);
+            }
+#else
             staticEval += pawnCorr[pos.side_to_move()][pos.pawn_key() & (CORR_SIZE - 1)] / CORR_GRAIN;
+#endif
 #endif
 #ifdef SE_FIFTYSCALE
             // Scale staticEval toward 0 near the 50-move draw threshold
@@ -1108,12 +1127,19 @@ struct Searcher {
             // ── Check extension (+ singular extension) ────────────────────
             // Extend by 1 ply when this move gives check or is singular. Checks
             // are forcing; the MAX_PLY guard in the recursion prevents runaway.
+            bool chkExtend = givesCheck && ply < MAX_PLY - 1;
+#if CHECK_SEE
+            // SEE-gate: don't spend a ply on a check that loses material (a spite/
+            // sac check). Capturing checks reuse the cached seeVal (free); quiet
+            // checks have no parent SEE here and are treated as non-losing.
+            if (chkExtend && seeVal[i] != SEE_NONE && seeVal[i] < 0) chkExtend = false;
+#endif
 #if SE_DSE
             // DSE: the singular result drives a -1..+2 extension; the check
             // extension applies only when singular didn't fire. newDepth is
             // clamped >= 1 (safety), and the per-line double-extension count
             // propagates to the child so DSE_CAP can bound consecutive doubles.
-            const int chkExt    = (givesCheck && ply < MAX_PLY - 1) ? 1 : 0;
+            const int chkExt    = chkExtend ? 1 : 0;
             const int extension = (seExtension != 0) ? seExtension : chkExt;
             // newDepth==0 is the NORMAL leaf->qsearch transition; only guard
             // against a theoretical negative (the -1 negative extension can only
@@ -1123,10 +1149,10 @@ struct Searcher {
             ss[ply + 1].doubleExt = ss[ply].doubleExt + (seExtension == 2 ? 1 : 0);
 #elif defined(SE_SINGULAR)
             const int extension =
-                std::min(1, (givesCheck && ply < MAX_PLY - 1 ? 1 : 0) + seExtension);
+                std::min(1, (chkExtend ? 1 : 0) + seExtension);
             const int newDepth = depth - 1 + extension;
 #else
-            const int extension = (givesCheck && ply < MAX_PLY - 1) ? 1 : 0;
+            const int extension = chkExtend ? 1 : 0;
             const int newDepth = depth - 1 + extension;
 #endif
             int score;
@@ -1280,6 +1306,14 @@ struct Searcher {
             const int w      = std::min(depth + 1, 16);
             const int e      = pawnCorr[c][idx] + (target - pawnCorr[c][idx]) * w / CORR_SCALE;
             pawnCorr[c][idx] = (int16_t)std::clamp(e, -CORR_MAX, CORR_MAX);
+#if MULTICORR
+            const int mi      = (int)(pos.minor_key() & (CORR_SIZE - 1));
+            const int em      = minorCorr[c][mi] + (target - minorCorr[c][mi]) * w / CORR_SCALE;
+            minorCorr[c][mi]  = (int16_t)std::clamp(em, -CORR_MAX, CORR_MAX);
+            const int ma      = (int)(pos.major_key() & (CORR_SIZE - 1));
+            const int ej      = majorCorr[c][ma] + (target - majorCorr[c][ma]) * w / CORR_SCALE;
+            majorCorr[c][ma]  = (int16_t)std::clamp(ej, -CORR_MAX, CORR_MAX);
+#endif
         }
 #endif
 #ifdef SE_SINGULAR
@@ -1646,6 +1680,10 @@ Move think(Position& pos, const Limits& L, std::atomic<bool>& stop,
         std::memset(s.counterMove, 0, sizeof(s.counterMove));
 #if CORRHIST
         std::memset(s.pawnCorr, 0, sizeof(s.pawnCorr));
+#if MULTICORR
+        std::memset(s.minorCorr, 0, sizeof(s.minorCorr));
+        std::memset(s.majorCorr, 0, sizeof(s.majorCorr));
+#endif
 #endif
         std::memset(s.contHist, 0, sizeof(s.contHist));
 #ifdef SE_CONTHIST2
@@ -1758,6 +1796,10 @@ SearchResult think_result(Position& pos, const Limits& L,
         std::memset(s.counterMove, 0, sizeof(s.counterMove));
 #if CORRHIST
         std::memset(s.pawnCorr, 0, sizeof(s.pawnCorr));
+#if MULTICORR
+        std::memset(s.minorCorr, 0, sizeof(s.minorCorr));
+        std::memset(s.majorCorr, 0, sizeof(s.majorCorr));
+#endif
 #endif
         std::memset(s.contHist, 0, sizeof(s.contHist));
 #ifdef SE_CONTHIST2
