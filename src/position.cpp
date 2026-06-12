@@ -562,13 +562,7 @@ Bitboard Position::attackers_to(Square s, Bitboard occ) const {
 }
 
 bool Position::attacked_by(Square s, Color by, Bitboard occ) const {
-    const Bitboard pawns = (by == WHITE) ? pawn_attacks[BLACK][s] : pawn_attacks[WHITE][s];
-    if (pawns & pieces(by, PAWN)) return true;
-    if (knight_attacks[s] & pieces(by, KNIGHT)) return true;
-    if (king_attacks[s] & pieces(by, KING)) return true;
-    if (bishop_attacks(s, occ) & (pieces(by, BISHOP) | pieces(by, QUEEN))) return true;
-    if (rook_attacks(s, occ) & (pieces(by, ROOK) | pieces(by, QUEEN))) return true;
-    return false;
+    return (attackers_to(s, occ) & pieces(by)) != 0;
 }
 
 bool Position::in_check(Color c) const {

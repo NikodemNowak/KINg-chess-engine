@@ -12,7 +12,7 @@
 // = the original direct-mapped table (bit-identical behaviour); -DTT_WAYS=4 makes
 // it 4-way (one 64-byte cache line per bucket, so a bucket probe is one miss).
 #ifndef TT_WAYS
-#define TT_WAYS 4
+#define TT_WAYS 1
 #endif
 
 namespace king {
