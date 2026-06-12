@@ -29,6 +29,22 @@ TEST_CASE("fen round-trip + key") {
     }
 }
 
+TEST_CASE("halfmove/fullmove clamp on absurd FEN (UB guard, crash=loss)") {
+    init_all();
+    Position p;
+    // A near-INT_MAX halfmove field would overflow halfmove_++ during search
+    // (signed-int UB -> crash on the -O3 Linux build). set_fen must clamp it to the
+    // legal [0,100] range so the clock can never overflow while deepening.
+    p.set_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 2147483647 1");
+    CHECK(p.halfmove_clock() >= 0);
+    CHECK(p.halfmove_clock() <= 100);
+    // Negative / malformed fields must also land in range.
+    Position q;
+    q.set_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - -5 0");
+    CHECK(q.halfmove_clock() >= 0);
+    CHECK(q.halfmove_clock() <= 100);
+}
+
 TEST_CASE("queries + in_check") {
     init_all();
     Position p;

@@ -427,9 +427,17 @@ void Position::set_fen(const std::string& fen) {
 
     // 5. Halfmove clock
     ss >> halfmove_;
+    // Robustness: a FEN with a huge/negative halfmove field would overflow the
+    // halfmove_++ in do_move during search (signed-int UB -> crash at -O3). Clamp to
+    // the legal [0,100] range (100 = the 50-move draw threshold; beyond is already a
+    // draw). A failed parse leaves halfmove_ at 0, which is in range. crash=loss.
+    if (halfmove_ < 0)   halfmove_ = 0;
+    if (halfmove_ > 100) halfmove_ = 100;
 
     // 6. Fullmove number
     ss >> fullmove_;
+    if (fullmove_ < 1)    fullmove_ = 1;
+    if (fullmove_ > 9999) fullmove_ = 9999;  // guard fullmove_++ overflow on absurd FENs
 
     // 7. Seed key history for repetition detection
     hist_.clear();
