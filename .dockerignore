@@ -1,0 +1,49 @@
+# Build-context hygiene — keep `docker build` fast and reproducible.
+# The Dockerfile COPYs only: CMakeLists.txt, src, third_party, tests, nets,
+# tools, trainer/nnue_samples.txt. Everything below is noise in the context
+# (and some of it — host build dirs, local experiment nets — is large).
+
+# Version control & editor cruft
+.git
+.gitignore
+.gitattributes
+.claude
+
+# Out-of-tree / accidental in-source build artifacts (never needed in the image;
+# the image always configures a fresh `build/` via `cmake -B build`)
+build/
+build-nnue/
+CMakeFiles/
+CMakeCache.txt
+Makefile
+*.o
+*.obj
+*.exe
+
+# Local-only experiment nets are gitignored; keep only the committed nets the
+# build can actually embed (NNUE_NET default = nets/king_int8_174m.bin).
+nets/*.bin
+!nets/king_int8_174m.bin
+!nets/king_ob8_174m.bin
+!nets/king_nnue.bin
+
+# Training data, datasets, numpy caches, logs, PGNs, the rules PDF, error logs.
+# The engine image needs NOTHING from data/ or trainer/ (the NNUE net is embedded
+# from nets/, the bit-exact sample gate is unit-tests-only and not built here).
+data/
+trainer/
+*.pgn
+*.log
+*.err
+*.npz
+*.pdf
+
+# Large Texel dataset & baseline binaries under tools/ (embed_net.py is kept)
+tools/*.epd
+tools/*.epd.gz
+tools/baseline/
+
+# Host-side harness files (the organizer supplies its own copies; the engine
+# inside the image never needs them)
+engine-adapter.sh
+openings.bin

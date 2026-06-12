@@ -20,13 +20,17 @@ COPY third_party ./third_party
 COPY tests ./tests
 COPY nets ./nets
 COPY tools ./tools
-COPY trainer/nnue_samples.txt ./trainer/nnue_samples.txt
 # NOTE: CMakeLists.txt builds a PORTABLE x86-64 baseline (-march=x86-64, no -mavx2).
 # AVX2 is selected at runtime in src/nnue.cpp (init_simd_dispatch via
 # __builtin_cpu_supports), so the binary runs on ANY x86-64 CPU and never SIGILLs
 # if the eval hardware lacks AVX2 — critical because crash == lost game.
+# JOBS controls build parallelism. Default (empty) = all cores via $(nproc) —
+# what the organizer wants on a fast machine. Override with --build-arg JOBS=4
+# to cap parallelism when building on a shared/busy host, without changing the
+# shipped full-speed default.
+ARG JOBS=
 RUN cmake -B build -DCMAKE_BUILD_TYPE=Release -DEVAL=${EVAL} \
-    && cmake --build build --target engine -j
+    && cmake --build build --target engine -j${JOBS:-$(nproc)}
 
 # Runtime stage (slim, CPU-only — no python, no nets, just the binary)
 FROM ubuntu:22.04 AS runtime

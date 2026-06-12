@@ -2,46 +2,63 @@
 
 KINg is a UCI chess engine written in C++20, developed for the KINo AI Chess Engine Competition.
 
-## Building locally (Windows + MinGW)
+## Building & testing locally
 
 ```
-make unit
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
+ctest --test-dir build --output-on-failure
 ```
 
-This runs CMake with the MinGW Makefiles generator, builds both the `engine` and `unit_tests` targets, and runs the full test suite via ctest.
+This builds the `engine` and `unit_tests` targets and runs the full unit-test
+suite (perft, movegen, UCI handshake, time management, NNUE bit-exact gate, …).
 
 Quick perft check at depth 5:
 
 ```
-make perft
+./build/engine perft 5
 ```
 
 ## Building in Docker
 
 ```
-make build
+docker build -t chess-engine:latest .
 ```
 
-Produces a slim `ubuntu:22.04`-based image with the UCI binary at `/usr/local/bin/engine`.
+Produces a slim `ubuntu:22.04`-based image with the UCI binary at
+`/usr/local/bin/engine`. The build is CPU-only (no CUDA): `-march=x86-64` baseline
+with AVX2 selected at runtime, so the image runs on any x86-64 host without
+SIGILL.
 
 ## Running in Docker (competition contract)
 
-The organizer harness starts the engine with:
+The organizer harness (`engine-adapter.sh`) starts the engine with:
 
 ```
-docker run --rm -i --init --memory 2g --network none king:latest
+docker run --rm -i --init --memory 2g --network none chess-engine:latest
 ```
 
-The binary at `/usr/local/bin/engine` must speak UCI on stdin/stdout. No GPU, no network, 2 GB RAM cap.
+The binary at `/usr/local/bin/engine` is the image `ENTRYPOINT` and speaks UCI on
+stdin/stdout. No GPU is required, no network, 2 GB RAM cap. The image name
+`chess-engine:latest` is the organizer adapter's default `ENGINE_IMAGE`.
 
-## Self-play smoke test (requires cutechess-cli on PATH)
+## Self-play smoke test
+
+UCI handshake only:
 
 ```
-make test-uci    # UCI handshake only
-make test-game   # two-game self-play via engine-adapter.sh
+printf 'uci\nquit\n' | docker run --rm -i chess-engine:latest
 ```
 
-`engine-adapter.sh` wraps `docker run` so that cutechess-cli can treat the container as a local UCI binary.
+Self-play via cutechess-cli, using the host-side `engine-adapter.sh` (it wraps
+`docker run` so cutechess-cli can treat the container as a local UCI binary):
+
+```
+ENGINE_IMAGE=chess-engine:latest cutechess-cli \
+    -engine cmd=./engine-adapter.sh name=KINg proto=uci \
+    -engine cmd=./engine-adapter.sh name=KINg2 proto=uci \
+    -each tc=40/60 -games 2
+```
 
 ## Provenance
 
@@ -73,7 +90,8 @@ Two evaluation back-ends are supported, selected at build time via `-DEVAL=`:
   training data preparation and is **not present at game time** — the trained net
   is baked into the binary and the engine plays completely standalone). The corpus
   is on the order of 10^8 self-play positions (~175M). The trained net is committed
-  at `nets/king_ob8_174m.bin` and embedded into the binary at build time. All trainer,
+  at `nets/king_int8_174m.bin` (int8-constrained weights for the fast 16-wide SCReLU
+kernel; eval-equivalent to the float OB8 net) and embedded into the binary at build time. All trainer,
   datagen, and search code is original to the KINg team; Stockfish contributes
   only training-data labels, not any source code.
 
@@ -99,4 +117,4 @@ KINg was developed with AI assistance. Large parts of the implementation,
 debugging, and design were done interactively with **Claude / Claude Code**
 (Anthropic).
 
-AI conversation link: `<INSERT BEFORE SUBMISSION>`
+AI conversation link: **`<INSERT BEFORE SUBMISSION — also paste this link into the submission form, §5.8>`**
