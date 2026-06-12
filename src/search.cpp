@@ -813,7 +813,7 @@ struct Searcher {
             const int pbBeta   = beta + 200;
             const int pbSeeMin = pbBeta - staticEval;
             MoveList pcml;
-            generate_pseudo(pos, pcml);
+            generate_captures(pos, pcml);
             for (int pi = 0; pi < pcml.size; ++pi) {
                 Move pm = pcml.moves[pi];
                 const bool  pcIsEp  = (type_of(pm) == EN_PASSANT);

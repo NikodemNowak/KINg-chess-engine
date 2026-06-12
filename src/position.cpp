@@ -43,35 +43,54 @@ Position::Position() : stm_(WHITE), castling_(NO_CASTLING), ep_(NO_SQ),
 // (and rebuilt from scratch in set_fen / copy_from), decoupled from the board so
 // a move is one fused accumulator pass instead of per-piece add/sub calls.
 void Position::put_piece(Piece p, Square s) {
-    board_[s]       = p;
-    by_type_[piece_type(p)] |= square_bb(s);
-    by_color_[color_of(p)]  |= square_bb(s);
+    const PieceType pt = piece_type(p);
+    const Color c = color_of(p);
+    const Bitboard bb = square_bb(s);
+    board_[s] = p;
+    by_type_[pt] |= bb;
+    by_color_[c] |= bb;
     key_ ^= zobrist::psq[p][s];
-    if (piece_type(p) == PAWN || piece_type(p) == KING) pawn_key_ ^= zobrist::psq[p][s];
+    if (pt == PAWN || pt == KING) pawn_key_ ^= zobrist::psq[p][s];
 #if MULTICORR
-    if (piece_type(p) == KNIGHT || piece_type(p) == BISHOP) minor_key_ ^= zobrist::psq[p][s];
-    if (piece_type(p) == ROOK   || piece_type(p) == QUEEN)  major_key_ ^= zobrist::psq[p][s];
+    if (pt == KNIGHT || pt == BISHOP) minor_key_ ^= zobrist::psq[p][s];
+    if (pt == ROOK   || pt == QUEEN)  major_key_ ^= zobrist::psq[p][s];
 #endif
 }
 
 void Position::remove_piece(Square s) {
-    Piece p = board_[s];
+    const Piece p = board_[s];
     assert(p != NO_PIECE);
-    by_type_[piece_type(p)] &= ~square_bb(s);
-    by_color_[color_of(p)]  &= ~square_bb(s);
+    const PieceType pt = piece_type(p);
+    const Color c = color_of(p);
+    const Bitboard bb = square_bb(s);
+    by_type_[pt] &= ~bb;
+    by_color_[c] &= ~bb;
     board_[s] = NO_PIECE;
     key_ ^= zobrist::psq[p][s];
-    if (piece_type(p) == PAWN || piece_type(p) == KING) pawn_key_ ^= zobrist::psq[p][s];
+    if (pt == PAWN || pt == KING) pawn_key_ ^= zobrist::psq[p][s];
 #if MULTICORR
-    if (piece_type(p) == KNIGHT || piece_type(p) == BISHOP) minor_key_ ^= zobrist::psq[p][s];
-    if (piece_type(p) == ROOK   || piece_type(p) == QUEEN)  major_key_ ^= zobrist::psq[p][s];
+    if (pt == KNIGHT || pt == BISHOP) minor_key_ ^= zobrist::psq[p][s];
+    if (pt == ROOK   || pt == QUEEN)  major_key_ ^= zobrist::psq[p][s];
 #endif
 }
 
 void Position::move_piece(Square from, Square to) {
-    Piece p = board_[from];
-    remove_piece(from);
-    put_piece(p, to);
+    const Piece p = board_[from];
+    assert(p != NO_PIECE);
+    const PieceType pt = piece_type(p);
+    const Color c = color_of(p);
+    const Bitboard fromTo = square_bb(from) | square_bb(to);
+
+    board_[from] = NO_PIECE;
+    board_[to] = p;
+    by_type_[pt] ^= fromTo;
+    by_color_[c] ^= fromTo;
+    key_ ^= zobrist::psq[p][from] ^ zobrist::psq[p][to];
+    if (pt == PAWN || pt == KING) pawn_key_ ^= zobrist::psq[p][from] ^ zobrist::psq[p][to];
+#if MULTICORR
+    if (pt == KNIGHT || pt == BISHOP) minor_key_ ^= zobrist::psq[p][from] ^ zobrist::psq[p][to];
+    if (pt == ROOK   || pt == QUEEN)  major_key_ ^= zobrist::psq[p][from] ^ zobrist::psq[p][to];
+#endif
 }
 
 // ── Controlled deep clone ─────────────────────────────────────────────────────
@@ -534,19 +553,22 @@ uint64_t Position::compute_key() const {
 // ── Attack queries ────────────────────────────────────────────────────────────
 
 Bitboard Position::attackers_to(Square s, Bitboard occ) const {
-    return
-        (pawn_attacks[WHITE][s]  & pieces(BLACK, PAWN))
-      | (pawn_attacks[BLACK][s]  & pieces(WHITE, PAWN))
-      | (knight_attacks[s]       & pieces(KNIGHT))
-      | (king_attacks[s]         & pieces(KING))
-      | (bishop_attacks(s, occ)  & (pieces(BISHOP) | pieces(QUEEN)))
-      | (rook_attacks(s, occ)    & (pieces(ROOK)   | pieces(QUEEN)));
+    return (pawn_attacks[WHITE][s] & pieces(BLACK, PAWN))
+      | (pawn_attacks[BLACK][s]    & pieces(WHITE, PAWN))
+      | (knight_attacks[s]         & pieces(KNIGHT))
+      | (king_attacks[s]           & pieces(KING))
+      | (bishop_attacks(s, occ)    & (pieces(BISHOP) | pieces(QUEEN)))
+      | (rook_attacks(s, occ)      & (pieces(ROOK)   | pieces(QUEEN)));
+}
+
+bool Position::attacked_by(Square s, Color by, Bitboard occ) const {
+    return (attackers_to(s, occ) & pieces(by)) != 0;
 }
 
 bool Position::in_check(Color c) const {
     Bitboard k = pieces(c, KING);
     if (!k) return false;                 // defensive: no king -> avoid OOB on lsb(0)=64
-    return (attackers_to(lsb(k), occupied()) & by_color_[Color(!c)]) != 0;
+    return attacked_by(lsb(k), Color(!c), occupied());
 }
 
 // ── Draw detection ────────────────────────────────────────────────────────────

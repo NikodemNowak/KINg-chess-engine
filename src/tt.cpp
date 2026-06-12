@@ -6,7 +6,7 @@
 // shallow same-position store must not clobber a meaningfully-deeper entry's
 // score/move. -DTT_DEPTHREPL=1.
 #ifndef TT_DEPTHREPL
-#define TT_DEPTHREPL 0
+#define TT_DEPTHREPL 1
 #endif
 
 namespace king {

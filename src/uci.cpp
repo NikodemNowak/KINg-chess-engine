@@ -20,6 +20,7 @@
 #include <vector>
 #include <deque>
 #include <algorithm>
+#include <climits>
 
 #ifdef __linux__
 #include <sched.h>

@@ -62,6 +62,7 @@ public:
 
     // Attack queries
     Bitboard attackers_to(Square s, Bitboard occ) const;
+    bool     attacked_by(Square s, Color by, Bitboard occ) const;
     bool     in_check(Color c) const;
 
     // State

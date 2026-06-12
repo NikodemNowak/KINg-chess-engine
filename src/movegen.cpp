@@ -8,7 +8,7 @@ namespace {
 
 // True iff square `s` is attacked by any piece of color `by` (uses current occ).
 inline bool attacked(const Position& pos, Square s, Color by, Bitboard occ) {
-    return (pos.attackers_to(s, occ) & pos.pieces(by)) != 0;
+    return pos.attacked_by(s, by, occ);
 }
 
 // Emit pawn moves to `to` from `from`: 4 promotion moves on the last rank,
@@ -36,38 +36,41 @@ void generate_pseudo(const Position& pos, MoveList& list) {
 
     // ── Pawns ───────────────────────────────────────────────────────────────
     const Square   ep        = pos.ep_square();
-    const Rank     startRank = (us == WHITE) ? RANK_2 : RANK_7;
     const Rank     promoRank = (us == WHITE) ? RANK_8 : RANK_1;
     const int      forward   = (us == WHITE) ? 8 : -8;
 
     Bitboard pawns = pos.pieces(us, PAWN);
-    while (pawns) {
-        Square from   = pop_lsb(pawns);
-        Rank   fromR  = rank_of(from);
+    
+    // Single and double pushes
+    Bitboard push1 = (us == WHITE) ? (pawns << 8) & empty : (pawns >> 8) & empty;
+    Bitboard push2 = (us == WHITE) ? ((push1 & RANK_3_BB) << 8) & empty : ((push1 & RANK_6_BB) >> 8) & empty;
+    Bitboard promo_mask = (us == WHITE) ? RANK_8_BB : RANK_1_BB;
 
-        // Single push.
-        Square push1 = Square(int(from) + forward);
-        if (empty & square_bb(push1)) {
-            bool promo = (rank_of(push1) == promoRank);
-            add_pawn_move(list, from, push1, promo, NORMAL);
+    Bitboard p1_promo = push1 & promo_mask;
+    while (p1_promo) {
+        Square to = pop_lsb(p1_promo);
+        add_pawn_move(list, Square(int(to) - forward), to, true, NORMAL);
+    }
+    Bitboard p1_quiet = push1 & ~promo_mask;
+    while (p1_quiet) {
+        Square to = pop_lsb(p1_quiet);
+        list.add(make_move(Square(int(to) - forward), to, NORMAL));
+    }
+    Bitboard p2 = push2;
+    while (p2) {
+        Square to = pop_lsb(p2);
+        list.add(make_move(Square(int(to) - forward * 2), to, NORMAL));
+    }
 
-            // Double push (only from the start rank, both squares empty).
-            if (fromR == startRank) {
-                Square push2 = Square(int(push1) + forward);
-                if (empty & square_bb(push2))
-                    list.add(make_move(from, push2, NORMAL));
-            }
-        }
-
-        // Captures.
+    // Captures and En Passant
+    Bitboard p3 = pawns;
+    while (p3) {
+        Square from = pop_lsb(p3);
         Bitboard caps = pawn_attacks[us][from] & enemy;
         while (caps) {
-            Square to    = pop_lsb(caps);
-            bool   promo = (rank_of(to) == promoRank);
-            add_pawn_move(list, from, to, promo, NORMAL);
+            Square to = pop_lsb(caps);
+            add_pawn_move(list, from, to, rank_of(to) == promoRank, NORMAL);
         }
-
-        // En passant.
         if (ep != NO_SQ && (pawn_attacks[us][from] & square_bb(ep)))
             list.add(make_move(from, ep, EN_PASSANT));
     }
@@ -161,20 +164,22 @@ void generate_captures(const Position& pos, MoveList& list) {
     const int    forward   = (us == WHITE) ? 8 : -8;
 
     Bitboard pawns = pos.pieces(us, PAWN);
+    
+    // Quiet promotion push (noisy)
+    Bitboard promos = (us == WHITE) ? (pawns << 8) & empty & RANK_8_BB : (pawns >> 8) & empty & RANK_1_BB;
+    while (promos) {
+        Square to = pop_lsb(promos);
+        add_pawn_move(list, Square(int(to) - forward), to, true, NORMAL);
+    }
+
+    // Captures and En Passant
     while (pawns) {
         Square from = pop_lsb(pawns);
-        // Quiet promotion push (noisy) — only when the push lands on the last rank.
-        Square push1 = Square(int(from) + forward);
-        if ((empty & square_bb(push1)) && rank_of(push1) == promoRank)
-            add_pawn_move(list, from, push1, true, NORMAL);
-        // Captures (including capture-promotions), in the same bit order as pseudo.
         Bitboard caps = pawn_attacks[us][from] & enemy;
         while (caps) {
-            Square to    = pop_lsb(caps);
-            bool   promo = (rank_of(to) == promoRank);
-            add_pawn_move(list, from, to, promo, NORMAL);
+            Square to = pop_lsb(caps);
+            add_pawn_move(list, from, to, rank_of(to) == promoRank, NORMAL);
         }
-        // En passant.
         if (ep != NO_SQ && (pawn_attacks[us][from] & square_bb(ep)))
             list.add(make_move(from, ep, EN_PASSANT));
     }
