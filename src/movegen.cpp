@@ -44,18 +44,22 @@ void generate_pseudo(const Position& pos, MoveList& list) {
     // Single and double pushes
     Bitboard push1 = (us == WHITE) ? (pawns << 8) & empty : (pawns >> 8) & empty;
     Bitboard push2 = (us == WHITE) ? ((push1 & RANK_3_BB) << 8) & empty : ((push1 & RANK_6_BB) >> 8) & empty;
+    Bitboard promo_mask = (us == WHITE) ? RANK_8_BB : RANK_1_BB;
 
-    Bitboard p1 = push1;
-    while (p1) {
-        Square to = pop_lsb(p1);
-        Square from = Square(int(to) - forward);
-        add_pawn_move(list, from, to, rank_of(to) == promoRank, NORMAL);
+    Bitboard p1_promo = push1 & promo_mask;
+    while (p1_promo) {
+        Square to = pop_lsb(p1_promo);
+        add_pawn_move(list, Square(int(to) - forward), to, true, NORMAL);
+    }
+    Bitboard p1_quiet = push1 & ~promo_mask;
+    while (p1_quiet) {
+        Square to = pop_lsb(p1_quiet);
+        list.add(make_move(Square(int(to) - forward), to, NORMAL));
     }
     Bitboard p2 = push2;
     while (p2) {
         Square to = pop_lsb(p2);
-        Square from = Square(int(to) - forward * 2);
-        list.add(make_move(from, to, NORMAL));
+        list.add(make_move(Square(int(to) - forward * 2), to, NORMAL));
     }
 
     // Captures and En Passant
