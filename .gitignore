@@ -57,3 +57,15 @@ build-nnue/
 # kernel is bit-exact; eval-equivalent to the OB8 net, +35 Elo from the NPS/depth.
 !nets/king_int8_174m.bin
 !trainer/s_int8_174m.txt
+
+# Accidentally-committed in-source CMake build artifacts (generated; never track).
+# The Docker build configures a fresh build/ via `cmake -B build`, so these root
+# CMake files are never needed and only pollute the public repo.
+/Makefile
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+CTestTestfile.cmake
+
+# Claude Code workspace artifacts — never part of the project repo.
+.claude/
