@@ -180,4 +180,4 @@ KINg was developed with AI assistance: large parts of the implementation,
 debugging and design were done interactively with **Claude / Claude Code**
 (Anthropic).
 
-AI conversation link: **`<INSERT BEFORE SUBMISSION — paste this link into the submission form, §5.8>`**
+AI conversation log (full transcript, exported): [`AI_conversation.zip`](https://github.com/NikodemNowak/KINg-chess-engine/raw/main/AI_conversation.zip)
