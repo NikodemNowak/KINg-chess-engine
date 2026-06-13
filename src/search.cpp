@@ -343,6 +343,7 @@ struct Searcher {
     uint64_t           nodes;
     bool               aborted;
     int                id = 0;   // Lazy SMP thread index (0 = main); drives diversity
+    int                selDepth = 0; // deepest ply reached this iteration (UCI seldepth; reporting-only)
 
     // ── Move-ordering tables ───────────────────────────────────────────────
     Move    killers[MAX_PLY][2];          // 2 killer (quiet) moves per ply
@@ -412,6 +413,7 @@ struct Searcher {
                 bool searchChecks = true) {
         if (aborted || times_up()) { aborted = true; return 0; }
         ++nodes;
+        if (ply > selDepth) selDepth = ply; // UCI seldepth: deepest ply reached (reporting-only, no behaviour change)
 
         if (ply >= MAX_PLY) return evaluate(pos);
 
@@ -1468,6 +1470,7 @@ static void smp_worker(Searcher& s, Position& pos, const TimeManager& tm,
             beta  =  INF;
         }
 
+        s.selDepth = 0; // reset so seldepth reflects THIS iteration's selective depth
         int scoreThisDepth = 0;
         iterBest  = best;
         iterScore = 0;
@@ -1514,8 +1517,53 @@ static void smp_worker(Searcher& s, Position& pos, const TimeManager& tm,
             auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                           std::chrono::steady_clock::now() - s.start)
                           .count();
+
+            // ── Principal variation: walk the TT from the root ────────────────
+            // Read-only w.r.t. the search. do_move/undo_move are perfectly
+            // balanced and run on THIS thread's own Position clone; TT probes are
+            // lockless-safe. Every probed move is legality-checked (a TT collision
+            // can yield a garbage move), the walk stops on a repetition and is
+            // hard-capped at MAX_PLY, and the accumulator ring (256, wraps) can't
+            // overflow — so it can never loop, emit an illegal move, or crash.
+            // Worst case the PV is a few plies short (purely cosmetic).
+            std::string pvStr = to_uci(best);
+            {
+                StateInfo pvSt[MAX_PLY];
+                Move      pvMv[MAX_PLY];
+                uint64_t  pvKey[MAX_PLY];
+                int n = 0;
+                pvKey[n] = pos.key();
+                pvMv[n]  = best;
+                pos.do_move(best, pvSt[n]);
+                ++n;
+                while (n < MAX_PLY) {
+                    const uint64_t k = pos.key();
+                    bool rep = false;
+                    for (int i = 0; i < n; ++i) if (pvKey[i] == k) { rep = true; break; }
+                    if (rep) break;
+                    TTEntry tte;
+                    if (!tt.probe(k, tte) || tte.move == 0) break;
+                    const Move m = tte.move;
+                    MoveList ml; generate_legal(pos, ml);
+                    bool legal = false;
+                    for (int i = 0; i < ml.size; ++i) if (ml.moves[i] == m) { legal = true; break; }
+                    if (!legal) break;
+                    pvKey[n] = k;
+                    pvMv[n]  = m;
+                    pos.do_move(m, pvSt[n]);
+                    ++n;
+                    pvStr += ' ';
+                    pvStr += to_uci(m);
+                }
+                for (int i = n - 1; i >= 0; --i) pos.undo_move(pvMv[i]);
+            }
+
+            const int64_t  npsMs = (ms > 0) ? (int64_t)ms : (int64_t)1;
+            const uint64_t nps   = (uint64_t)s.nodes * 1000ull / (uint64_t)npsMs;
+
             if (out_mtx) out_mtx->lock();
-            out << "info depth " << depth;
+            out << "info depth " << depth
+                << " seldepth " << std::max(depth, s.selDepth);
             if (is_mate_score(scoreThisDepth)) {
                 // UCI "score mate N": N is in MOVES (not plies), signed.
                 int mate_plies = MATE - std::abs(scoreThisDepth);
@@ -1525,8 +1573,10 @@ static void smp_worker(Searcher& s, Position& pos, const TimeManager& tm,
                 out << " score cp " << scoreThisDepth;
             }
             out << " nodes " << s.nodes
+                << " nps " << nps
+                << " hashfull " << tt.hashfull()
                 << " time " << ms
-                << " pv " << to_uci(best) << std::endl;
+                << " pv " << pvStr << std::endl;
             if (out_mtx) out_mtx->unlock();
 
             // Soft-time management is the MAIN thread's job only. Dynamic soft
