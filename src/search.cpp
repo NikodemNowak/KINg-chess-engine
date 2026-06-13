@@ -125,158 +125,25 @@ static constexpr int SCORE_KILLER2     =    800'000;
 static constexpr int SCORE_COUNTER     =    700'000; // countermove bonus band
 static constexpr int SCORE_BAD_CAPTURE = -1'000'000; // SEE<0 capture base; tried after quiets
 
-// ── Ordering-component toggles (bisection; default all on) ────────────────────
-#ifndef ORD_CAPTHIST
+// ── Move-ordering components (all enabled): capture & continuation history and ─
+// countermove bonuses, kept as named constants used at the ordering sites below.
 #define ORD_CAPTHIST 1
-#endif
-#ifndef ORD_CONTHIST
 #define ORD_CONTHIST 1
-#endif
-#ifndef ORD_COUNTER
-#define ORD_COUNTER 1
-#endif
+#define ORD_COUNTER  1
 
-// ── Singular Extensions (default ON — confirmed +28.7 Elo at 30+0.3 slow TC) ──
-// A TT move is "singular" when a reduced-depth search excluding it fails below
-// (ttScore - SE_MARGIN); such a move gets a +1 extension. Fast-TC SPRT
-// UNDER-measures this (it needs search depth to pay off), so it is validated at
-// the competition's slow TC. Build with -USE_SINGULAR removed only for A/B.
-#ifndef SE_SINGULAR
-#define SE_SINGULAR 1
-#endif
-#ifndef SE_MARGIN
-#define SE_MARGIN 64
-#endif
+// ── Singular-extension margins (DSE: double / negative extensions) ────────────
+// DSE double-extends a dramatically-singular TT move and negatively-extends a
+// non-singular one; DSE_CAP bounds consecutive doubles per line (tree safety).
+#define DSE_MARGIN 16   // double-extend only when seScore < seBeta - DSE_MARGIN*depth
+#define DSE_CAP    4    // cap on consecutive double extensions along one line
 
-// ── Double / negative singular extensions (DSE — OFF until slow-TC SPRT) ──────
-// On top of the +1 singular extension: a DRAMATICALLY singular TT move (excluded
-// search fails below seBeta - DSE_MARGIN) gets +2 ("double extension"); a TT move
-// that is NOT singular yet would itself fail high (ttScore >= beta) gets a -1
-// "negative extension". DSE_CAP bounds consecutive double extensions along one
-// line so a pathological position can't explode the tree (time-loss safety).
-// Depth-dependent → validate at slow TC (like singular). Enable with -DSE_DSE=1.
-#ifndef SE_DSE
-#define SE_DSE 1   // double + negative singular extensions (depth-scaled margin): +19.7 Elo @60+0.6, LOS 99%
-#endif
-#ifndef DSE_MARGIN
-#define DSE_MARGIN 16   // per-DEPTH coeff: double-ext only if seScore < seBeta - 16*depth (was flat 20 = far too eager)
-#endif
-#ifndef DSE_CAP
-#define DSE_CAP 4       // tighter consecutive-double cap (was 6) to bound tree inflation
-#endif
-
-// ── Aggressive LMR (OFF until validated vs Tucano at slow TC) ─────────────────
-// Targets the MEASURED weakness: KINg's effective branching factor (~2.5) is too
-// high vs Tucano (~2.0) → ~4-6 plies shallower at equal time. This reduces late
-// quiets EARLIER (depth>=3, moveCount>=4 vs 4/6) and by ONE more ply → narrower
-// tree → deeper search. Validate vs Tucano at slow TC (gauntlet), then SPSA-refine.
-#ifndef AGGR_LMR
-#define AGGR_LMR 1   // default ON: part of the validated baseline (ship with this on)
-#endif
-
-// ── cutNode LMR (OFF until SPRT) ──────────────────────────────────────────────
-// Thread the expected node type (cut node = a node expected to fail high for the
-// opponent, i.e. produce a beta cutoff) through the search and reduce one extra
-// ply on late quiets at cut nodes. Cut nodes need only refute, so a deeper search
-// rarely changes the bound → safe to search shallower → narrower tree (lower EBF).
-// NPS-neutral (one bool threaded). Enable -DCUTNODE=1. The bool is always plumbed
-// (so the tree shape is unchanged when OFF); only the `r += cutNode` is gated.
-#ifndef CUTNODE
-#define CUTNODE 2   // default ON (=2): +11.6 Elo stacked with CORRHIST (LOS 98.3%)
-#endif
-
-// ── Aggressive reduced-depth pruning (OFF until SPRT) ─────────────────────────
-// Structural EBF lever (NOT a param — those were SPRT-neutral). Gates shallow
-// futility on the LMR-REDUCED depth (lmrDepth = depth - r): a late quiet that
-// will be searched shallow should be pruned on that shallow depth, not the raw
-// one → more late quiets pruned → narrower tree → deeper search. Also uncaps LMP
-// (the moveCount≈depth² threshold self-limits, so high-depth LMP rarely fires but
-// helps in wide middlegames). AGGR_PRUNE=0 ⇒ bit-identical to current. -DAGGR_PRUNE=1.
-#ifndef AGGR_PRUNE
-#define AGGR_PRUNE 0
-#endif
-
-// ── Best-thread voting for Lazy SMP (OFF until SPRT) ──────────────────────────
-// Lazy SMP currently reports thread 0's move; helper threads only enrich the TT.
-// Helpers reach different depths/scores, and thread 0 is not always best. With
-// SMP_VOTE the final move is chosen across ALL threads by (deepest, then best
-// score) — the data (bestDepths/bestScores) is already collected. ONLY affects
-// Threads>1 (identical at Threads=1). Test at Threads=4/8. -DSMP_VOTE=1.
-#ifndef SMP_VOTE
-#define SMP_VOTE 1   // default ON: validated +5.8 @4thr (best-thread voting)
-#endif
-
-// ── Lazy SMP thread diversity (OFF until SPRT) ────────────────────────────────
-// Today all helper threads run an IDENTICAL search → 8 threads reach the same
-// depth as 1 (measured). With SMP_DIV, helpers skip a staggered subset of
-// iterative-deepening depths so they work on DIFFERENT depths than the main
-// thread → richer shared TT → main searches deeper. Only useful WITH SMP_VOTE
-// (so a helper's better result is actually picked). -DSMP_DIV=1 (implies VOTE).
-#ifndef SMP_DIV
-#define SMP_DIV 1    // default ON: validated (helper depth diversity, with SMP_VOTE)
-#endif
-
-// ── SMP helper aspiration widening (OFF until SPRT) ───────────────────────────
-// Helper threads use a 2x-wider aspiration window so they do NOT fail high/low in
-// lockstep with the main thread → more varied re-searches → richer shared TT →
-// main thread deepens. Bit-identical at Threads=1. -DSMP_ASPWIDE=1.
-#ifndef SMP_ASPWIDE
-#define SMP_ASPWIDE 0
-#endif
-
-// ── Lazy SMP per-thread LMR jitter ────────────────────────────────────────────
-// SMP_DIV desyncs WHICH iterative-deepening depth a helper is on, but every thread
-// searches a given subtree with IDENTICAL LMR → identical subtrees → redundant TT
-// stores ("8 threads ~ 1"). With SMP_LMRJIT, helpers nudge LMR by +-1 ply (by id
-// parity) so they expand a DIFFERENT late-move frontier than the main thread →
-// genuinely different trees → non-redundant TT. Bit-identical at Threads=1.
-#ifndef SMP_LMRJIT
-#define SMP_LMRJIT 0
-#endif
-
-// ── History pruning (OFF until SPRT) ──────────────────────────────────────────
-// Skip a late quiet whose combined history is very negative at shallow reduced
-// depth — a SOTA pruning term KINg lacks. Gated lmrDepth∈[1,3]. -DHIST_PRUNE=1.
-#ifndef HIST_PRUNE
-#define HIST_PRUNE 1 // default ON: validated +24.9 Elo (biggest single search lever)
-#endif
-
-// ── Multicut on singular fail-high (OFF until SPRT) ───────────────────────────
-// If the singular VERIFICATION search (which excludes the TT move) ALSO beats
-// beta, then 2+ distinct moves beat beta → this is a cut node → return the proven
-// bound (a multicut). Crash-safe: !aborted guard, returns a real lower bound that
-// is >= beta. -DSE_MULTICUT=1.
-#ifndef SE_MULTICUT
-#define SE_MULTICUT 0
-#endif
-
-// ── Cross-type history malus (OFF until SPRT) ─────────────────────────────────
-// On a quiet beta-cutoff, also penalise the capture-history of the captures that
-// were searched first and failed to cut (they were a wasted try). Standard SOTA;
-// improves capture ordering. -DXMALUS=1.
-#ifndef XMALUS
-#define XMALUS 0
-#endif
-
-// ── Correction history (OFF until SPRT) ──────────────────────────────────────
-// A pawn(+king)-keyed table recording (searchScore − staticEval); it shifts the
-// static eval of future similar pawn structures toward what search actually found
-// → sharper RFP / NMP / futility / LMR decisions. NPS-neutral (one table lookup),
-// grows at slow TC. Bounded ±64cp so it can never destabilise. Enable -DCORRHIST=1.
-#ifndef CORRHIST
-#define CORRHIST 1  // default ON: +11.6 Elo stacked with CUTNODE=2 (LOS 98.3%)
-#endif
-#define CORR_SIZE  16384   // entries per side (mask = CORR_SIZE-1)
-#define CORR_GRAIN 256     // entry stored as correction_cp * GRAIN
-#define CORR_SCALE 256     // EMA denominator (update step = weight/CORR_SCALE)
-#define CORR_MAX   (CORR_GRAIN * 64)  // clamp: ±64cp max correction
-#define CORR_TOTAL_MAX 96             // clamp on SUMMED multi-table correction (cp): guards over-correction
-
-// ── ProbCut (default ON — confirmed +12.2 Elo at 30+0.3 slow TC) ─────────────
-// Also depth-dependent: neutral at fast TC, positive at the competition TC.
-#ifndef SE_PROBCUT
-#define SE_PROBCUT 1
-#endif
+// ── Correction history ────────────────────────────────────────────────────────
+// Pawn-keyed table of (searchScore - staticEval); nudges the static eval of
+// similar future structures toward what search actually found.
+#define CORR_SIZE  16384             // entries per side (mask = CORR_SIZE-1)
+#define CORR_GRAIN 256               // stored value = correction_cp * CORR_GRAIN
+#define CORR_SCALE 256               // EMA denominator (step = weight / CORR_SCALE)
+#define CORR_MAX   (CORR_GRAIN * 64) // clamp: +/-64cp max correction
 
 // ── History (gravity-updated, capped) ─────────────────────────────────────────
 // Butterfly + capture + continuation histories all use the same int16 gravity
@@ -305,7 +172,7 @@ struct Stack {
     PieceType movedPiece  = PAWN;// piece type that made currentMove
     Square    toSq        = A1;
     int       staticEval  = 0;
-    Move      excluded    = 0;   // singular-extension excluded move (batch E)
+    Move      excluded    = 0;   // singular-extension excluded move
     int       doubleExt   = 0;   // consecutive double singular extensions on this line (DSE cap)
 };
 
@@ -316,16 +183,6 @@ struct Stack {
 // position key — so entries stay valid forever and never need clearing (a
 // different position simply fails the full 64-bit key check). Behaviour-preserving:
 // the returned eval equals a recompute, so the search tree is unchanged.
-#ifndef EVAL_CACHE
-#define EVAL_CACHE 1
-#endif
-#ifndef TM_INSTAB
-#define TM_INSTAB 1   // two-sided instability TM: extend when the best move is unsettled
-#endif
-#ifndef CHECK_SEE
-#define CHECK_SEE 1   // SEE-gate the check extension: skip extending material-losing checks (+12.7 Elo @60+0.6)
-#endif
-#if EVAL_CACHE
 struct EvCacheEntry { uint64_t key; int32_t eval; };
 static constexpr int EVCACHE_BITS = 16;            // 64K entries ≈ 1 MB/thread
 static constexpr int EVCACHE_SIZE = 1 << EVCACHE_BITS;
@@ -333,7 +190,6 @@ static constexpr int EVCACHE_MASK = EVCACHE_SIZE - 1;
 // The cache itself is thread_local (declared inside eval_cached) — correct for both
 // the per-search Lazy-SMP threads and concurrent datagen workers, with no shared
 // global state and therefore no resize/torn-read data race.
-#endif
 
 // ── Searcher ──────────────────────────────────────────────────────────────────
 struct Searcher {
@@ -353,17 +209,7 @@ struct Searcher {
     // Continuation history: [prevPiece12][prevTo][curPiece12][curTo]. Indexed by
     // the parent (1-ply) and grandparent (2-ply) moves; ~1.2 MB/thread.
     int16_t contHist[12][64][12][64];
-#ifdef SE_CONTHIST2
-    // 4-ply (great-grandparent) continuation history; same layout, ~1.2 MB/thread.
-    int16_t contHist2[12][64][12][64];
-#endif
-#if CORRHIST
     int16_t pawnCorr[2][CORR_SIZE];  // [stm][pawn_key & (CORR_SIZE-1)] static-eval correction
-#if MULTICORR
-    int16_t minorCorr[2][CORR_SIZE]; // [stm][minor_key & (CORR_SIZE-1)] knight+bishop correction
-    int16_t majorCorr[2][CORR_SIZE]; // [stm][major_key & (CORR_SIZE-1)] rook+queen   correction
-#endif
-#endif
     Stack   ss[MAX_PLY + 4];
 
     bool times_up() {
@@ -388,7 +234,6 @@ struct Searcher {
     // Static eval via the per-thread cache: a hit skips the NNUE forward pass.
     // Returns the RAW (pre-correction) static eval, bit-identical to evaluate(pos).
     int eval_cached(Position& pos) {
-#if EVAL_CACHE
         // thread_local: each OS thread (Lazy-SMP worker OR concurrent datagen worker)
         // owns its cache — no shared global, so no resize/torn-read race. Allocated
         // (zeroed) on first use per thread; the full-key check makes stale hits safe.
@@ -400,17 +245,13 @@ struct Searcher {
         const int v = evaluate(pos);
         e.key = k; e.eval = (int32_t)v;
         return v;
-#else
-        return evaluate(pos);
-#endif
     }
 
     // ── Quiescence search ──────────────────────────────────────────────────
     // Extends the leaf search through "noisy" moves (captures/promotions, and
     // all evasions while in check) so the static eval is only taken in a quiet
     // position. This removes the horizon effect inside capture sequences.
-    int qsearch(Position& pos, int alpha, int beta, int ply,
-                bool searchChecks = true) {
+    int qsearch(Position& pos, int alpha, int beta, int ply) {
         if (aborted || times_up()) { aborted = true; return 0; }
         ++nodes;
         if (ply > selDepth) selDepth = ply; // UCI seldepth: deepest ply reached (reporting-only, no behaviour change)
@@ -446,11 +287,6 @@ struct Searcher {
         } else {
             // Reuse the TT's cached static eval when present (saves an evaluate()).
             standPat = (ttHit && tte.eval != TT_EVAL_NONE) ? (int)tte.eval : eval_cached(pos);
-#ifdef SE_FIFTYSCALE
-            // Scale the stand-pat score toward 0 as the 50-move clock nears 100.
-            // The draw check fires at exactly 100, so the factor is in [0,1].
-            standPat = standPat * (100 - pos.halfmove_clock()) / 100;
-#endif
             if (standPat >= beta) {
                 tt.store(pos.key(), ttMove, toTT(standPat, ply), (int16_t)standPat, 0, BOUND_LOWER);
                 return standPat; // fail-high: opponent won't allow this
@@ -460,36 +296,11 @@ struct Searcher {
         }
 
         MoveList ml;
-        // Not in check, qsearch only searches captures/promotions (quiets are
-        // skipped below), so generate just the NOISY moves — this avoids producing
-        // the whole quiet list and shrinks the O(n^2) ordering sort from ~all moves
-        // to ~the few captures (big win in open/endgame positions). In check we need
-        // every evasion; with SE_QSCHECK we also need quiets for quiet-check search.
-#if defined(SE_QSCHECK)
-        generate_pseudo(pos, ml);
-#else
+        // Not in check, qsearch searches only noisy moves (captures/promotions);
+        // generating just those shrinks the O(n^2) ordering sort to a handful of
+        // moves (a big win in open/endgame positions). In check we need every evasion.
         if (inCheck) generate_pseudo(pos, ml);
         else         generate_captures(pos, ml);
-#endif
-
-#if defined(QS_VERIFY) && !defined(SE_QSCHECK)
-        // Correctness gate: generate_captures MUST equal the noisy subset of
-        // generate_pseudo, in the same order (so qsearch ordering is unchanged).
-        if (!inCheck) {
-            MoveList full; generate_pseudo(pos, full);
-            MoveList noisy;
-            for (int i = 0; i < full.size; ++i) {
-                Move mm = full.moves[i];
-                bool ep    = type_of(mm) == EN_PASSANT;
-                bool cap   = ep || pos.piece_on(to_sq(mm)) != NO_PIECE;
-                bool promo = type_of(mm) == PROMO;
-                if (cap || promo) noisy.add(mm);
-            }
-            if (noisy.size != ml.size) std::abort();
-            for (int i = 0; i < ml.size; ++i)
-                if (ml.moves[i] != noisy.moves[i]) std::abort();
-        }
-#endif
 
         // Precompute MVV-LVA keys for ordering; the TT move (if any) sorts first.
         int keys[256];
@@ -528,29 +339,8 @@ struct Searcher {
             const bool isCapture = isEp || (capPiece != NO_PIECE);
             const bool isPromo   = (type_of(m) == PROMO);
 
-            // When not in check, only consider captures and promotions — plus
-            // (SE_QSCHECK) quiet moves that give check with SEE >= 0, searched
-            // one extra ply deep (searchChecks=false in the child prevents
-            // recursive check explosion).
-            if (!inCheck && !isCapture && !isPromo) {
-#ifdef SE_QSCHECK
-                if (!searchChecks) continue;
-                if (see(pos, m) < 0) continue;
-                StateInfo stChk;
-                pos.do_move(m, stChk);
-                if (pos.in_check(Color(!pos.side_to_move()))) { pos.undo_move(m); continue; }
-                if (!pos.in_check(pos.side_to_move())) { pos.undo_move(m); continue; }
-                int score = -qsearch(pos, -beta, -alpha, ply + 1, false);
-                pos.undo_move(m);
-                if (aborted) return 0;
-                if (score > best)  { best = score; bestMove = m; }
-                if (score > alpha) alpha = score;
-                if (alpha >= beta) break;
-                continue;
-#else
-                continue;
-#endif
-            }
+            // When not in check, search only captures and promotions; skip quiets.
+            if (!inCheck && !isCapture && !isPromo) continue;
 
             // Delta pruning (only when not in check, plain captures): if even
             // winning the victim plus a safety margin cannot reach alpha, skip.
@@ -574,7 +364,7 @@ struct Searcher {
                 continue;
             }
             tt.prefetch(pos.key());   // overlap child TT-probe latency
-            int score = -qsearch(pos, -beta, -alpha, ply + 1, searchChecks);
+            int score = -qsearch(pos, -beta, -alpha, ply + 1);
             pos.undo_move(m);
             if (aborted) return 0;
             if (score > best)  { best = score; bestMove = m; }
@@ -721,26 +511,8 @@ struct Searcher {
             staticEval = evalForPruning = -INF;
         } else {
             staticEval = (ttHit && tte.eval != TT_EVAL_NONE) ? (int)tte.eval : eval_cached(pos);
-#if CORRHIST
             rawEval = staticEval;
-#if MULTICORR
-            {
-                const int cstm = pos.side_to_move();
-                int corr = pawnCorr [cstm][pos.pawn_key()  & (CORR_SIZE - 1)]
-                         + minorCorr[cstm][pos.minor_key() & (CORR_SIZE - 1)]
-                         + majorCorr[cstm][pos.major_key() & (CORR_SIZE - 1)];
-                corr /= CORR_GRAIN;                       // three same-grain ±64cp terms
-                staticEval += std::clamp(corr, -CORR_TOTAL_MAX, CORR_TOTAL_MAX);
-            }
-#else
             staticEval += pawnCorr[pos.side_to_move()][pos.pawn_key() & (CORR_SIZE - 1)] / CORR_GRAIN;
-#endif
-#endif
-#ifdef SE_FIFTYSCALE
-            // Scale staticEval toward 0 near the 50-move draw threshold
-            // (halfmove_clock() is in [0,99] here; the ==100 draw was caught above).
-            staticEval = staticEval * (100 - pos.halfmove_clock()) / 100;
-#endif
             evalForPruning = staticEval;
             if (ttHit) {
                 int ts = fromTT(tte.score, ply);
@@ -752,12 +524,10 @@ struct Searcher {
             }
         }
         ss[ply].staticEval = staticEval;
-#if SE_DSE
         // Default: children inherit this node's double-extension count. The move
         // loop overrides per move (adds 1 when it double-extends); NMP / ProbCut
         // children (searched before the move loop) use this inherited value.
         ss[ply + 1].doubleExt = ss[ply].doubleExt;
-#endif
 
         // ── "Improving" trend ─────────────────────────────────────────────────
         // Is our static eval higher than two plies ago (our previous turn)? If so
@@ -785,12 +555,6 @@ struct Searcher {
             && evalForPruning >= beta   // only when the static eval already beats beta
             && beta < MATE - MAX_PLY && beta > -(MATE - MAX_PLY)) {
             int R = sp::nmp_base + depth / sp::nmp_div;
-#ifdef SE_NMPEVAL
-            // If our eval already beats beta by a large margin the position is
-            // even more likely to be a safe prune — reduce a touch more. Bonus
-            // in [0,3]; evalForPruning >= beta is implied at a fail-high node.
-            R += std::max(0, std::min(3, (evalForPruning - beta) / 200));
-#endif
             StateInfo nullSt;
             // Mark this ply as "no move" so the child doesn't index countermove /
             // continuation history off a stale sibling move.
@@ -805,7 +569,6 @@ struct Searcher {
             }
         }
 
-#ifdef SE_PROBCUT
         // ── ProbCut ───────────────────────────────────────────────────────────
         // At non-PV, non-check nodes with depth >= 5, search a small set of good
         // captures at reduced depth to get a cheap fail-high. Only fire when beta
@@ -834,7 +597,6 @@ struct Searcher {
                 if (pcScore >= pbBeta) return pbBeta;
             }
         }
-#endif // SE_PROBCUT
 
         // ── Internal Iterative Reduction (IIR) ───────────────────────────────
         // If we have no TT move at this node (no prior search result to guide
@@ -862,13 +624,6 @@ struct Searcher {
             gPiece12 = make_piece(stm, ss[ply - 2].movedPiece);
             gTo      = ss[ply - 2].toSq;
         }
-#ifdef SE_CONTHIST2
-        int  ggPiece12 = -1, ggTo = 0;
-        if (ply >= 4 && ss[ply - 4].currentMove != 0) {
-            ggPiece12 = make_piece(stm, ss[ply - 4].movedPiece);
-            ggTo      = ss[ply - 4].toSq;
-        }
-#endif
 
         // ── Move scoring (for ordering) ───────────────────────────────────────
         // Assign a score to each pseudo-legal move; we iterate in descending
@@ -934,9 +689,6 @@ struct Searcher {
                             q += (int)contHist[pPiece12][pTo][cp12][to];
                             if (gPiece12 >= 0) q += (int)contHist[gPiece12][gTo][cp12][to];
                         }
-#ifdef SE_CONTHIST2
-                        if (ggPiece12 >= 0) q += (int)contHist2[ggPiece12][ggTo][cp12][to];
-#endif
                         scores[i] = q;
                     }
                 }
@@ -967,10 +719,8 @@ struct Searcher {
 
             Move m = ml.moves[i];
 
-#ifdef SE_SINGULAR
             // Skip the excluded move while verifying a singular candidate.
             if (m == ss[ply].excluded) continue;
-#endif
 
             // ── Classify move BEFORE do_move (board is still unmoved) ─────
             // isQuiet: not a capture, not en passant, not a promotion.
@@ -979,16 +729,8 @@ struct Searcher {
             const bool isQuiet      = !(isEpPre || (capPiecePre != NO_PIECE)
                                                  || (type_of(m) == PROMO));
 
-            // Reduced "lmr depth" for shallow pruning: a late quiet will be
-            // searched at depth - r, so gate futility on that reduced depth.
-            // Equals `depth` when AGGR_PRUNE is off ⇒ original behaviour.
+            // Depth used by the shallow-pruning gates below (futility/SEE/history).
             int lmrDepth = depth;
-#if AGGR_PRUNE
-            if (isQuiet && depth >= 3 && moveCount >= 4) {
-                lmrDepth -= LMR[std::min(depth, 63)][std::min(moveCount, 63)];
-                if (lmrDepth < 0) lmrDepth = 0;
-            }
-#endif
 
             // Mover piece type captured BEFORE do_move (board still unmoved),
             // for the search-stack / history indexing.
@@ -1003,9 +745,6 @@ struct Searcher {
                     quietHist += (int)contHist[pPiece12][pTo][cp12][to_sq(m)];
                     if (gPiece12 >= 0) quietHist += (int)contHist[gPiece12][gTo][cp12][to_sq(m)];
                 }
-#ifdef SE_CONTHIST2
-                if (ggPiece12 >= 0) quietHist += (int)contHist2[ggPiece12][ggTo][cp12][to_sq(m)];
-#endif
             }
 
             // ── Late Move Pruning (LMP) ───────────────────────────────────
@@ -1017,9 +756,7 @@ struct Searcher {
             // earlier when not — standard LMP "improving" modulation.
             if (!isPV && !inCheck && isQuiet
                     && depth >= 3
-#if !AGGR_PRUNE
                     && depth <= 6
-#endif
                     && moveCount >= (improving ? sp::lmp_imp + depth * depth : sp::lmp_noimp + depth * depth / 2)
                     && best > -(MATE - MAX_PLY)) {
                 continue;
@@ -1052,7 +789,6 @@ struct Searcher {
                 if (sv < -sp::see_margin * depth * depth) continue;
             }
 
-#if HIST_PRUNE
             // ── History pruning ───────────────────────────────────────────
             // A late quiet with very negative history is unlikely to be best;
             // skip it at shallow reduced depth (placed after SEE so bad captures
@@ -1062,12 +798,10 @@ struct Searcher {
                     && quietHist < -sp::hp_mult * lmrDepth * lmrDepth) {
                 continue;
             }
-#endif
 
-#ifdef SE_SINGULAR
             // ── Singular Extension ────────────────────────────────────────
             // If the TT move's score is "singular" (a reduced search excluding
-            // it fails below ttScore - SE_MARGIN), extend it by +1. Guards:
+            // it fails below ttScore - sp::se_margin), extend it by +1. Guards:
             // this is the TT move, not already verifying, deep enough node,
             // reliable TT entry (depth, non-UPPER, non-mate), ply headroom.
             // Crash-safe: seDepth=(depth-1)/2 < depth (no runaway); excluded is
@@ -1086,30 +820,20 @@ struct Searcher {
                 ss[ply].excluded = ttMove;
                 int seScore = negamax(pos, seDepth, seBeta - 1, seBeta, ply, cutNode);
                 ss[ply].excluded = 0;
-#if SE_MULTICUT
-                // Multicut: the TT-move-excluded search ALSO beat beta → 2+ moves
-                // beat beta → cut node → return the proven bound (>= beta).
-                if (!aborted && seBeta >= beta && seScore >= beta) return seBeta;
-#endif
                 if (!aborted && seScore < seBeta) {
                     seExtension = 1;
-#if SE_DSE
                     // Double extension: the TT move is dramatically better than
                     // every alternative (excluded search fails well below seBeta).
                     // Capped per line (DSE_CAP) so it can never explode the tree.
                     if (!isPV && seScore < seBeta - DSE_MARGIN * depth
                             && ss[ply].doubleExt < DSE_CAP)
                         seExtension = 2;
-#endif
                 }
-#if SE_DSE
                 // Negative extension: the TT move is NOT singular but would itself
                 // fail high (its TT score already beats beta) — search it shallower.
                 else if (!aborted && !isPV && ttScore >= beta)
                     seExtension = -1;
-#endif
             }
-#endif
 
             StateInfo st;
             pos.do_move(m, st);
@@ -1140,13 +864,10 @@ struct Searcher {
             // Extend by 1 ply when this move gives check or is singular. Checks
             // are forcing; the MAX_PLY guard in the recursion prevents runaway.
             bool chkExtend = givesCheck && ply < MAX_PLY - 1;
-#if CHECK_SEE
             // SEE-gate: don't spend a ply on a check that loses material (a spite/
             // sac check). Capturing checks reuse the cached seeVal (free); quiet
             // checks have no parent SEE here and are treated as non-losing.
             if (chkExtend && seeVal[i] != SEE_NONE && seeVal[i] < 0) chkExtend = false;
-#endif
-#if SE_DSE
             // DSE: the singular result drives a -1..+2 extension; the check
             // extension applies only when singular didn't fire. newDepth is
             // clamped >= 1 (safety), and the per-line double-extension count
@@ -1159,14 +880,6 @@ struct Searcher {
             int newDepth = depth - 1 + extension;
             if (newDepth < 0) newDepth = 0;
             ss[ply + 1].doubleExt = ss[ply].doubleExt + (seExtension == 2 ? 1 : 0);
-#elif defined(SE_SINGULAR)
-            const int extension =
-                std::min(1, (chkExtend ? 1 : 0) + seExtension);
-            const int newDepth = depth - 1 + extension;
-#else
-            const int extension = chkExtend ? 1 : 0;
-            const int newDepth = depth - 1 + extension;
-#endif
             int score;
 
             if (firstMove) {
@@ -1178,46 +891,18 @@ struct Searcher {
             } else {
                 // ── Late Move Reduction (LMR) ─────────────────────────────
                 int r = 0;
-#if AGGR_LMR
                 if (depth >= 3 && moveCount >= 4 && isQuiet
                         && !inCheck && !givesCheck) {
-#else
-                if (depth >= 4 && moveCount >= 6 && isQuiet
-                        && !inCheck && !givesCheck) {
-#endif
                     r = LMR[std::min(depth, 63)][std::min(moveCount, 63)];
                     if (isPV) r -= 1;                       // reduce less on PV
                     if (!improving) r += 1;                 // reduce more when not improving
                     r -= std::clamp(quietHist / sp::lmr_hist_div, -2, 2); // trust history
-#if AGGR_LMR
                     r += 1;                                 // one more ply: lower EBF
-#endif
-#if CUTNODE == 1
-                    if (cutNode) r += 1;                    // expected cut node: reduce one extra ply
-#elif CUTNODE == 2
                     if (cutNode && !ttMove) r += 1;         // only the poorly-ordered cut nodes (no TT move)
-#endif
-#if SMP_LMRJIT
-                    // Lazy-SMP tree-shape diversity: odd-id helpers reduce 1 ply LESS,
-                    // even-id 1 ply MORE → different late-move frontier than main. The
-                    // clamps below bound it; main (id 0) is untouched → Thr=1 identical.
-                    if (id > 0) r += (id & 1) ? -1 : +1;
-#endif
                     if (r < 0) r = 0;
                     if (r > newDepth - 1) r = newDepth - 1; // never below 1 ply
                     if (r < 0) r = 0;
                 }
-#ifdef SE_BADCAPLMR
-                // Mild LMR for late SEE-negative captures (scored < 0 by the
-                // ordering pass; good captures score >= SCORE_CAPTURE, quiets
-                // were handled above). Promotions keep SCORE_CAPTURE so are safe.
-                else if (!isQuiet && scores[i] < 0 && depth >= 4
-                         && moveCount >= 4 && !inCheck && !givesCheck) {
-                    r = 1;
-                    if (r > newDepth - 1) r = newDepth - 1;
-                    if (r < 0) r = 0;
-                }
-#endif
 
                 // Reduced zero-window scout. A reduced search is always a cut
                 // node (we expect it to fail low); an unreduced scout inherits the
@@ -1257,9 +942,6 @@ struct Searcher {
                     hist_update(history[stm][f][t], bo);
                     if (pPiece12 >= 0) hist_update(contHist[pPiece12][pTo][cp12][t], bo);
                     if (gPiece12 >= 0) hist_update(contHist[gPiece12][gTo][cp12][t], bo);
-#ifdef SE_CONTHIST2
-                    if (ggPiece12 >= 0) hist_update(contHist2[ggPiece12][ggTo][cp12][t], bo / 2);
-#endif
                 };
                 auto capBonus = [&](Move mv, int bo) {
                     const Square f = from_sq(mv), t = to_sq(mv);
@@ -1286,12 +968,6 @@ struct Searcher {
                     quietBonus(m, bonus);
                     for (int q = 0; q < nQuiets; ++q)
                         if (quietsTried[q] != m) quietBonus(quietsTried[q], -bonus);
-#if XMALUS
-                    // A quiet refuted this node, so the captures we searched first
-                    // and that did NOT cut were a waste — penalise their capture
-                    // history too (cross-type malus, SOTA). They are all != m.
-                    for (int c = 0; c < nCaps; ++c) capBonus(capsTried[c], -bonus);
-#endif
                 } else if (isCapturePost) {
                     // Reward the cutting capture; punish the others.
                     capBonus(m, bonus);
@@ -1309,7 +985,6 @@ struct Searcher {
         Bound bound = (best <= alphaOrig) ? BOUND_UPPER
                     : (best >= beta)       ? BOUND_LOWER
                     :                        BOUND_EXACT;
-#if CORRHIST
         // Update pawn correction history toward the (bound-consistent) search
         // result on quiet, non-check, non-mate, non-singular-verification nodes.
         if (!inCheck && rawEval != -INF && bestMove != 0 && ss[ply].excluded == 0
@@ -1324,30 +999,15 @@ struct Searcher {
             const int w      = std::min(depth + 1, 16);
             const int e      = pawnCorr[c][idx] + (target - pawnCorr[c][idx]) * w / CORR_SCALE;
             pawnCorr[c][idx] = (int16_t)std::clamp(e, -CORR_MAX, CORR_MAX);
-#if MULTICORR
-            const int mi      = (int)(pos.minor_key() & (CORR_SIZE - 1));
-            const int em      = minorCorr[c][mi] + (target - minorCorr[c][mi]) * w / CORR_SCALE;
-            minorCorr[c][mi]  = (int16_t)std::clamp(em, -CORR_MAX, CORR_MAX);
-            const int ma      = (int)(pos.major_key() & (CORR_SIZE - 1));
-            const int ej      = majorCorr[c][ma] + (target - majorCorr[c][ma]) * w / CORR_SCALE;
-            majorCorr[c][ma]  = (int16_t)std::clamp(ej, -CORR_MAX, CORR_MAX);
-#endif
         }
-#endif
-#ifdef SE_SINGULAR
         // Don't pollute the TT with the result of a singular-verification search
         // (it deliberately omits the best move).
         if (ss[ply].excluded == 0)
-#endif
         // TT stores the RAW (pre-correction) static eval; the correction is
         // re-applied fresh on each probe (storing the corrected value would
         // compound the correction over repeated probes).
         tt.store(pos.key(), bestMove, toTT(best, ply),
-#if CORRHIST
                  inCheck ? TT_EVAL_NONE : (int16_t)rawEval,
-#else
-                 inCheck ? TT_EVAL_NONE : (int16_t)staticEval,
-#endif
                  (uint8_t)depth, bound);
 
         return best;
@@ -1404,12 +1064,10 @@ static void smp_worker(Searcher& s, Position& pos, const TimeManager& tm,
         Move localBest = iterBest;
         bool firstMove = true;
 
-#if SE_DSE
         // Root moves are never "double-extended into": reset the per-line double-
         // extension counter so each root search starts the DSE_CAP count clean.
         s.ss[0].doubleExt = 0;
         s.ss[1].doubleExt = 0;
-#endif
         for (int i = 0; i < root.size; ++i) {
             StateInfo st;
             pos.do_move(root.moves[i], st);
@@ -1446,7 +1104,6 @@ static void smp_worker(Searcher& s, Position& pos, const TimeManager& tm,
     };
 
     for (int depth = 1; depth <= maxDepth; ++depth) {
-#if SMP_DIV
         // Helper-thread diversity: skip a staggered subset of depths so helpers
         // search at DIFFERENT depths than main → richer shared TT → main deepens.
         if (s.id > 0) {
@@ -1455,12 +1112,7 @@ static void smp_worker(Searcher& s, Position& pos, const TimeManager& tm,
             int i = (s.id - 1) % 20;
             if (((depth + sPhase[i]) / sSize[i]) % 2) continue;
         }
-#endif
-#if SMP_ASPWIDE
-        int delta = sp::asp_delta * (s.id > 0 ? 2 : 1); // helpers: wider window, varied re-searches
-#else
         int delta = sp::asp_delta;
-#endif
         int alpha, beta;
         if (depth >= 5) {
             alpha = prevScore - delta;
@@ -1584,7 +1236,6 @@ static void smp_worker(Searcher& s, Position& pos, const TimeManager& tm,
             // (we're confident — bank the time), spend longer when the score just
             // dropped (fail-low panic — resolve it). Never exceed the hard limit.
             double factor = 1.0;
-#if TM_INSTAB
             // Two-sided instability TM: bank time when the best move is settled, and
             // EXTEND when it's unsettled (best move just changed, or eval fell) so
             // critical positions get the depth they need instead of stopping at ~soft.
@@ -1593,11 +1244,6 @@ static void smp_worker(Searcher& s, Position& pos, const TimeManager& tm,
             if (depth >= 6 && stableCnt == 0) factor *= 1.7;    // best move just changed
             if (scoreDrop >= 30)              factor *= 1.6;    // eval fell (fail-low panic)
             factor = std::clamp(factor, 0.5, 4.0);              // raised ceiling (was 2.5)
-#else
-            if (depth >= 6 && stableCnt >= 3) factor *= 0.65;
-            if (scoreDrop >= 30) factor *= 1.6;
-            factor = std::clamp(factor, 0.5, 2.5);
-#endif
             int64_t softLimit = (int64_t)(tm.soft_ms * factor);
             if (softLimit > tm.hard_ms) softLimit = tm.hard_ms;
             if (ms >= softLimit) { stop.store(true); break; }
@@ -1744,17 +1390,8 @@ Move think(Position& pos, const Limits& L, std::atomic<bool>& stop,
         std::memset(s.history, 0, sizeof(s.history));
         std::memset(s.captHist, 0, sizeof(s.captHist));
         std::memset(s.counterMove, 0, sizeof(s.counterMove));
-#if CORRHIST
         std::memset(s.pawnCorr, 0, sizeof(s.pawnCorr));
-#if MULTICORR
-        std::memset(s.minorCorr, 0, sizeof(s.minorCorr));
-        std::memset(s.majorCorr, 0, sizeof(s.majorCorr));
-#endif
-#endif
         std::memset(s.contHist, 0, sizeof(s.contHist));
-#ifdef SE_CONTHIST2
-        std::memset(s.contHist2, 0, sizeof(s.contHist2));
-#endif
         std::memset(s.ss, 0, sizeof(s.ss));
         positions[t].copy_from(pos); // private clone with full repetition history
     }
@@ -1782,7 +1419,6 @@ Move think(Position& pos, const Limits& L, std::atomic<bool>& stop,
 
     // ── Select the move to play ──────────────────────────────────────────────
     int bestIdx = 0;
-#if SMP_VOTE
     // Best-thread voting: pick the thread that reached the greatest completed
     // depth, breaking ties by the higher score (prefers shorter mates / avoids a
     // shallower thread's stale result). Helpers often out-search thread 0.
@@ -1792,7 +1428,6 @@ Move think(Position& pos, const Limits& L, std::atomic<bool>& stop,
             || (bestDepths[t] == bestDepths[bestIdx] && bestScores[t] > bestScores[bestIdx]))
             bestIdx = t;
     }
-#endif
     Move best = bestMoves[bestIdx];
     if (best == 0) best = bestMoves[0];
     if (best == 0) best = startBest; // ultra-defensive: never return null here
@@ -1860,17 +1495,8 @@ SearchResult think_result(Position& pos, const Limits& L,
         std::memset(s.history, 0, sizeof(s.history));
         std::memset(s.captHist, 0, sizeof(s.captHist));
         std::memset(s.counterMove, 0, sizeof(s.counterMove));
-#if CORRHIST
         std::memset(s.pawnCorr, 0, sizeof(s.pawnCorr));
-#if MULTICORR
-        std::memset(s.minorCorr, 0, sizeof(s.minorCorr));
-        std::memset(s.majorCorr, 0, sizeof(s.majorCorr));
-#endif
-#endif
         std::memset(s.contHist, 0, sizeof(s.contHist));
-#ifdef SE_CONTHIST2
-        std::memset(s.contHist2, 0, sizeof(s.contHist2));
-#endif
         std::memset(s.ss, 0, sizeof(s.ss));
         positions[t].copy_from(pos);
     }

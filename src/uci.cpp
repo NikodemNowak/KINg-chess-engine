@@ -221,7 +221,7 @@ void run(std::istream& in, std::ostream& out) {
             if (cmd == "uci") {
                 std::lock_guard<std::mutex> lk(es.out_mtx);
                 out << "id name KINg\n";
-                out << "id author KINg Team\n";
+                out << "id author EPSZ-team (Bartosz Kolacinski, Nikodem Nowak)\n";
                 out << "option name Hash type spin default 64 min 1 max 1024\n";
                 out << "option name Threads type spin default " << threads
                     << " min 1 max 256\n";

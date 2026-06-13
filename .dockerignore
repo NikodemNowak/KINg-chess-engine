@@ -20,12 +20,9 @@ Makefile
 *.obj
 *.exe
 
-# Local-only experiment nets are gitignored; keep only the committed nets the
-# build can actually embed (NNUE_NET default = nets/king_int8_174m.bin).
+# Keep only the committed net the build embeds (NNUE_NET default).
 nets/*.bin
 !nets/king_int8_174m.bin
-!nets/king_ob8_174m.bin
-!nets/king_nnue.bin
 
 # Training data, datasets, numpy caches, logs, PGNs, the rules PDF, error logs.
 # The engine image needs NOTHING from data/ or trainer/ (the NNUE net is embedded

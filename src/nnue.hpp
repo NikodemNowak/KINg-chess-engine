@@ -1,11 +1,11 @@
 #pragma once
 // NNUE inference for the KINg engine.
 //
-// Perspective net (768 -> HL) x2 -> 1, clipped-ReLU, INT16/INT32 quantized.
-// HL (accumulator size per perspective) is a compile-time constant controlled
-// by -DNNUE_HL=<n> (default 512, matching the committed 30M-position net).
-// The net is embedded in the binary (see nnue_net_data.cpp, generated at build
-// time from nets/king_nnue.bin), so no external file is needed at runtime.
+// Perspective net (768 -> HL) x2 -> output buckets, squared clipped-ReLU,
+// INT16/INT32 quantized. HL (accumulator size per perspective) is a compile-time
+// constant set via -DNNUE_HL=<n> (default 512). The net is embedded in the binary
+// (see nnue_net_data.cpp, generated at build time from the committed net binary),
+// so no external file is needed at runtime.
 //
 // This whole translation unit is only compiled when EVAL_NNUE is defined (the
 // CMake -DEVAL=NNUE configuration). HCE builds pull in none of it.
@@ -22,7 +22,7 @@ namespace nnue {
 // (default 512, matching the committed net).  All other constants are fixed.
 constexpr int INPUT = 768;
 #ifndef NNUE_HL
-constexpr int HL    = 256;
+constexpr int HL    = 512;
 #else
 constexpr int HL    = NNUE_HL;
 #endif
@@ -117,13 +117,11 @@ void refresh_perspective(Accumulator& acc, const Position& pos, Color persp);
 // piece_count (total pieces on the board, 2..32) selects the output bucket.
 int evaluate_acc(const Accumulator& acc, Color stm, int piece_count);
 
-// Add / subtract a single feature (a piece of color c, type t on square s) to
-// BOTH perspectives of the accumulator. wking/bking are the White/Black king
-// squares (the per-perspective bucket determinants). Used by Position::put/
-// remove_piece (which pass the position's tracked king squares so the call is
-// valid even mid-move; king moves trigger a full refresh afterwards).
+// Add a single feature (a piece of color c, type t on square s) to BOTH
+// perspectives of `acc`. wking/bking are the White/Black king squares (the
+// per-perspective bucket determinants, consulted only for KB>1). Used by the
+// full-board refresh.
 void add_feature(Accumulator& acc, Color c, PieceType t, Square s, Square wking, Square bking);
-void sub_feature(Accumulator& acc, Color c, PieceType t, Square s, Square wking, Square bking);
 
 // ── Copy-make fused update ──────────────────────────────────────────────────
 // One piece placement (color c, type t, square s) that became active (added) or
@@ -135,8 +133,8 @@ struct Feat { Color c; PieceType t; Square s; };
 // the copy-make update: `src` (the parent) is only read and left intact, so undo
 // is free (the search just steps the ply index back). n_add ∈ [1,2], n_sub ∈
 // [1,2]. wking/bking are the per-perspective OWN king squares (consulted only for
-// KB>1; ignored for the KB=1 production net). Bit-identical to
-// memcpy(dst,src) followed by n_add add_feature + n_sub sub_feature calls.
+// KB>1; ignored for the KB=1 production net). Bit-identical to a memcpy(dst,src)
+// followed by applying the n_add added and n_sub removed features one at a time.
 void update_accumulator(Accumulator& dst, const Accumulator& src,
                         const Feat* adds, int n_add,
                         const Feat* subs, int n_sub,

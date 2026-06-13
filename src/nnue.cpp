@@ -28,7 +28,7 @@
 namespace king {
 namespace nnue {
 
-// Embedded net bytes (generated at build time from nets/king_nnue.bin).
+// Embedded net bytes (generated at build time from the committed net binary).
 extern "C" const unsigned char king_nnue_data[];
 extern "C" const unsigned int  king_nnue_data_len;
 
@@ -431,13 +431,6 @@ void add_feature(Accumulator& acc, Color c, PieceType t, Square s, Square wking,
     const int ib = feature_index(c, t, s, BLACK, bking);
     acc_add(acc.v[WHITE], g_net.W1t[iw]);
     acc_add(acc.v[BLACK], g_net.W1t[ib]);
-}
-
-void sub_feature(Accumulator& acc, Color c, PieceType t, Square s, Square wking, Square bking) {
-    const int iw = feature_index(c, t, s, WHITE, wking);
-    const int ib = feature_index(c, t, s, BLACK, bking);
-    acc_sub(acc.v[WHITE], g_net.W1t[iw]);
-    acc_sub(acc.v[BLACK], g_net.W1t[ib]);
 }
 
 // Copy-make fused update: child `dst` = parent `src` + adds − subs, one pass per

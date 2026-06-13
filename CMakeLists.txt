@@ -23,19 +23,15 @@ set(CMAKE_C_FLAGS_RELEASE   "-O3 -march=x86-64 -mtune=generic -DNDEBUG")
 # -DEVAL=NNUE (default): embedded NNUE net + incremental accumulator ("Open").
 # -DEVAL=HCE           : handcrafted PeSTO/structural eval ("No Deep Learning").
 #
-# Default is NNUE: the HL=512 net retrained on ~30M self-play positions beats the
-# Texel-tuned HCE by +193 Elo at 8+0.08 (NNUE-vs-HCE 225-23-152 over 400 games,
-# 95% CI [+167, +222]). (The first net — 3.5M positions, HL=256 — had lost ~133
-# Elo, which is why HCE shipped previously.) Pass -DEVAL=HCE to build the
-# "No Deep Learning" entry.
+# NNUE (the shipped build) is far stronger than the handcrafted eval; pass
+# -DEVAL=HCE only to build the "No Deep Learning" entry.
 set(EVAL "NNUE" CACHE STRING "Evaluation: NNUE (default) or HCE")
 set_property(CACHE EVAL PROPERTY STRINGS NNUE HCE)
 message(STATUS "KINg eval = ${EVAL}")
 
 # ── NNUE hidden-layer size ────────────────────────────────────────────────────
-# -DNNUE_HL=512 (default, matches committed king_nnue.bin — the 30M-position net).
-# Override with -DNNUE_HL=<n> to build against a different-width net; the value
-# is passed through as -DNNUE_HL=<n> so nnue.hpp picks it up at compile time.
+# -DNNUE_HL=512 (default, matches the committed production net). Override with
+# -DNNUE_HL=<n> to build against a different-width net (passed through to nnue.hpp).
 set(NNUE_HL "512" CACHE STRING "NNUE accumulator hidden-layer size per perspective (default 512)")
 message(STATUS "KINg NNUE_HL = ${NNUE_HL}")
 
@@ -56,18 +52,15 @@ set(NNUE_KB "1" CACHE STRING "NNUE king-square input buckets (default 1 = none)"
 message(STATUS "KINg NNUE_KB = ${NNUE_KB}")
 
 # ── NNUE activation ───────────────────────────────────────────────────────────
-# -DNNUE_SCRELU=ON uses the squared clipped-ReLU activation (must match a net
-# trained with `--activation screlu`). Default ON: the committed king_nnue.bin is
-# the SCReLU net trained with lambda=0.9 (eval-weighted target), which is +132 Elo
-# over the previous CReLU/lambda-0.6 net. Pass -DNNUE_SCRELU=OFF only with a
-# CReLU net.
+# -DNNUE_SCRELU=ON (default) uses the squared clipped-ReLU activation, matching the
+# committed production net. Pass -DNNUE_SCRELU=OFF only with a plain-CReLU net.
 set(NNUE_SCRELU ON CACHE BOOL "Use SCReLU (squared) NNUE activation")
 message(STATUS "KINg NNUE_SCRELU = ${NNUE_SCRELU}")
 
 # ── NNUE net binary (override for validation builds) ─────────────────────────
-# Default: the committed HL=256 production net.
+# Default (empty): embed the committed production net (nets/king_int8_174m.bin).
 # Override with -DNNUE_NET=/abs/path/to/other.bin for temp-net validation.
-set(NNUE_NET "" CACHE FILEPATH "Override NNUE net binary (default: nets/king_nnue.bin)")
+set(NNUE_NET "" CACHE FILEPATH "Override NNUE net binary (default: nets/king_int8_174m.bin)")
 
 include_directories(${CMAKE_SOURCE_DIR}/src
                     ${CMAKE_SOURCE_DIR}/third_party
@@ -92,8 +85,8 @@ if(EVAL STREQUAL "NNUE")
     add_compile_definitions(NNUE_SCRELU)
   endif()
 
-  # Embed the net into the binary: generate a C++ byte-array source from
-  # nets/king_nnue.bin (or the override) at build time.
+  # Embed the net into the binary: generate a C++ byte-array source from the
+  # committed net (or the -DNNUE_NET override) at build time.
   find_package(Python3 COMPONENTS Interpreter REQUIRED)
   if(NNUE_NET STREQUAL "")
     set(NET_BIN ${CMAKE_SOURCE_DIR}/nets/king_int8_174m.bin)

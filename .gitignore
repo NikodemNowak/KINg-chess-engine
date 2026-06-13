@@ -1,71 +1,44 @@
+# Build output
 build/
+build-*/
 *.o
 *.obj
 *.exe
+
+# Python caches
+__pycache__/
+*.pyc
+
+# Logs, PGNs, datasets, numpy caches, the rules PDF
 *.pgn
 *.log
+*.err
+*.npz
+*.pdf
+data/
 syzygy/
 syzygy_test/
-nets/*.bin
-*.pdf
-# Explicit: always commit harness files used for local Task-16 testing
-!engine-adapter.sh
-!openings.bin
 
-# Baseline binaries -- rebuild from the tagged commit, don't commit binaries
-tools/baseline/king_v1
-tools/baseline/king_v*
-
-# Texel tuning dataset (public Zurichess quiet-labeled.epd, ~41MB) -- large, fetch separately
-tools/quiet-labeled.epd
-tools/*.epd.gz
-
-# Generated self-play data (NNUE training; can be very large -- regenerate as needed)
+# Generated training data, sample dumps and net binaries (regenerate from source).
+# The exceptions below are the only such files the build / unit tests need.
 *.txt
-build/dg_*.txt
-
-# NNUE training: ignore the whole data dir (datasets + numpy caches, large).
-data/
-
-# ...but DO commit the exported net and the C++ contract sample file, despite
-# the broad `nets/*.bin` and `*.txt` ignores above.
-!nets/king_nnue.bin
-!trainer/nnue_samples.txt
-# Don't commit trainer dev/test scratch files.
-trainer/_*.py
-trainer/__pycache__/
-
-# NNUE binary caches (large memmap files; regenerate from text dataset).
 *.bin
-!nets/king_nnue.bin
 !openings.bin
-# Smoke-run / temp validation artifacts (not production).
-trainer/smoke_big.txt
-trainer/smoke_big.bin
-trainer/tmp_*.bin
-trainer/tmp_*.txt
-nets/smoke_nnue.bin
-# build-nnue/ is a local validation build dir, not a standard out-of-tree build.
-build-nnue/
-
-# Production OB=8 net + its C++ bit-exact contract samples — these ARE the shipped
-# default (CMakeLists NNUE_OB=8 / NNUE_NET default), so they MUST be committed
-# despite the broad nets/*.bin and *.txt ignores above.
-!nets/king_ob8_174m.bin
-!trainer/s_ob8_174m.txt
-# Promoted production net: int8-constrained (|W2q|<=127) so the fast 16-wide SCReLU
-# kernel is bit-exact; eval-equivalent to the OB8 net, +35 Elo from the NPS/depth.
+!engine-adapter.sh
 !nets/king_int8_174m.bin
 !trainer/s_int8_174m.txt
 
-# Accidentally-committed in-source CMake build artifacts (generated; never track).
-# The Docker build configures a fresh build/ via `cmake -B build`, so these root
-# CMake files are never needed and only pollute the public repo.
+# Large public datasets — fetch separately, don't commit
+tools/quiet-labeled.epd
+tools/*.epd.gz
+tools/baseline/king_v*
+
+# Accidentally-generated in-source CMake artifacts (the build uses a fresh build/)
 /Makefile
 CMakeFiles/
 CMakeCache.txt
 cmake_install.cmake
 CTestTestfile.cmake
 
-# Claude Code workspace artifacts — never part of the project repo.
+# Claude Code workspace artifacts — never part of the project repo
 .claude/
