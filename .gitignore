@@ -34,7 +34,8 @@ tools/*.epd.gz
 tools/baseline/king_v*
 
 # Accidentally-generated in-source CMake artifacts (the build uses a fresh build/)
-/Makefile
+# NOTE: /Makefile is the competition test harness — tracked on purpose. Never run
+# `cmake` in the repo root or it will overwrite it.
 CMakeFiles/
 CMakeCache.txt
 cmake_install.cmake
